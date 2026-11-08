@@ -1,0 +1,14 @@
+﻿# Credentials – niemals einchecken
+credentials.json
+*.credentials.json
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
