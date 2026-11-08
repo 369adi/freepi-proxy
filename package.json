@@ -1,13 +1,22 @@
 {
   "name": "freepi-proxy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenAI-compatible local proxy for free-pi-cli with live usage tracking and automatic multi-account rotation",
   "type": "module",
   "scripts": {
+    "setup": "node tools/setup.mjs",
     "start": "node proxy.mjs",
+    "stop": "node tools/stop.mjs",
+    "watchdog": "node tools/watchdog.mjs",
+    "doctor": "node tools/doctor.mjs",
     "accounts": "node tools/freepi-accounts.mjs",
     "status": "node tools/freepi-accounts.mjs status",
+    "plan": "node tools/freepi-accounts.mjs plan",
+    "refresh": "node tools/freepi-accounts.mjs refresh",
     "test": "node --test tools/test-policy.test.mjs"
+  },
+  "bin": {
+    "freepi-proxy": "proxy.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

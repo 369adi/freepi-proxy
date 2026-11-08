@@ -11,53 +11,161 @@ It lets **opencode** (or any OpenAI-API harness) use free-pi as its LLM provider
 
 ---
 
-## Prerequisites
+## Quick start (Windows)
 
-1. Run `npx free-pi-cli` **once** to go through the consent screen and log in with GitHub.  
-   This creates `~/.free-pi/agent/credentials.json`.  
-   You do not need to keep the pi TUI open after that.
+```powershell
+git clone https://github.com/369adi/freepi-proxy
+cd freepi-proxy
+```
 
-2. Node.js ≥ 18 (no npm install needed — zero dependencies).
+Then **double-click `Setup.cmd`** — it checks Node.js, seeds the account store,
+writes the opencode and DeepSeek Harness configs and runs a health check.
+
+Afterwards **double-click `Start-Proxy.cmd`**. Leave that window open; ads print
+there. Stop it with `Stop-Proxy.cmd` or `Ctrl+C`.
+
+That's it — opencode and DSH can now talk to `http://127.0.0.1:4000/v1`.
 
 ---
 
-## Start the proxy
+## Prerequisites
+
+1. **Node.js ≥ 18** — <https://nodejs.org> (LTS). No `npm install` needed,
+   the project has zero dependencies.
+2. **A free-pi login.** Run once:
+
+   ```powershell
+   npx free-pi-cli
+   ```
+
+   Go through the consent screen and log in with GitHub. This creates
+   `%USERPROFILE%\.free-pi\agent\credentials.json`.
+   You do **not** need to keep the pi TUI open afterwards.
+
+`Setup.cmd` tells you if either is missing.
+
+---
+
+## Setup commands
 
 ```powershell
-cd C:\Users\liket\Documents\freepi-proxy
-node proxy.mjs
+node tools\setup.mjs            # same as Setup.cmd, step by step
+node tools\setup.mjs --check     # read-only: what is installed and configured
+node tools\setup.mjs --force     # re-apply configs without asking
 ```
 
-Or with a custom port:
+`setup` is idempotent — running it twice changes nothing twice.
+
+---
+
+## Start / stop
+
+```powershell
+node proxy.mjs                   # foreground, see the ads
+```
+
+| Windows | |
+|---|---|
+| `Setup.cmd` | install / configure |
+| `Start-Proxy.cmd` | start the proxy, checks prerequisites first |
+| `Stop-Proxy.cmd` | kill a running proxy |
+| `Watchdog.cmd` | supervise the proxy — restarts it if it dies |
+
+### Keep it running
+
+If the proxy stops, every client that points at `127.0.0.1:4000` fails with a
+connection error. The watchdog prevents that:
+
+```powershell
+node tools\watchdog.mjs              # supervise in this console
+node tools\watchdog.mjs --install    # start automatically at logon
+node tools\watchdog.mjs --remove     # undo
+```
+
+Logs, which are the first place to look after a crash:
+
+| File | Content |
+|---|---|
+| `%USERPROFILE%\.free-pi\proxy\proxy.log` | proxy stdout/stderr |
+| `%USERPROFILE%\.free-pi\proxy\crashes.log` | start/exit events with timestamps |
+
+The watchdog polls `/v1/models` every 20 s and restarts the proxy after three
+failed checks in a row.
+
+Custom port:
 
 ```powershell
 $env:FREEPI_PROXY_PORT = 5000
 node proxy.mjs
 ```
 
-Leave this window **open** while you work — ads print here.
-
-> On Windows you can also double-click `Start-Proxy.cmd`.
-
 ---
 
 ## Connect opencode
 
-opencode reads its provider config from `opencode.json` (project-level) or
-`~/.config/opencode/config.json` (global).  Add or merge:
+`Setup.cmd` writes this for you. Manually, add to `opencode.json`
+(project) or `~/.config/opencode/config.json` (global):
 
 ```json
 {
-  "provider": "openai",
-  "openai": {
-    "baseUrl": "http://127.0.0.1:4000/v1",
-    "apiKey": "freepi-proxy"
+  "provider": {
+    "freepi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "free-pi (local proxy)",
+      "options": {
+        "baseURL": "http://127.0.0.1:4000/v1",
+        "apiKey": "freepi-proxy"
+      }
+    }
   }
 }
 ```
 
-Then in your project just run `opencode` as normal — it will call your proxy
-which forwards to free-pi.
+Then `opencode` calls your proxy, which forwards to free-pi.
+
+---
+
+## Connect DeepSeek Harness
+
+`Setup.cmd` appends a `freepi` provider to the profile patch under
+`%USERPROFILE%\.dsh\profiles\<profile>\*.yml`:
+
+```yaml
+freepi:
+  type: openai-completions
+  baseUrl: http://127.0.0.1:4000/v1
+  apiKeyEnv: FREEPI_PROXY_API_KEY
+  default: deepseek-v4.1-flash
+```
+
+Set the key (any non-empty string — the proxy does not check it):
+
+```powershell
+setx FREEPI_PROXY_API_KEY freepi-proxy
+```
+
+---
+
+## Troubleshooting
+
+Run the doctor:
+
+```powershell
+node tools\doctor.mjs
+```
+
+It checks Node, credentials, the account store, token validity (live),
+whether the client version is still accepted, the port and reachability of
+`api.freepi.ai`.
+
+| Symptom | Fix |
+|---|---|
+| `Node.js not found` | install Node ≥ 18, reopen the terminal |
+| `No usable free-pi account` | run `npx free-pi-cli` once, then `node tools\freepi-accounts.mjs import` |
+| `Port 4000 in use` | `$env:FREEPI_PROXY_PORT = 5000`, or `Stop-Proxy.cmd` for a stale instance |
+| `free-pi requires a newer version` | raise `FREEPI_VERSION` in `proxy.mjs` |
+| `token rejected (401)` | `node tools\freepi-accounts.mjs add` to log in again |
+| requests fail with 402/429 | budget used up everywhere — see the rotation section |
 
 ---
 
