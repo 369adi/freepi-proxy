@@ -12,8 +12,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
 
-import { loadStore, saveStore, findAccount, markExhausted, markInvalid } from './tools/lib/store.mjs';
+import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
@@ -70,6 +71,91 @@ function queueDepth() {
 }
 
 let STORE = null;
+let STORE_MTIME = 0;
+
+/** mtime of the accounts file, or 0 when it does not exist yet. */
+async function storeModTime() {
+  try {
+    const st = await fs.stat(STORE_PATH);
+    return st.mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Accounts added while the proxy is running must show up without a restart.
+ * Reload when the store file changed on disk; re-persist our own writes first
+ * so live usage counters are not thrown away.
+ * Serialised: several requests may call this at the same time.
+ */
+let SYNC_INFLIGHT = null;
+const MEASURE_TRIED = new Map(); // account id -> last measurement attempt (ms)
+
+function syncStore() {
+  if (!SYNC_INFLIGHT) {
+    SYNC_INFLIGHT = doSyncStore().finally(() => {
+      SYNC_INFLIGHT = null;
+    });
+  }
+  return SYNC_INFLIGHT;
+}
+
+async function doSyncStore() {
+  const { store } = await ensureStore();
+  const mtime = await storeModTime();
+  if (!STORE) {
+    STORE = store;
+    STORE_MTIME = mtime;
+    return STORE;
+  }
+  if (mtime && mtime !== STORE_MTIME) {
+    // Keep the freshest in-memory usage for accounts we already track.
+    const live = new Map();
+    for (const a of STORE.accounts || []) live.set(a.id, a);
+    for (const a of store.accounts || []) {
+      const old = live.get(a.id);
+      if (old && old.usage && (!a.usage || (a.usage.measuredAt || '') < (old.usage.measuredAt || ''))) {
+        a.usage = old.usage;
+        a.day = old.day;
+      }
+    }
+    const fresh = (store.accounts || []).filter((a) => !live.has(a.id));
+    STORE = store;
+    STORE_MTIME = mtime;
+    console.log(`[proxy] store reloaded: ${STORE.accounts.length} account(s)`);
+
+    // Measure accounts we have never seen, so they become usable lanes at once
+    // instead of sitting in the "stale" state until something else refreshes them.
+    if (fresh.length) {
+      await Promise.all(
+        fresh.map((a) => refreshAccount(STORE, a, Date.now()).catch(() => null)),
+      );
+      await persist();
+      const ready = fresh.filter((a) => a.usage && !a.tokenBad).length;
+      console.log(`[proxy] measured ${ready}/${fresh.length} new account(s)`);
+    }
+  }
+
+  // An account whose measurement is stale or missing cannot serve as a lane.
+  // Fill that in lazily (max one attempt per account per minute) so N accounts -> N lanes.
+  const now = Date.now();
+  const staleMs = Number(STORE.settings?.staleMs) || 10 * 60 * 1000;
+  const unmeasured = (STORE.accounts || []).filter((a) => {
+    if (a.disabled || !a.token || a.tokenBad) return false;
+    const fetchedAt = a.usage?.fetchedAt ? Date.parse(a.usage.fetchedAt) : 0;
+    if (fetchedAt && now - fetchedAt <= staleMs) return false;
+    return now - (MEASURE_TRIED.get(a.id) || 0) > 60000;
+  });
+  if (unmeasured.length) {
+    for (const a of unmeasured) MEASURE_TRIED.set(a.id, now);
+    await Promise.all(
+      unmeasured.map((a) => refreshAccount(STORE, a, now).catch(() => null)),
+    );
+    await persist();
+  }
+  return STORE;
+}
 
 // ---------------------------------------------------------------- account glue
 
@@ -446,11 +532,13 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       upReq.on('error', err => {
         finish();
         console.error('[proxy] upstream error: ' + err.message);
+        if (inRes.destroyed) return;
         if (!inRes.headersSent) {
           inRes.writeHead(502, { 'content-type': 'application/json' });
           inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
-        }
+        } else { inRes.destroy(err); }
       });
+      bindRequestLifecycle(upReq, inRes, finish);
       upReq.write(body);
       upReq.end();
     };
@@ -592,13 +680,19 @@ function startServer(models) {
 
     // Local diagnostics: what is left, what the rotator plans to do.
     if (req.method === 'GET' && (url.pathname === '/usage' || url.pathname === '/accounts')) {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(usageSnapshot(), null, 2));
+      syncStore()
+        .catch(() => null)
+        .then(function () {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(usageSnapshot(), null, 2));
+        });
       return;
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-      proxyCompletions(req, res);
+      syncStore()
+        .catch(() => null)
+        .finally(function () { proxyCompletions(req, res); });
       return;
     }
 
