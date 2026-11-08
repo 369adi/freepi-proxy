@@ -312,6 +312,13 @@ const commands = {
   import: cmdImport,
   help: async () => {
     console.log('usage: node tools/freepi-accounts.mjs <status|refresh|plan|add|use|remove|import>');
+    console.log('');
+    console.log('  add            log in a new account via the GitHub device flow');
+    console.log('                 --manual      print the code, do not touch the browser');
+    console.log('                 --no-browser  do not open a browser window at all');
+    console.log('');
+    console.log('  Fully automatic add (drives Chrome, types the code, clicks Authorize):');
+    console.log('    node tools/freepi-add.mjs [--manual]');
   },
 };
 
