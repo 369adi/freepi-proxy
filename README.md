@@ -1,4 +1,4 @@
-﻿# freepi-proxy
+# freepi-proxy
 
 A zero-dependency OpenAI-compatible proxy for [free-pi-cli](https://github.com/dennisonbertram/free-pi-cli).  
 It lets **opencode** (or any OpenAI-API harness) use free-pi as its LLM provider, while:
@@ -6,6 +6,8 @@ It lets **opencode** (or any OpenAI-API harness) use free-pi as its LLM provider
 - **keeping ads** — the proxy polls the free-pi ads endpoint every 30 s and displays them in its own terminal window, maintaining the ethical ad-supported model
 - **reusing your existing credentials** — reads `~/.free-pi/agent/credentials.json`, no duplicate login
 - **not touching pi's TUI** — you can keep a separate `free-pi-cli` window for its slash-commands if you want
+- **tracking your remaining quota** — live credits per day via `GET /me`, persisted to disk
+- **rotating between accounts** — continues on another account shortly *before* the daily budget runs out, and reuses accounts whose budget has been refilled
 
 ---
 
@@ -64,9 +66,88 @@ which forwards to free-pi.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/models` | Returns the model catalog from free-pi |
-| `POST` | `/v1/chat/completions` | Proxies to `api.freepi.ai` with your JWT |
+| `POST` | `/v1/chat/completions` | Proxies to `api.freepi.ai` with the active account |
+| `GET` | `/usage` | Local JSON: remaining credits per account + what the rotator does next |
+| `GET` | `/accounts` | Same payload as `/usage` |
 
 All other paths return 404.
+
+---
+
+## Usage tracking and account rotation
+
+free-pi grants a daily credit allowance per account (`allowance_credits`, currently
+15 000) that refills at `refill_at`. The proxy keeps a persistent account store at
+
+```
+%USERPROFILE%\.free-pi\proxy\accounts.json      (override: FREEPI_ACCOUNTS_PATH)
+```
+
+> **This file contains login tokens.** It lives outside the repository on purpose —
+> never commit it, never paste it anywhere.
+
+For every account the store remembers:
+
+- `usage` — last measurement from `GET /me`: `allowanceCredits`,
+  `remainingCreditsToday`, the USD cap (`cap_usd_today` / `remaining_usd_today`),
+  `refillAt`, tier and the time of measurement
+- `day` — how many credits were consumed today
+- `history` — the last 60 days of consumption, rolled over automatically at refill
+- totals — credits used overall and per day across all accounts
+
+### When does it switch?
+
+Every account is classified on each check:
+
+| State | Meaning |
+|-------|---------|
+| `ready` | enough budget — keep using it |
+| `low` | below the watermark (default 10 % of the allowance) — switch when a better account exists |
+| `exhausted` | nothing left today |
+| `refillable` | was empty, but `refill_at` has passed — re-measure, then reuse |
+| `stale` | last measurement older than 10 min — re-measure |
+| `invalid` | token rejected or expired — needs a new login, never used automatically |
+
+The decision order (`tools/lib/policy.mjs`, pure functions, unit-tested):
+
+1. active account is `ready` → keep it
+2. another existing account has more budget → **switch to it** (this is the
+   "switch shortly before it is used up" step — a `low` account is only kept when
+   it is the best one left)
+3. some data is out of date → re-measure, then decide again
+4. everything empty, but a daily refill is within 20 min → **wait**, requests
+   fail until then instead of burning a fresh account
+5. only then: a new account is genuinely required
+
+### Managing accounts
+
+```powershell
+node tools\freepi-accounts.mjs status      # per-account state, budget, refill time
+node tools\freepi-accounts.mjs plan        # what the rotator would do right now
+node tools\freepi-accounts.mjs refresh     # re-measure every account via /me
+node tools\freepi-accounts.mjs add         # log in another account (device flow)
+node tools\freepi-accounts.mjs use acc-2   # pin an account as active
+node tools\freepi-accounts.mjs remove acc-2
+node tools\freepi-accounts.mjs import      # seed from free-pi-cli credentials.json
+```
+
+`npm test` runs the rotation-policy unit tests (`node --test`).
+
+### Running out of budget
+
+Adding an account is **not** automated: it needs a GitHub sign-up, which is a
+human step by design. When `plan` reports `create a NEW account gh-N@arisya.de`:
+
+1. create a GitHub account using that address (a catch-all domain delivers the
+   verification mail to the catch-all mailbox)
+2. read the verification link:
+   `node tools\fetch-verify-mail.mjs gh-N@arisya.de`
+   (configured through `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, `IMAP_PORT`)
+3. `node tools\freepi-accounts.mjs add` — prints a code for
+   `github.com/login/device`, handles the consent step, stores the token
+
+The proxy itself never creates accounts; it only tells you when one is needed
+and keeps serving from existing accounts otherwise.
 
 ---
 

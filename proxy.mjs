@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+// free-pi proxy — OpenAI-compatible local gateway with multi-account rotation.
+//
+// One local endpoint, many free-pi accounts: the rotator measures each account's
+// live budget via GET /me, keeps using the active one until it gets low, then
+// switches to another existing account. A brand-new GitHub account is only
+// needed when *every* known account is out of budget and no daily refill is
+// imminent — see tools/lib/policy.mjs for that decision.
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs/promises';
@@ -6,19 +13,107 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
+import { loadStore, saveStore, findAccount, markExhausted, markInvalid } from './tools/lib/store.mjs';
+import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
+import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
+import { getCatalog } from './tools/lib/freepi-api.mjs';
+
 const FREEPI_BASE    = 'https://api.freepi.ai';
 const FREEPI_VERSION = '0.6.15';   // keep in sync with upstream minimum
 const PORT           = Number(process.env.FREEPI_PROXY_PORT ?? 4000);
 const AD_INTERVAL_MS = 30_000;
+const USAGE_POLL_MS  = Number(process.env.FREEPI_USAGE_POLL_MS ?? 60_000);
 const CREDENTIALS_PATH = path.join(os.homedir(), '.free-pi', 'agent', 'credentials.json');
 const SESSION_ID = crypto.randomUUID();
 
-async function loadJwt() {
-  try {
-    const p = JSON.parse(await fs.readFile(CREDENTIALS_PATH, 'utf8'));
-    return typeof p.token === 'string' && p.token ? p.token : null;
-  } catch { return null; }
+let STORE = null;
+
+// ---------------------------------------------------------------- account glue
+
+async function persist() {
+  if (!STORE) return;
+  try { await saveStore(STORE); } catch (err) { console.error('[proxy] store save failed: ' + err.message); }
 }
+
+function activeAccount() {
+  return STORE ? findAccount(STORE, STORE.activeAccountId) : null;
+}
+
+/**
+ * Pick the account to talk to upstream. Re-measures when data is stale or when
+ * the current account is about to run dry, so the switch happens *before* the
+ * budget is gone rather than after a failed request.
+ */
+async function chooseAccount() {
+  if (!STORE) return null;
+  const now = Date.now();
+  let decision = decide(STORE, now, STORE.settings);
+
+  if (decision.action === 'refresh') {
+    for (const id of decision.accountIds) {
+      const account = findAccount(STORE, id);
+      if (account) await refreshAccount(STORE, account, now);
+    }
+    await persist();
+    decision = decide(STORE, Date.now(), STORE.settings);
+  }
+
+  if (decision.action === 'switch') {
+    const target = findAccount(STORE, decision.accountId);
+    if (target) {
+      STORE.activeAccountId = target.id;
+      target.lastUsedAt = new Date().toISOString();
+      await persist();
+      console.log(`[rotator] switch -> ${target.id} (${target.handle || target.email || '?'}) — ${decision.reason}`);
+      return target;
+    }
+  }
+
+  if (decision.action === 'keep' || decision.action === 'switch') {
+    const account = activeAccount();
+    if (account) {
+      account.lastUsedAt = new Date().toISOString();
+      return account;
+    }
+  }
+
+  if (decision.action === 'wait') {
+    console.warn(`[rotator] all accounts exhausted; next refill ${decision.until} — requests will fail until then`);
+    const fallback = activeAccount();
+    return fallback; // let upstream answer with the real quota error
+  }
+
+  if (decision.action === 'mint') {
+    console.warn('[rotator] every account is out of budget and no refill is close.');
+    console.warn(`[rotator] a new account is required: ${decision.email}`);
+    console.warn('[rotator] run:  node tools/freepi-accounts.mjs add   (see README "Adding an account")');
+    const fallback = activeAccount();
+    return fallback;
+  }
+  return activeAccount();
+}
+
+/** Candidate accounts to retry with, best first, excluding the failed one. */
+function retryCandidates(excludeId) {
+  if (!STORE) return [];
+  const now = Date.now();
+  return STORE.accounts
+    .filter(a => !a.disabled && a.id !== excludeId && !a.tokenBad && a.token)
+    .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
+    .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
+    .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
+    .map(x => x.account);
+}
+
+async function promote(account, reason) {
+  if (!STORE || !account) return;
+  STORE.activeAccountId = account.id;
+  account.lastUsedAt = new Date().toISOString();
+  await persist();
+  console.log(`[rotator] retry on ${account.id} (${account.handle || account.email || '?'}) — ${reason}`);
+}
+
+// ---------------------------------------------------------------- upstream I/O
 
 function httpsGet(urlStr, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -39,20 +134,17 @@ function httpsGet(urlStr, headers = {}) {
   });
 }
 
-async function fetchCatalog(jwt) {
+async function fetchCatalogFor(token) {
   try {
-    const r = await httpsGet(
-      `${FREEPI_BASE}/client-version?cli_version=${FREEPI_VERSION}`,
-      { authorization: `Bearer ${jwt}`, 'x-client-version': FREEPI_VERSION },
-    );
-    return (typeof r.body === 'object' && r.body) ? r.body : {};
+    const r = await getCatalog(token);
+    return (typeof r === 'object' && r) ? r : {};
   } catch { return {}; }
 }
 
-async function fetchAd(jwt) {
+async function fetchAd(token) {
   try {
     return await httpsGet(`${FREEPI_BASE}/ads/next?slot=banner`, {
-      authorization: `Bearer ${jwt}`,
+      authorization: `Bearer ${token}`,
       'x-session-id': SESSION_ID,
       'x-client-version': FREEPI_VERSION,
     });
@@ -81,58 +173,231 @@ function renderAd(ad) {
   console.log('+' + bar + '+');
 }
 
-async function runAdLoop(jwt) {
-  const tick = async () => { const a = await fetchAd(jwt); if (a && a.status === 200) renderAd(a); };
+async function runAdLoop() {
+  const tick = async () => {
+    const account = activeAccount();
+    if (!account || !account.token) return;
+    const a = await fetchAd(account.token);
+    if (a && a.status === 200) renderAd(a);
+  };
   await tick();
   setInterval(tick, AD_INTERVAL_MS);
 }
 
-// No model remapping: the model ID opencode sends is forwarded as-is.
-function proxyCompletions(jwt, inReq, inRes) {
+/** Background: keep the usage numbers warm and rotate before the budget dies. */
+async function runUsageLoop() {
+  const tick = async () => {
+    if (!STORE) return;
+    try {
+      await refreshAll(STORE, { now: Date.now() });
+      await persist();
+      const d = decide(STORE, Date.now(), STORE.settings);
+      if (d.action === 'switch') {
+        const target = findAccount(STORE, d.accountId);
+        if (target) {
+          STORE.activeAccountId = target.id;
+          await persist();
+          console.log(`[rotator] proactive switch -> ${target.id} — ${d.reason}`);
+        }
+      } else if (d.action === 'mint') {
+        console.warn(`[rotator] budget exhausted everywhere; new account would be ${d.email}`);
+      }
+    } catch (err) {
+      console.error('[rotator] usage poll failed: ' + err.message);
+    }
+  };
+  await tick();
+  setInterval(tick, USAGE_POLL_MS);
+}
+
+// ---------------------------------------------------------------- chat proxy
+
+const QUOTA_STATUS = new Set([402, 429]);
+
+/**
+ * Forward one chat completion. If the upstream rejects it because the account's
+ * budget is used up, that account is marked exhausted and the same request is
+ * retried on the next usable account (nothing has been sent to the client yet).
+ */
+function proxyCompletions(inReq, inRes, attempt = 0) {
   const chunks = [];
   inReq.on('data', c => chunks.push(c));
-  inReq.on('end', () => {
+  inReq.on('end', async () => {
     const body = Buffer.concat(chunks);
     try { const p = JSON.parse(body); if (p.model) console.log('[proxy] -> ' + p.model); } catch {}
-    const upReq = https.request({
-      hostname: 'api.freepi.ai',
-      port: 443,
-      path: '/v1/chat/completions',
-      method: 'POST',
-      headers: Object.assign(
-        {
-          'content-type': 'application/json',
-          'content-length': body.length,
-          'authorization': 'Bearer ' + jwt,
-          'x-session-id': SESSION_ID,
-          'x-client-version': FREEPI_VERSION,
+
+    const account = await chooseAccount();
+    if (!account || !account.token) {
+      inRes.writeHead(503, { 'content-type': 'application/json' });
+      inRes.end(JSON.stringify({
+        error: {
+          message: 'no usable free-pi account. run: node tools/freepi-accounts.mjs add',
+          type: 'no_account',
         },
-        inReq.headers['accept']        ? { accept: inReq.headers['accept'] } : {},
-        inReq.headers['x-request-id'] ? { 'x-request-id': inReq.headers['x-request-id'] } : {},
-      ),
-    }, upRes => {
-      const h = {
-        'access-control-allow-origin': '*',
-        'content-type': upRes.headers['content-type'] || 'application/json',
-      };
-      if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
-      if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
-      inRes.writeHead(upRes.statusCode, h);
-      upRes.pipe(inRes);
-    });
-    upReq.on('error', err => {
-      console.error('[proxy] upstream error: ' + err.message);
-      if (!inRes.headersSent) {
-        inRes.writeHead(502, { 'content-type': 'application/json' });
-        inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
-      }
-    });
-    upReq.write(body);
-    upReq.end();
+      }));
+      return;
+    }
+
+    const send = (token, onQuota, onUnauthorized) => {
+      const upReq = https.request({
+        hostname: 'api.freepi.ai',
+        port: 443,
+        path: '/v1/chat/completions',
+        method: 'POST',
+        headers: Object.assign(
+          {
+            'content-type': 'application/json',
+            'content-length': body.length,
+            'authorization': 'Bearer ' + token,
+            'x-session-id': SESSION_ID,
+            'x-client-version': FREEPI_VERSION,
+          },
+          inReq.headers['accept']        ? { accept: inReq.headers['accept'] } : {},
+          inReq.headers['x-request-id'] ? { 'x-request-id': inReq.headers['x-request-id'] } : {},
+        ),
+      }, upRes => {
+        if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
+          // Drain and let the caller decide: rotate and retry, or relay.
+          const errChunks = [];
+          upRes.on('data', d => errChunks.push(d));
+          upRes.on('end', () => onQuota(upRes.statusCode, Buffer.concat(errChunks)));
+          return;
+        }
+        if (upRes.statusCode === 401 && !inRes.headersSent) {
+          const errChunks = [];
+          upRes.on('data', d => errChunks.push(d));
+          upRes.on('end', () => onUnauthorized(Buffer.concat(errChunks)));
+          return;
+        }
+        const h = {
+          'access-control-allow-origin': '*',
+          'content-type': upRes.headers['content-type'] || 'application/json',
+        };
+        if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
+        if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
+        inRes.writeHead(upRes.statusCode, h);
+        upRes.pipe(inRes);
+      });
+      upReq.on('error', err => {
+        console.error('[proxy] upstream error: ' + err.message);
+        if (!inRes.headersSent) {
+          inRes.writeHead(502, { 'content-type': 'application/json' });
+          inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
+        }
+      });
+      upReq.write(body);
+      upReq.end();
+    };
+
+    const relay = (status, buf) => {
+      if (inRes.headersSent) { inRes.end(); return; }
+      inRes.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      inRes.end(buf);
+    };
+
+    const tryNext = async (reason) => {
+      if (attempt >= 3) return false;
+      const next = retryCandidates(account.id)[0];
+      if (!next) return false;
+      await promote(next, reason);
+      proxyCompletionsReplay(body, inReq, inRes, attempt + 1, next);
+      return true;
+    };
+
+    send(
+      account.token,
+      async (status, buf) => {
+        // The account just ran dry: remember that and try another one.
+        markExhausted(account, `upstream ${status}`);
+        account.usage = account.usage || {};
+        account.usage.remainingCreditsToday = 0;
+        await persist();
+        console.log(`[rotator] ${account.id} returned ${status} (budget spent) — rotating`);
+        if (await tryNext('budget spent (' + status + ')')) return;
+        relay(status, buf);
+      },
+      async (buf) => {
+        markInvalid(account, 'token rejected (401)');
+        await persist();
+        console.log(`[rotator] ${account.id} token rejected — rotating`);
+        if (await tryNext('token rejected')) return;
+        relay(401, buf);
+      },
+    );
   });
 }
 
-function startServer(jwt, models) {
+/**
+ * Replay an already-buffered request body against a specific account
+ * (used for the retry path so the client body is not consumed twice).
+ */
+function proxyCompletionsReplay(body, inReq, inRes, attempt, account) {
+  const upReq = https.request({
+    hostname: 'api.freepi.ai',
+    port: 443,
+    path: '/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': body.length,
+      'authorization': 'Bearer ' + account.token,
+      'x-session-id': SESSION_ID,
+      'x-client-version': FREEPI_VERSION,
+      accept: inReq.headers['accept'] || 'application/json',
+    },
+  }, upRes => {
+    if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
+      const errChunks = [];
+      upRes.on('data', d => errChunks.push(d));
+      upRes.on('end', async () => {
+        markExhausted(account, `upstream ${upRes.statusCode}`);
+        account.usage = account.usage || {};
+        account.usage.remainingCreditsToday = 0;
+        await persist();
+        const next = retryCandidates(account.id)[0];
+        if (next && attempt < 3) {
+          await promote(next, 'budget spent');
+          proxyCompletionsReplay(body, inReq, inRes, attempt + 1, next);
+          return;
+        }
+        inRes.writeHead(upRes.statusCode, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        inRes.end(Buffer.concat(errChunks));
+      });
+      return;
+    }
+    const h = {
+      'access-control-allow-origin': '*',
+      'content-type': upRes.headers['content-type'] || 'application/json',
+    };
+    if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
+    if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
+    inRes.writeHead(upRes.statusCode, h);
+    upRes.pipe(inRes);
+  });
+  upReq.on('error', err => {
+    console.error('[proxy] upstream error: ' + err.message);
+    if (!inRes.headersSent) {
+      inRes.writeHead(502, { 'content-type': 'application/json' });
+      inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
+    }
+  });
+  upReq.write(body);
+  upReq.end();
+}
+
+// ---------------------------------------------------------------- local server
+
+function usageSnapshot() {
+  const now = Date.now();
+  return {
+    activeAccountId: STORE ? STORE.activeAccountId : null,
+    nextAction: STORE ? decide(STORE, now, STORE.settings) : null,
+    totals: STORE ? STORE.totals : null,
+    accounts: (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
+  };
+}
+
+function startServer(models) {
   const catalog = (Array.isArray(models) && models.length)
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
@@ -155,8 +420,15 @@ function startServer(jwt, models) {
       return;
     }
 
+    // Local diagnostics: what is left, what the rotator plans to do.
+    if (req.method === 'GET' && (url.pathname === '/usage' || url.pathname === '/accounts')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(usageSnapshot(), null, 2));
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-      proxyCompletions(jwt, req, res);
+      proxyCompletions(req, res);
       return;
     }
 
@@ -186,6 +458,9 @@ function startServer(jwt, models) {
     console.log('     }');
     console.log('   }');
     console.log(sep);
+    console.log(' usage:   GET http://127.0.0.1:' + PORT + '/usage');
+    console.log(' accounts: node tools/freepi-accounts.mjs status');
+    console.log(sep);
     console.log(' Models (copy an ID into the opencode "model" setting):');
     console.log(sep);
     for (const m of catalog)
@@ -197,17 +472,36 @@ function startServer(jwt, models) {
 }
 
 async function main() {
-  const jwt = await loadJwt();
-  if (!jwt) {
-    console.error('No credentials. Run  npx free-pi-cli  once first.');
-    console.error('Expected: ' + CREDENTIALS_PATH);
+  const { store, seeded } = await ensureStore();
+  STORE = store;
+  if (!STORE.accounts.length) {
+    console.error('No free-pi account available.');
+    console.error('Run  npx free-pi-cli  once, or:  node tools/freepi-accounts.mjs add');
+    console.error('Expected credentials: ' + CREDENTIALS_PATH);
     process.exit(1);
   }
-  const data   = await fetchCatalog(jwt);
+  if (seeded) console.log('[rotator] imported existing credentials from ' + CREDENTIALS_PATH);
+
+  // Measure everything once at startup so the very first request is routed well.
+  const results = await refreshAll(STORE, { force: true });
+  await persist();
+  for (const r of results) {
+    const a = findAccount(STORE, r.id);
+    const u = a && a.usage;
+    console.log(
+      `[rotator] ${String(r.id).padEnd(8)} ${String(a && (a.handle || a.email)).padEnd(16)} ` +
+      (u ? `${u.remainingCreditsToday} / ${u.allowanceCredits} credits left` : (r.reason || '?')),
+    );
+  }
+
+  const active = activeAccount();
+  const data = await fetchCatalogFor(active ? active.token : null);
   const models = Array.isArray(data.models) && data.models.length ? data.models : null;
   if (data.notice) console.log('[free-pi] ' + data.notice);
-  startServer(jwt, models);
-  runAdLoop(jwt).catch(function() {});
+
+  startServer(models);
+  runUsageLoop().catch(function() {});
+  runAdLoop().catch(function() {});
 }
 
 main().catch(function(err) { console.error('[proxy] Fatal:', err); process.exit(1); });

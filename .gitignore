@@ -12,3 +12,7 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# per-account store lives outside the repo, but never let it slip in
+accounts.json
+*.tmp
