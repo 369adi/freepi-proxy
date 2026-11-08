@@ -26,6 +26,49 @@ const USAGE_POLL_MS  = Number(process.env.FREEPI_USAGE_POLL_MS ?? 60_000);
 const CREDENTIALS_PATH = path.join(os.homedir(), '.free-pi', 'agent', 'credentials.json');
 const SESSION_ID = crypto.randomUUID();
 
+// free-pi allows exactly ONE in-flight request per account ("one request at a
+// time"). Parallel clients - a harness running several subagents - would all but
+// one get 429. Two layers fix that:
+//   1. one lane per account, so N accounts serve N concurrent requests,
+//   2. a FIFO queue, so extra requests wait instead of failing.
+const MAX_QUEUE = Number(process.env.FREEPI_MAX_QUEUE ?? 64);
+
+/**
+ * Queue a request that found no free account lane. The callback is retried
+ * every time a lane frees up. Unlike enqueue() this does not reserve an
+ * upstream slot - lanes are the concurrency limit now.
+ */
+const claimWaiters = [];
+
+function enqueueClaim(attemptClaim) {
+  if (claimWaiters.length >= MAX_QUEUE) return { accepted: false };
+  const waiter = { attemptClaim, cancelled: false };
+  claimWaiters.push(waiter);
+  const position = claimWaiters.length;
+  if (position > 0) console.log('[queue] waiting for a free account lane, position ' + position);
+  return {
+    accepted: true,
+    position,
+    cancel: () => { waiter.cancelled = true; },
+  };
+}
+
+/** Hand free lanes to waiting requests. Called whenever a lane is released. */
+function pumpClaims() {
+  for (let i = 0; i < claimWaiters.length; i++) {
+    const waiter = claimWaiters[i];
+    if (waiter.cancelled) { claimWaiters.splice(i, 1); i--; continue; }
+    if (!usableAccounts().some(a => !laneBusy.has(a.id))) return; // no lane free
+    claimWaiters.splice(i, 1);
+    try { waiter.attemptClaim(); } catch (e) { console.error('[queue] ' + e.message); }
+    i = -1; // re-check from the start: the claim may have taken the last lane
+  }
+}
+
+function queueDepth() {
+  return { inFlight: laneBusy.size, waiting: claimWaiters.length, lanes: laneCount() };
+}
+
 let STORE = null;
 
 // ---------------------------------------------------------------- account glue
@@ -103,6 +146,64 @@ function retryCandidates(excludeId) {
     .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
     .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
     .map(x => x.account);
+}
+
+// ------------------------------------------------ multi-account request lanes
+//
+// free-pi allows ONE in-flight request per account, but a harness running
+// several subagents needs real parallelism. So each account is a lane: a request
+// claims a free account, runs on it, and frees it again. With N accounts we get
+// N truly concurrent requests; a request only queues when every lane is busy.
+
+const laneBusy = new Set();   // account ids currently serving a request
+
+/** All accounts usable right now, most remaining budget first. */
+function usableAccounts() {
+  if (!STORE) return [];
+  const now = Date.now();
+  return STORE.accounts
+    .filter(a => !a.disabled && !a.tokenBad && a.token)
+    .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
+    .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
+    .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
+    .map(x => x.account);
+}
+
+/**
+ * Claim a free account for one request. Returns {account, release} or null when
+ * every lane is busy. A free lane is preferred over the sticky active account so
+ * parallel subagents spread across accounts instead of colliding on one.
+ */
+function claimAccount() {
+  const usable = usableAccounts();
+  if (!usable.length) {
+    // No measured-but-usable account: fall back to the rotator decision path,
+    // which may refresh stale data or report a quota problem.
+    return null;
+  }
+  const free = usable.filter(a => !laneBusy.has(a.id));
+  if (!free.length) return null;
+  // Round-robin-ish: least recently used among free lanes keeps wear even.
+  free.sort((a, b) => {
+    const la = a.lastUsedAt ? Date.parse(a.lastUsedAt) : 0;
+    const lb = b.lastUsedAt ? Date.parse(b.lastUsedAt) : 0;
+    return la - lb;
+  });
+  const account = free[0];
+  laneBusy.add(account.id);
+  account.lastUsedAt = new Date().toISOString();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    laneBusy.delete(account.id);
+    setImmediate(pumpClaims);
+  };
+  return { account, release };
+}
+
+function laneCount() {
+  return usableAccounts().length;
 }
 
 async function promote(account, reason) {
@@ -226,19 +327,61 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     const body = Buffer.concat(chunks);
     try { const p = JSON.parse(body); if (p.model) console.log('[proxy] -> ' + p.model); } catch {}
 
-    const account = await chooseAccount();
-    if (!account || !account.token) {
-      inRes.writeHead(503, { 'content-type': 'application/json' });
-      inRes.end(JSON.stringify({
-        error: {
-          message: 'no usable free-pi account. run: node tools/freepi-accounts.mjs add',
-          type: 'no_account',
-        },
-      }));
+    // Take a free account lane if one exists; otherwise wait in the queue and
+    // claim a lane as soon as another request frees it.
+    const start = (claimed) => {
+      let account = claimed ? claimed.account : null;
+      let releaseLane = claimed ? claimed.release : () => {};
+
+      const withAccount = async () => {
+        if (!account) {
+          const fallback = await chooseAccount();
+          if (fallback) { account = fallback; releaseLane = () => {}; }
+        }
+        if (!account || !account.token) {
+          releaseLane();
+          inRes.writeHead(503, { 'content-type': 'application/json' });
+          inRes.end(JSON.stringify({
+            error: {
+              message: 'no usable free-pi account. run: node tools/freepi-accounts.mjs add',
+              type: 'no_account',
+            },
+          }));
+          return;
+        }
+        run(account, releaseLane);
+      };
+      withAccount();
+    };
+
+    const tryClaim = () => {
+      const claimed = claimAccount();
+      if (claimed) { start(claimed); return true; }
+      return false;
+    };
+
+    if (!tryClaim()) {
+      // Every lane busy: queue, and claim a lane when one frees up.
+      const slot = enqueueClaim(() => { tryClaim(); });
+      if (!slot.accepted) {
+        inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
+        inRes.end(JSON.stringify({
+          error: {
+            message: 'proxy queue full (' + MAX_QUEUE + ' waiting) - retry shortly.',
+            type: 'queue_full',
+          },
+        }));
+        return;
+      }
+      inRes.on('close', () => { if (!inRes.writableEnded) slot.cancel?.(); });
       return;
     }
 
-    const send = (token, onQuota, onUnauthorized) => {
+    function run(account, releaseLane) {
+    let retries = 0;
+    const send = (token, release) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; release(); } };
       const upReq = https.request({
         hostname: 'api.freepi.ai',
         port: 443,
@@ -257,16 +400,35 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         ),
       }, upRes => {
         if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
-          // Drain and let the caller decide: rotate and retry, or relay.
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => onQuota(upRes.statusCode, Buffer.concat(errChunks)));
+          upRes.on('end', () => {
+            finish();
+            const raw = Buffer.concat(errChunks);
+            // "concurrent" means *we* sent two requests at once, not that the
+            // account is out of credits - never mark it exhausted for that.
+            let code = '';
+            try { code = JSON.parse(raw.toString()).code || ''; } catch { /* ignore */ }
+            if (code === 'concurrent' || raw.toString().includes('one request at a time')) {
+              // Another client raced us on this account (e.g. the pi TUI). The
+              // lane is already released by finish(), so retry on it directly.
+              console.warn('[proxy] upstream said concurrent - retrying after backoff');
+              retries++;
+              if (retries > 4) { relay(429, raw); return; }
+              setTimeout(() => {
+                if (inRes.destroyed) { releaseLane(); return; }
+                send(account.token, releaseLane);
+              }, 400 * retries);
+              return;
+            }
+            onQuota(upRes.statusCode, raw);
+          });
           return;
         }
         if (upRes.statusCode === 401 && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => onUnauthorized(Buffer.concat(errChunks)));
+          upRes.on('end', () => { finish(); onUnauthorized(Buffer.concat(errChunks)); });
           return;
         }
         const h = {
@@ -277,8 +439,12 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
         inRes.writeHead(upRes.statusCode, h);
         upRes.pipe(inRes);
+        upRes.on('end', finish);
+        upRes.on('error', finish);
+        inRes.on('close', finish);
       });
       upReq.on('error', err => {
+        finish();
         console.error('[proxy] upstream error: ' + err.message);
         if (!inRes.headersSent) {
           inRes.writeHead(502, { 'content-type': 'application/json' });
@@ -304,26 +470,29 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       return true;
     };
 
-    send(
-      account.token,
-      async (status, buf) => {
-        // The account just ran dry: remember that and try another one.
-        markExhausted(account, `upstream ${status}`);
-        account.usage = account.usage || {};
-        account.usage.remainingCreditsToday = 0;
-        await persist();
-        console.log(`[rotator] ${account.id} returned ${status} (budget spent) — rotating`);
-        if (await tryNext('budget spent (' + status + ')')) return;
-        relay(status, buf);
-      },
-      async (buf) => {
-        markInvalid(account, 'token rejected (401)');
-        await persist();
-        console.log(`[rotator] ${account.id} token rejected — rotating`);
-        if (await tryNext('token rejected')) return;
-        relay(401, buf);
-      },
-    );
+    const onQuota = async (status, buf) => {
+      markExhausted(account, `upstream ${status}`);
+      account.usage = account.usage || {};
+      account.usage.remainingCreditsToday = 0;
+      await persist();
+      console.log(`[rotator] ${account.id} returned ${status} (budget spent) — rotating`);
+      if (await tryNext('budget spent (' + status + ')')) return;
+      relay(status, buf);
+    };
+
+    const onUnauthorized = async (buf) => {
+      markInvalid(account, 'token rejected (401)');
+      await persist();
+      console.log(`[rotator] ${account.id} token rejected — rotating`);
+      if (await tryNext('token rejected')) return;
+      relay(401, buf);
+    };
+
+    // The lane is already claimed and free-pi allows one request per account,
+    // so go straight upstream. releaseLane fires when the response ends.
+    if (inRes.destroyed) { releaseLane(); return; }
+    send(account.token, releaseLane);
+    }
   });
 }
 
@@ -393,6 +562,7 @@ function usageSnapshot() {
     activeAccountId: STORE ? STORE.activeAccountId : null,
     nextAction: STORE ? decide(STORE, now, STORE.settings) : null,
     totals: STORE ? STORE.totals : null,
+    queue: queueDepth(),
     accounts: (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
   };
 }

@@ -233,26 +233,62 @@ The decision order (`tools/lib/policy.mjs`, pure functions, unit-tested):
 node tools\freepi-accounts.mjs status      # per-account state, budget, refill time
 node tools\freepi-accounts.mjs plan        # what the rotator would do right now
 node tools\freepi-accounts.mjs refresh     # re-measure every account via /me
-node tools\freepi-accounts.mjs add         # log in another account (device flow)
+node tools\freepi-accounts.mjs add         # add an account (opens GitHub in the browser)
+node tools\freepi-accounts.mjs add --many  # add several, one after another
 node tools\freepi-accounts.mjs use acc-2   # pin an account as active
 node tools\freepi-accounts.mjs remove acc-2
 node tools\freepi-accounts.mjs import      # seed from free-pi-cli credentials.json
 ```
 
+Adding an account needs no manual typing: `add` prints the one-time code, copies
+it to the clipboard, and opens `github.com/login/device` with the code already
+filled in. Pick a GitHub account, confirm, done — the token is stored and the
+account is immediately usable. Use `--no-browser` to only print the URL.
+
+On Windows you can also just double-click **`Account-hinzufuegen.cmd`**, which
+runs `add --many` and lets you keep adding accounts in a loop.
+
+### Parallelism: one account = one request at a time
+
+free-pi rejects a second simultaneous request per account with
+
+```
+429 {"code":"concurrent","message":"one request at a time"}
+```
+
+The proxy turns that into real parallelism instead of errors:
+
+* **one lane per account** — with N accounts, N requests run genuinely at the
+  same time
+* **a FIFO queue for the rest** — extra requests wait for a free lane rather than
+  fail (cap: `FREEPI_MAX_QUEUE`, default 64)
+* `code: "concurrent"` is retried with backoff and **never** marks an account as
+  out of budget (only `402` / a real quota `429` does that)
+
+Check current load:
+
+```powershell
+curl http://127.0.0.1:4000/usage     # -> "queue": { inFlight, waiting, lanes }
+```
+
+So: a harness running 3 subagents in parallel wants 3 accounts. Everything above
+that queues and still completes.
+
 `npm test` runs the rotation-policy unit tests (`node --test`).
 
 ### Running out of budget
 
-Adding an account is **not** automated: it needs a GitHub sign-up, which is a
-human step by design. When `plan` reports `create a NEW account gh-N@arisya.de`:
+Adding an account is **not** automated past the GitHub login: it needs a GitHub
+sign-up, which is a human step by design. When `plan` reports
+`create a NEW account gh-N@arisya.de`:
 
 1. create a GitHub account using that address (a catch-all domain delivers the
    verification mail to the catch-all mailbox)
 2. read the verification link:
    `node tools\fetch-verify-mail.mjs gh-N@arisya.de`
    (configured through `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, `IMAP_PORT`)
-3. `node tools\freepi-accounts.mjs add` — prints a code for
-   `github.com/login/device`, handles the consent step, stores the token
+3. `node tools\freepi-accounts.mjs add` — opens GitHub with the code pre-filled,
+   handles the consent step, stores the token
 
 The proxy itself never creates accounts; it only tells you when one is needed
 and keeps serving from existing accounts otherwise.

@@ -1,6 +1,6 @@
 {
   "name": "freepi-proxy",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "OpenAI-compatible local proxy for free-pi-cli with live usage tracking and automatic multi-account rotation",
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "watchdog": "node tools/watchdog.mjs",
     "doctor": "node tools/doctor.mjs",
     "accounts": "node tools/freepi-accounts.mjs",
+    "add": "node tools/freepi-accounts.mjs add",
     "status": "node tools/freepi-accounts.mjs status",
     "plan": "node tools/freepi-accounts.mjs plan",
     "refresh": "node tools/freepi-accounts.mjs refresh",

@@ -13,8 +13,8 @@
 // and `--force` exists only for scripting.
 
 import readline from 'node:readline/promises';
-import {
-  loadStore,
+import { spawn } from 'node:child_process';
+import { loadStore,
   saveStore,
   STORE_PATH,
   findAccount,
@@ -43,6 +43,38 @@ const dur = ms => {
   const h = Math.floor(m / 60);
   return h ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${m}m`;
 };
+
+/** Open a URL in the default browser. Never fatal: the URL is printed anyway. */
+function openBrowser(url) {
+  try {
+    const cmd = process.platform === 'win32' ? 'cmd'
+      : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    child.on('error', () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Best-effort clipboard copy (so the code is one paste away). */
+function copyToClipboard(text) {
+  try {
+    const child = process.platform === 'win32'
+      ? spawn('clip', [], { stdio: ['pipe', 'ignore', 'ignore'] })
+      : process.platform === 'darwin'
+        ? spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
+        : spawn('xclip', ['-selection', 'clipboard'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', () => {});
+    child.stdin.on('error', () => {});
+    child.stdin.end(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function cmdStatus() {
   const { store } = await ensureStore();
@@ -131,46 +163,92 @@ async function cmdPlan() {
 }
 
 async function cmdAdd() {
+  const noBrowser = flag('no-browser');
   const { store } = await ensureStore();
-  const suggested = nextMintEmail(store);
-  console.log('Logging in a GitHub account for free-pi.');
-  console.log(`suggested address for a brand-new account: ${suggested}`);
-  console.log('(use any address you control — this is only shown for convenience)');
+
   console.log('');
+  console.log('  free-pi account hinzufuegen');
+  console.log('  ' + '-'.repeat(56));
 
-  const { token } = await loginWithDeviceFlow({
-    onCode: c => {
-      console.log('+----------------------------------------------------------+');
-      console.log('|  Open:  ' + (c.verificationUriComplete || c.verificationUri));
-      console.log('|  Code:  ' + c.userCode);
-      console.log('+----------------------------------------------------------+');
-      console.log(`waiting for authorization (expires in ${Math.round((c.expiresIn || 900) / 60)} min)...`);
-    },
-  });
+  let added = 0;
+  for (;;) {
+    const suggested = nextMintEmail(store);
+    console.log('');
+    console.log(`  Bisher ${store.accounts.filter(a => !a.disabled).length} Account(s) im Proxy.`);
+    console.log(`  Neue Adresse, falls du einen frischen GitHub-Account anlegst:  ${suggested}`);
+    console.log('');
+    console.log('  Gleich oeffnet sich GitHub. Dort: mit einem Konto einloggen,');
+    console.log('  den Code bestaetigen und free-pi erlauben.');
+    console.log('');
 
-  // Ask the API who this account actually is before storing it.
-  const me = await getMe(token);
-  const handle = typeof me.handle === 'string' ? me.handle : null;
-  const userId = typeof me.user_id === 'string' ? me.user_id : null;
+    let opened = false;
+    const { token } = await loginWithDeviceFlow({
+      onCode: c => {
+        const url = c.verificationUriComplete || c.verificationUri;
+        const clipboard = copyToClipboard(c.userCode);
+        console.log('  +----------------------------------------------------------+');
+        console.log('  |  Code: ' + String(c.userCode).padEnd(50) + '|');
+        console.log('  +----------------------------------------------------------+');
+        console.log('  URL : ' + url);
+        if (clipboard) console.log('  (Code liegt schon in der Zwischenablage)');
+        console.log('');
+        if (flag('no-browser')) {
+          console.log('  -> bitte die URL selbst im Browser oeffnen');
+        } else {
+          opened = openBrowser(url);
+          console.log(opened
+            ? '  -> Browser geoeffnet, warte auf Bestaetigung ...'
+            : '  -> Browser konnte nicht geoeffnet werden, URL oben manuell aufrufen');
+        }
+        console.log(`  (Code laeuft in ${Math.round((c.expiresIn || 900) / 60)} Minuten ab)`);
+      },
+    });
 
-  const existing = store.accounts.find(a => a.userId && userId && a.userId === userId);
-  if (existing) {
-    existing.token = token;
-    existing.tokenBad = false;
-    existing.disabled = false;
-    recordUsage(store, existing, me);
+    const me = await getMe(token);
+    const handle = typeof me.handle === 'string' ? me.handle : null;
+    const userId = typeof me.user_id === 'string' ? me.user_id : null;
+
+    const existing = store.accounts.find(a => a.userId && userId && a.userId === userId);
+    if (existing) {
+      existing.token = token;
+      existing.tokenBad = false;
+      existing.disabled = false;
+      recordUsage(store, existing, me);
+      await saveStore(store);
+      console.log('');
+      console.log(`  ${existing.id} (${existing.handle}) war schon bekannt - Token aufgefrischt.`);
+      console.log(`  Kontingent: ${fmt(me.remaining_credits_today)} / ${fmt(me.allowance_credits)} Credits`);
+      console.log('  Der Account kann jetzt wieder parallel genutzt werden.');
+      break;
+    }
+
+    const account = addAccount(store, { token, handle, userId, email: suggested });
+    recordUsage(store, account, me);
+    store.activeAccountId = account.id;
     await saveStore(store);
-    console.log(`this GitHub account was already known as ${existing.id} (${existing.handle}) — token refreshed.`);
-    return;
+    added++;
+    console.log('');
+    console.log(`  + ${account.id}  @${handle}  (${suggested})`);
+    console.log(`    Kontingent: ${fmt(me.remaining_credits_today)} / ${fmt(me.allowance_credits)} Credits, Refill ${me.refill_at}`);
+    const lanes = store.accounts.filter(a => !a.disabled && !a.tokenBad && a.token).length;
+    console.log(`    -> jetzt ${lanes} parallele Requests moeglich`);
+
+    if (flag('many')) {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await rl.question('\n  Weiteren Account hinzufuegen? [j/N] ');
+      rl.close();
+      if (!/^\s*(j|ja|y|yes)\s*$/i.test(answer)) break;
+    } else {
+      break;
+    }
   }
 
-  const account = addAccount(store, { token, handle, userId, email: suggested });
-  recordUsage(store, account, me);
-  store.activeAccountId = account.id;
-  await saveStore(store);
+  if (added) {
+    console.log('');
+    console.log('  Der Proxy liest die Liste bei jedem Request neu - kein Neustart noetig.');
+    console.log('  Status:  node tools\\freepi-accounts.mjs status');
+  }
   console.log('');
-  console.log(`added ${account.id}  handle=${handle}  email=${suggested}`);
-  console.log(`remaining today: ${fmt(me.remaining_credits_today)} / ${fmt(me.allowance_credits)} credits, refills ${me.refill_at}`);
 }
 
 async function cmdUse() {
