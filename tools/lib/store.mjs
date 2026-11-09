@@ -136,6 +136,14 @@ export function recordUsage(store, account, me, now = Date.now()) {
     tier: typeof me.tier === 'string' ? me.tier : null,
     lane: typeof me.lane === 'string' ? me.lane : null,
     premiumCredits: num(me.premium_credits),
+    premiumBoughtCredits: num(me.premium_bought_credits),
+    premiumGiftedCredits: num(me.premium_gifted_credits),
+    premiumExpiringCredits: num(me.premium_expiring_credits),
+    premiumExpiresAt: typeof me.premium_expires_at === 'string' ? me.premium_expires_at : null,
+    purchasedCredits: num(me.credit_credits),
+    purchasedUsd: num(me.credit_usd),
+    regularWalletCredits: num(me.regular_wallet_credits),
+    bonusWalletCredits: num(me.bonus_wallet_credits),
     bonusCredits: num(me.bonus_credits),
     visibleAllowance: me.visible_allowance === true,
     fetchedAt: new Date(now).toISOString(),
@@ -177,6 +185,14 @@ export function recordUsage(store, account, me, now = Date.now()) {
   }
 
   account.usage = usage;
+  // Premium is a separate wallet. Bought/gifted are its breakdown, not extra balances to add again.
+  if (Number.isFinite(previous.premiumCredits) && Number.isFinite(usage.premiumCredits)) {
+    const spentPremium = Math.max(0, previous.premiumCredits - usage.premiumCredits);
+    store.totals.premiumCreditsUsedTotal = (store.totals.premiumCreditsUsedTotal || 0) + spentPremium;
+    store.totals.byDayPremium = store.totals.byDayPremium || {};
+    store.totals.byDayPremium[utcDay(now)] = (store.totals.byDayPremium[utcDay(now)] || 0) + spentPremium;
+    account.day.usedPremiumCredits = (account.day.usedPremiumCredits || 0) + spentPremium;
+  }
   account.handle = account.handle || (typeof me.handle === 'string' ? me.handle : null);
   account.userId = account.userId || (typeof me.user_id === 'string' ? me.user_id : null);
   account.lastError = null;

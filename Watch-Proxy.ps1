@@ -7,6 +7,16 @@ New-Item -ItemType Directory -Path $proxyLogs -Force | Out-Null
 $proxyWatchLog = Join-Path $proxyLogs 'watchdog.log'
 $proxyPidFile = Join-Path $proxyLogs 'proxy.pid'
 $proxyChild = $null
+$sponsorOpened = $false
+
+function Show-ProxySponsor {
+    if (-not $script:sponsorOpened) {
+        try {
+            & (Join-Path $proxyDirectory 'Show-Sponsor.ps1')
+            $script:sponsorOpened = $true
+        } catch { Write-ProxyEvent ('Open http://127.0.0.1:4000/sponsor to display ads. ' + $_.Exception.Message) }
+    }
+}
 
 function Write-ProxyEvent([string]$Message) {
     if ((Test-Path -LiteralPath $proxyWatchLog) -and (Get-Item -LiteralPath $proxyWatchLog).Length -gt 5MB) {
@@ -24,6 +34,7 @@ try {
             try {
                 $proxyExisting = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/v1/models' -TimeoutSec 3
                 if ($proxyExisting.object -eq 'list') {
+                    Show-ProxySponsor
                     Write-ProxyEvent 'An existing proxy owns port 4000; monitoring it without starting a duplicate.'
                     do {
                         Start-Sleep -Seconds 5
@@ -49,6 +60,7 @@ try {
                 try {
                     $proxyHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/v1/models' -TimeoutSec 4
                     if ($proxyHealth.object -ne 'list') { throw 'Unexpected model response' }
+                    Show-ProxySponsor
                     if ($null -eq $proxyLastHealthy) { Write-ProxyEvent 'Local API is healthy.' }
                     $proxyLastHealthy = [DateTime]::UtcNow
                 } catch {

@@ -144,6 +144,29 @@ Set the key (any non-empty string — the proxy does not check it):
 setx FREEPI_PROXY_API_KEY freepi-proxy
 ```
 
+### Slash commands inside DSH
+
+`plugin/` holds a small DSH command plugin. `Setup.cmd` links it into
+`%USERPROFILE%\.dsh\plugins\freepi-accounts`; `node tools\sync-plugin.mjs`
+copies the repo version over it after an edit (`--check` reports drift only).
+Restart DSH after syncing.
+
+| Command | What it does |
+|---|---|
+| `/freepi-add` | Sign in another account. Opens GitHub with the code pre-filled in a **throw-away browser profile**, so the account already signed in is never disturbed. The profile is deleted afterwards. |
+| `/freepi-add --reuse` | Same, but in the saved profile — use this to re-auth the account that is signed in there. |
+| `/freepi-add --manual` | Print the code and wait for you to confirm the GitHub prompt by hand. |
+| `/freepi-add --email you@example.com` | Record the address you actually registered instead of the suggested catch-all one. |
+| `/freepi-status` | Budgets, refill times, rotation mode, proxy lanes. |
+| `/freepi-usage` | Live load: lanes, in-flight requests, queue depth. |
+| `/freepi-switch <id\|email>` | Pin one account for new requests. No argument lists the accounts. |
+| `/freepi-auto` | Drop the pin so the proxy rotates by remaining budget again. |
+| `/freepi-remove <id>` | Forget an account (clears the pin if it pointed there). |
+
+No sign-out is needed between adds: each `/freepi-add` starts a fresh profile on
+a free debug port, and only one add runs at a time (a lock file prevents two
+GitHub device flows from colliding).
+
 ---
 
 ## Troubleshooting

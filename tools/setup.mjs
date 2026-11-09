@@ -16,8 +16,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import readline from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 function log(msg = '') { console.log(msg); }
 function step(msg) { log('\n== ' + msg); }
@@ -192,6 +194,35 @@ async function installDsh(force) {
   ok('appended freepi provider to ' + patch);
 }
 
+/**
+ * Install the DSH slash commands. The repo copy is the source of truth; DSH
+ * loads whatever sits in ~/.dsh/plugins/freepi-accounts.
+ */
+async function installPlugin(force) {
+  step('DSH slash commands');
+  const from = path.join(here, '..', 'plugin');
+  const to = path.join(HOME, '.dsh', 'plugins', 'freepi-accounts');
+  if (!fs.existsSync(from)) { warn('plugin/ missing from this checkout — skipping'); return; }
+  const files = ['package.json', 'lib/index.js', 'lib/manual-selection.js'];
+  let written = 0;
+  for (const rel of files) {
+    const src = path.join(from, rel);
+    const dst = path.join(to, rel);
+    if (!fs.existsSync(src)) continue;
+    const body = fs.readFileSync(src);
+    if (!force && fs.existsSync(dst) && fs.readFileSync(dst).equals(body)) continue;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.writeFileSync(dst, body);
+    written += 1;
+  }
+  if (written) {
+    ok('installed ' + written + ' plugin file(s) into ' + to);
+    log('   restart DSH, then /freepi-status works in the GUI');
+  } else {
+    ok('plugin already up to date (' + to + ')');
+  }
+}
+
 async function healthCheck(port) {
   step('health check');
   const url = 'http://127.0.0.1:' + port + '/v1/models';
@@ -244,6 +275,7 @@ async function main() {
 
   await installOpencode(force);
   await installDsh(force);
+  await installPlugin(force);
 
   step('finish');
   log('');

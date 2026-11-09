@@ -101,10 +101,12 @@ async function cmdStatus() {
       dur(r.refillInMs).padEnd(9) +
       (r.lastError || ''),
     );
+    console.log(`  Premium: ${r.premiumCredits === null ? '?' : fmt(r.premiumCredits)} (purchased: ${r.premiumBoughtCredits === null ? '?' : fmt(r.premiumBoughtCredits)}, gifted: ${r.premiumGiftedCredits === null ? '?' : fmt(r.premiumGiftedCredits)})`);
   }
   console.log('-'.repeat(88));
   console.log(`* active   accounts: ${rows.length}   accounts minted all-time: ${store.totals.accountsMinted}`);
   console.log(`credits used all-time: ${fmt(store.totals.creditsUsedTotal)}`);
+  console.log(`premium credits used since tracking: ${fmt(store.totals.premiumCreditsUsedTotal || 0)}`);
   const days = Object.keys(store.totals.byDay || {}).sort().slice(-7);
   if (days.length) {
     console.log('last days: ' + days.map(d => `${d}=${fmt(store.totals.byDay[d])}`).join('  '));

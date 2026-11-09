@@ -4,8 +4,27 @@
  *
  *   node freepi-add.mjs            full flow, fully automatic
  *   node freepi-add.mjs --manual   print the code and wait for a human
+ *   node freepi-add.mjs --reuse    keep the persistent browser profile
+ *
+ * By default every run uses its own throw-away browser profile with empty
+ * cookies, so the GitHub account that is already signed in is never disturbed.
  */
-const mod = await import('file://C:/Users/liket/.dsh/plugins/freepi-accounts/lib/index.js');
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const candidates = [
+  path.join(here, '..', 'plugin', 'lib', 'index.js'),
+  path.join(os.homedir(), '.dsh', 'plugins', 'freepi-accounts', 'lib', 'index.js'),
+];
+const entry = candidates.find((p) => fs.existsSync(p));
+if (!entry) {
+  console.error('plugin not found. Looked in:\n  ' + candidates.join('\n  '));
+  process.exit(1);
+}
+const mod = await import(pathToFileURL(entry).href);
 
 const registered = new Map();
 mod.apply({

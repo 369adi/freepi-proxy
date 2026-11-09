@@ -13,6 +13,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
+import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
@@ -72,6 +73,19 @@ function queueDepth() {
 
 let STORE = null;
 let STORE_MTIME = 0;
+let MANUAL_ACCOUNT_ID = null;
+const MANUAL_SELECTION_PATH = path.join(path.dirname(STORE_PATH), 'selected-account.json');
+
+async function syncManualSelection() {
+  try {
+    const selection = JSON.parse(await fs.readFile(MANUAL_SELECTION_PATH, 'utf8'));
+    if (typeof selection.accountId !== 'string' || !selection.accountId.trim()) throw new Error('Invalid manual account selection');
+    MANUAL_ACCOUNT_ID = selection.accountId;
+  } catch (error) {
+    if (error.code === 'ENOENT') MANUAL_ACCOUNT_ID = null;
+    else throw error; // An unreadable manual selection must never silently switch to another account.
+  }
+}
 
 /** mtime of the accounts file, or 0 when it does not exist yet. */
 async function storeModTime() {
@@ -102,6 +116,7 @@ function syncStore() {
 }
 
 async function doSyncStore() {
+  await syncManualSelection();
   const { store } = await ensureStore();
   const mtime = await storeModTime();
   if (!STORE) {
@@ -165,7 +180,7 @@ async function persist() {
 }
 
 function activeAccount() {
-  return STORE ? findAccount(STORE, STORE.activeAccountId) : null;
+  return STORE ? findAccount(STORE, MANUAL_ACCOUNT_ID || STORE.activeAccountId) : null;
 }
 
 /**
@@ -175,6 +190,7 @@ function activeAccount() {
  */
 async function chooseAccount() {
   if (!STORE) return null;
+  if (MANUAL_ACCOUNT_ID) return activeAccount();
   const now = Date.now();
   let decision = decide(STORE, now, STORE.settings);
 
@@ -225,6 +241,7 @@ async function chooseAccount() {
 /** Candidate accounts to retry with, best first, excluding the failed one. */
 function retryCandidates(excludeId) {
   if (!STORE) return [];
+  if (MANUAL_ACCOUNT_ID) return [];
   const now = Date.now();
   return STORE.accounts
     .filter(a => !a.disabled && a.id !== excludeId && !a.tokenBad && a.token)
@@ -246,6 +263,10 @@ const laneBusy = new Set();   // account ids currently serving a request
 /** All accounts usable right now, most remaining budget first. */
 function usableAccounts() {
   if (!STORE) return [];
+  if (MANUAL_ACCOUNT_ID) {
+    const selected = activeAccount();
+    return selected && selected.token && !selected.disabled && !selected.tokenBad ? [selected] : [];
+  }
   const now = Date.now();
   return STORE.accounts
     .filter(a => !a.disabled && !a.tokenBad && a.token)
@@ -376,6 +397,13 @@ async function runUsageLoop() {
   const tick = async () => {
     if (!STORE) return;
     try {
+      await syncManualSelection();
+      if (MANUAL_ACCOUNT_ID) {
+        const selected = activeAccount();
+        if (selected) await refreshAccount(STORE, selected, Date.now());
+        await persist();
+        return;
+      }
       await refreshAll(STORE, { now: Date.now() });
       await persist();
       const d = decide(STORE, Date.now(), STORE.settings);
@@ -411,6 +439,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
   inReq.on('data', c => chunks.push(c));
   inReq.on('end', async () => {
     const body = Buffer.concat(chunks);
+    if (MANUAL_ACCOUNT_ID && !usableAccounts().length) {
+      inRes.writeHead(401, { 'content-type': 'application/json' });
+      inRes.end(JSON.stringify({ error: { message: 'The selected account needs a valid sign-in. Use /freepi-switch to select an existing account.', type: 'selected_account_unavailable' } }));
+      return;
+    }
     try { const p = JSON.parse(body); if (p.model) console.log('[proxy] -> ' + p.model); } catch {}
 
     // Take a free account lane if one exists; otherwise wait in the queue and
@@ -647,21 +680,24 @@ function proxyCompletionsReplay(body, inReq, inRes, attempt, account) {
 function usageSnapshot() {
   const now = Date.now();
   return {
-    activeAccountId: STORE ? STORE.activeAccountId : null,
-    nextAction: STORE ? decide(STORE, now, STORE.settings) : null,
+    activeAccountId: MANUAL_ACCOUNT_ID || (STORE ? STORE.activeAccountId : null),
+    manualAccountId: MANUAL_ACCOUNT_ID,
+    nextAction: MANUAL_ACCOUNT_ID ? { action: 'manual', accountId: MANUAL_ACCOUNT_ID } : STORE ? decide(STORE, now, STORE.settings) : null,
     totals: STORE ? STORE.totals : null,
     queue: queueDepth(),
     accounts: (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
   };
 }
 
-function startServer(models) {
+function startServer(models, sponsorHtml) {
   const catalog = (Array.isArray(models) && models.length)
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
 
-  const server = http.createServer(function(req, res) {
+  const sponsorPanel = createSponsorPanel({ currentAccount: async () => { await syncStore(); return activeAccount(); }, sessionId: SESSION_ID, usage: usageSnapshot, html: sponsorHtml });
+  const server = http.createServer(async function(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1:' + PORT);
+    if (url.pathname.startsWith('/sponsor')) { await sponsorPanel(req, res, url); return; }
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
     res.setHeader('access-control-allow-headers', 'content-type, authorization, x-request-id');
@@ -691,8 +727,10 @@ function startServer(models) {
 
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
       syncStore()
-        .catch(() => null)
-        .finally(function () { proxyCompletions(req, res); });
+        .then(function () { proxyCompletions(req, res); }, function () {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Cannot read the account selection. Check the local proxy settings.', type: 'account_selection_unavailable' } }));
+        });
       return;
     }
 
@@ -738,6 +776,7 @@ function startServer(models) {
 async function main() {
   const { store, seeded } = await ensureStore();
   STORE = store;
+  await syncManualSelection();
   if (!STORE.accounts.length) {
     console.error('No free-pi account available.');
     console.error('Run  npx free-pi-cli  once, or:  node tools/freepi-accounts.mjs add');
@@ -763,9 +802,10 @@ async function main() {
   const models = Array.isArray(data.models) && data.models.length ? data.models : null;
   if (data.notice) console.log('[free-pi] ' + data.notice);
 
-  startServer(models);
+  const sponsorHtml = await fs.readFile(new URL('./tools/sponsor.html', import.meta.url), 'utf8');
+  startServer(models, sponsorHtml);
   runUsageLoop().catch(function() {});
-  runAdLoop().catch(function() {});
+  console.log('[sponsor] Open http://127.0.0.1:' + PORT + '/sponsor and keep the sponsor card visible.');
 }
 
 main().catch(function(err) { console.error('[proxy] Fatal:', err); process.exit(1); });

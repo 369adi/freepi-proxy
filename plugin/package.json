@@ -1,0 +1,14 @@
+{
+  "name": "dsh-command-freepi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Slash commands to add and inspect free-pi accounts behind the local proxy",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5"
+  }
+}
