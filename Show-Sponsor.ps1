@@ -6,10 +6,12 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
     try { $null = Invoke-RestMethod ($proxyBase + '/v1/models') -TimeoutSec 2; break } catch { Start-Sleep -Seconds 1 }
 }
 
-# One visible window per account: free-pi gates each account on its own ad
-# impression, so a window for account A does nothing for account B.
+# /sponsor/accounts sits behind the panel cookie, so open a session first. The
+# cookie is only used to read the list - the browser windows establish their own.
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 try {
-    $list = (Invoke-RestMethod ($proxyBase + '/sponsor/accounts') -TimeoutSec 5).accounts
+    $null = Invoke-WebRequest ($proxyBase + '/sponsor') -WebSession $session -UseBasicParsing -TimeoutSec 5
+    $list = (Invoke-RestMethod ($proxyBase + '/sponsor/accounts') -WebSession $session -TimeoutSec 5).accounts
 } catch {
     $list = @()
 }
@@ -47,7 +49,7 @@ foreach ($account in $list) {
     ) -WindowStyle Normal
     $opened++
     Write-Host ('sponsor window opened for ' + $account.id + ($(if ($account.handle) { ' (@' + $account.handle + ')' } else { '' })))
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 500
 }
 
 if ($opened -eq 0) {
