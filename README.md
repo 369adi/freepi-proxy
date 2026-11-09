@@ -162,10 +162,20 @@ Restart DSH after syncing.
 | `/freepi-switch <id\|email>` | Pin one account for new requests. No argument lists the accounts. |
 | `/freepi-auto` | Drop the pin so the proxy rotates by remaining budget again. |
 | `/freepi-remove <id>` | Forget an account (clears the pin if it pointed there). |
+| `/freepi-doctor` | Same checks as `tools\doctor.mjs`, inline: store, token lifetime, budget, pin, proxy reachability. |
 
 No sign-out is needed between adds: each `/freepi-add` starts a fresh profile on
 a free debug port, and only one add runs at a time (a lock file prevents two
 GitHub device flows from colliding).
+
+### When free-pi asks for a sponsor view
+
+If the account has to watch a sponsor card before it may use the model again,
+upstream answers `403 {"code":"ads_required"}`. The proxy then opens
+`http://127.0.0.1:4000/sponsor` once (at most every five minutes) and returns an
+`ads_required` error that names that URL. Keep the card visible for a moment and
+retry — the panel only reports an impression after the card really was visible
+for at least a second.
 
 ---
 

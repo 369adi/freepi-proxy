@@ -11,9 +11,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { loadStore, STORE_PATH, LEGACY_CREDENTIALS_PATH } from './lib/store.mjs';
 import { getMe, getCatalog, ApiError, VERSION, BASE, tokenExpired } from './lib/freepi-api.mjs';
 
+const HOME = os.homedir();
 const PORT = Number(process.env.FREEPI_PROXY_PORT ?? 4000);
 const results = [];
 
@@ -93,6 +95,34 @@ async function main() {
     } else ok('client version', VERSION);
   } catch (err) {
     bad('cannot fetch catalog', err.message);
+  }
+
+  // 5b. DSH slash-command plugin
+  const pluginEntry = path.join(HOME, '.dsh', 'plugins', 'freepi-accounts', 'lib', 'index.js');
+  const repoPlugin = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'lib', 'index.js');
+  if (!fs.existsSync(pluginEntry)) {
+    warn('DSH plugin missing', 'run: node tools\\sync-plugin.mjs  (then restart DSH)');
+  } else {
+    const installed = fs.readFileSync(pluginEntry);
+    const wanted = fs.existsSync(repoPlugin) ? fs.readFileSync(repoPlugin) : null;
+    if (!wanted) ok('DSH plugin installed', pluginEntry);
+    else if (installed.equals(wanted)) ok('DSH plugin installed', 'in sync with this checkout');
+    else warn('DSH plugin out of date', 'run: node tools\\sync-plugin.mjs  (then restart DSH)');
+  }
+
+  // 5c. pinned account (manual selection disables rotation)
+  const selectionPath = path.join(path.dirname(STORE_PATH), 'selected-account.json');
+  if (fs.existsSync(selectionPath)) {
+    try {
+      const sel = JSON.parse(fs.readFileSync(selectionPath, 'utf8'));
+      const known = store.accounts.some(a => a.id === sel.accountId);
+      if (known) warn('account pinned', (sel.accountId || '?') + ' serves every request; /freepi-auto restores rotation');
+      else warn('stale pin', (sel.accountId || '?') + ' is not in the store — /freepi-auto clears it');
+    } catch {
+      warn('selection file unreadable', selectionPath + ' — /freepi-auto clears it');
+    }
+  } else {
+    ok('rotation mode', 'automatic (no account pinned)');
   }
 
   // 6. port / running proxy

@@ -47,6 +47,9 @@ function fixture() {
 
 async function loadPlugin(f) {
   process.env.FREEPI_ACCOUNTS_PATH = f.storePath;
+  // Port 9 (discard) is never a proxy, so /freepi-doctor finds it unreachable
+  // instead of hitting whatever happens to listen on the default port.
+  process.env.FREEPI_PROXY_URL = 'http://127.0.0.1:9';
   const url = pathToFileURL(
     path.resolve(import.meta.dirname, '..', 'lib', 'index.js'),
   ).href;
@@ -137,4 +140,28 @@ test('/freepi-status names the rotation mode', async () => {
   const pinned = await call(commands, 'freepi-status');
   assert.match(pinned.text, /gepinnt/);
   assert.match(pinned.text, /acc-2/);
+});
+
+test('/freepi-doctor reports the store and survives a dead proxy', async () => {
+  const f = fixture();
+  const commands = await loadPlugin(f);
+
+  const result = await call(commands, 'freepi-doctor');
+  assert.match(result.text, /free-pi doctor/);
+  assert.match(result.text, /2 nutzbar \/ 2 gespeichert/);
+  assert.match(result.text, /automatische Rotation/);
+  assert.doesNotMatch(result.text, /SI_SECRET/, 'doctor never prints tokens');
+  // No proxy listens on the test port, so it must say so instead of throwing.
+  assert.match(result.text, /nicht erreichbar/);
+  assert.equal(result.kind, 'error');
+});
+
+test('/freepi-doctor flags a pinned account', async () => {
+  const f = fixture();
+  const commands = await loadPlugin(f);
+  fs.writeFileSync(f.selectionPath, JSON.stringify({ accountId: 'acc-2' }));
+
+  const pinned = await call(commands, 'freepi-doctor');
+  assert.match(pinned.text, /gepinnt auf acc-2/);
+  assert.match(pinned.text, /\/freepi-auto/);
 });

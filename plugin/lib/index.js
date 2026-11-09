@@ -4,6 +4,7 @@
  *   /freepi-add     add a free-pi account (opens GitHub, code pre-filled)
  *   /freepi-status  per-account budget and refill time
  *   /freepi-usage   live proxy load: lanes, in-flight, queue
+ *   /freepi-doctor  one-shot health check for store, tokens, proxy
  *
  * Zero dependencies beyond Node itself. Account state lives in the proxy's
  * own store (~/.free-pi/proxy/accounts.json), so a newly added account is
@@ -24,13 +25,17 @@ const inject = ['commands'];
 const API_BASE = 'https://api.freepi.ai';
 const CLIENT_VERSION = '0.6.15';
 const CONSENT_VERSION = '4';
-const PROXY_USAGE = 'http://127.0.0.1:4000/usage';
+const PROXY_URL = process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000';
+const PROXY_USAGE = PROXY_URL + '/usage';
 const STORE_PATH =
   process.env.FREEPI_ACCOUNTS_PATH ||
   path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
 // The proxy reads this file on every request; deleting it means "rotate again".
 const SELECTION_PATH = path.join(path.dirname(STORE_PATH), 'selected-account.json');
 const DAILY_CREDITS = 15000;
+// Mirrors tools/lib/policy.mjs so /freepi-doctor judges freshness the same way.
+const DEFAULT_STALE_MS = 10 * 60 * 1000;
+const DEFAULT_LOW_WATERMARK = 0.1;
 
 // ---------------------------------------------------------------- utilities
 
@@ -1071,19 +1076,26 @@ async function addAccountWithBrowser(ctx, invocation, browser) {
   saveStore(fresh);
 
   const parallel = fresh.accounts.filter((a) => !a.disabled && !a.tokenBad).length;
+  const pinned = readSelection();
 
-  return {
-    kind: 'success',
-    text: [
-      `Account hinzugefuegt: ${account.id}  @${account.handle || 'unbekannt'}  (${account.email})`,
-      `Kontingent: ${usageLine(account)}`,
-      `Refill: in ${human(Date.parse(me.refill_at) - Date.now())}`,
+  const lines = [
+    `Account hinzugefuegt: ${account.id}  @${account.handle || 'unbekannt'}  (${account.email})`,
+    `Kontingent: ${usageLine(account)}`,
+    `Refill: in ${human(Date.parse(me.refill_at) - Date.now())}`,
+    '',
+    `Der Proxy hat jetzt ${parallel} Lane(s) - also ${parallel} echte parallel Requests.`,
+    'Kein Neustart noetig, er liest den Store bei jedem Request neu.',
+    'Das temporaere Browser-Profil wird wieder geloescht.',
+  ];
+  if (pinned && pinned !== account.id) {
+    lines.push(
       '',
-      `Der Proxy hat jetzt ${parallel} Lane(s) - also ${parallel} echte parallel Requests.`,
-      'Kein Neustart noetig, er liest den Store bei jedem Request neu.',
-      'Das temporaere Browser-Profil wird wieder geloescht.',
-    ].join('\n'),
-  };
+      `Hinweis: der Proxy ist gerade auf ${pinned} gepinnt, der neue Account bekommt also noch keine Anfragen.`,
+      '/freepi-auto hebt das auf und nutzt alle Accounts abwechselnd.',
+    );
+  }
+
+  return { kind: 'success', text: lines.join('\n') };
 }
 
 async function handleStatus() {
@@ -1262,6 +1274,88 @@ function handleAuto() {
 
 // --------------------------------------------------------------- registration
 
+/**
+ * One-shot health check for the whole chain: store, tokens, proxy, lanes.
+ * Reads only local state plus the proxy's own /usage endpoint, so it never
+ * burns an upstream request.
+ */
+async function handleDoctor() {
+  const ok = [];
+  const warn = [];
+  const bad = [];
+
+  const store = loadStore();
+  if (!store) {
+    bad.push(['Store', `kein Store unter ${STORE_PATH} - lief der Proxy schon einmal?`]);
+  } else {
+    const accounts = store.accounts || [];
+    const usable = accounts.filter((a) => !a.disabled && !a.tokenBad && a.token);
+    if (!accounts.length) bad.push(['Accounts', 'keiner gespeichert - /freepi-add legt einen an']);
+    else if (!usable.length) bad.push(['Accounts', `${accounts.length} gespeichert, aber keiner nutzbar - /freepi-add`]);
+    else ok.push(['Accounts', `${usable.length} nutzbar / ${accounts.length} gespeichert`]);
+
+    const expiring = usable.filter((a) => {
+      const ts = Date.parse(a.tokenExpiresAt || '');
+      return Number.isFinite(ts) && ts - Date.now() < 24 * 60 * 60 * 1000;
+    });
+    if (expiring.length) {
+      warn.push(['Token laeuft ab', expiring.map((a) => `${a.id} (@${a.handle || '?'})`).join(', ') + ' - bei 401 /freepi-add']);
+    } else if (usable.length) {
+      ok.push(['Token', 'alle mindestens 24 h gueltig']);
+    }
+
+    const staleMs = store.settings?.staleMs ?? DEFAULT_STALE_MS;
+    const unknown = usable.filter((a) => {
+      const ts = Date.parse(a.usage?.fetchedAt || '');
+      return !Number.isFinite(ts) || Date.now() - ts > staleMs;
+    });
+    if (unknown.length) warn.push(['Messwerte', `${unknown.length} Account(s) ohne frische Messung - der Proxy misst sie beim naechsten Request`]);
+    else if (usable.length) ok.push(['Messwerte', 'frisch']);
+
+    const lowWatermark = store.settings?.lowWatermark ?? DEFAULT_LOW_WATERMARK;
+    const low = usable.filter((a) => {
+      const rem = a.usage?.remainingCreditsToday;
+      const allowance = a.usage?.allowanceCredits ?? DAILY_CREDITS;
+      return typeof rem === 'number' && rem <= allowance * lowWatermark;
+    });
+    if (low.length) warn.push(['Budget', `${low.length} Account(s) unter dem Low-Watermark (${Math.round(lowWatermark * 100)}%)`]);
+
+    const pinned = readSelection();
+    if (pinned) warn.push(['Modus', `gepinnt auf ${pinned} (max 1 Request) - /freepi-auto nutzt alle Accounts`]);
+    else ok.push(['Modus', `automatische Rotation zwischen ${usable.length} Account(s)`]);
+  }
+
+  try {
+    const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) {
+      bad.push(['Proxy', `antwortet ${res.status} auf ${PROXY_USAGE}`]);
+    } else {
+      const u = await res.json();
+      const q = u.queue || {};
+      ok.push(['Proxy', `laeuft auf :${new URL(PROXY_USAGE).port}, ${q.lanes ?? '?'} Lane(s), ${q.inFlight ?? 0} aktiv, ${q.waiting ?? 0} wartend`]);
+      if (q.waiting > 0) warn.push(['Warteschlange', `${q.waiting} Request(s) warten - ein weiterer Account bringt direkt Durchsatz (/freepi-add)`]);
+    }
+  } catch {
+    bad.push(['Proxy', `nicht erreichbar auf ${PROXY_USAGE} - starten mit Start-Proxy.cmd`]);
+  }
+
+  const lines = [
+    'free-pi doctor',
+    '',
+    ...ok.map(([k, v]) => `  ok  ${k.padEnd(16)} ${v}`),
+    ...warn.map(([k, v]) => `  !!  ${k.padEnd(16)} ${v}`),
+    ...bad.map(([k, v]) => `  XX  ${k.padEnd(16)} ${v}`),
+    '',
+    bad.length
+      ? `${bad.length} Problem(e), ${warn.length} Hinweis(e).`
+      : warn.length
+        ? `Laeuft, ${warn.length} Hinweis(e).`
+        : 'Alles in Ordnung.',
+  ];
+
+  return { kind: bad.length ? 'error' : 'success', text: lines.join('\n') };
+}
+
 function apply(ctx) {
   const active = new Set();
 
@@ -1302,6 +1396,12 @@ function apply(ctx) {
         name: 'freepi-remove',
         description: 'Forget a saved free-pi account; omit the ID to list them',
         handler: (invocation) => track(handleRemove(invocation)),
+      });
+
+      yield ctx.commands.register({
+        name: 'freepi-doctor',
+        description: 'Check store, tokens, budgets and proxy in one go',
+        handler: () => track(handleDoctor()),
       });
 
       yield ctx.commands.register({

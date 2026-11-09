@@ -12,6 +12,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
 import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
@@ -381,6 +382,50 @@ function renderAd(ad) {
   console.log('+' + bar + '+');
 }
 
+// ------------------------------------------------------------ sponsor nudge
+//
+// free-pi sometimes answers 403 {"code":"ads_required"}: the account has to see
+// a sponsor card before it may use the model again. The honest fix is to show
+// the real card - the panel only reports an impression once the card has
+// actually been visible for a second - so we open it and say so, instead of
+// passing a bare 403 to the client.
+const SPONSOR_URL = 'http://127.0.0.1:' + PORT + '/sponsor';
+const SPONSOR_NUDGE_MS = 5 * 60 * 1000;
+let sponsorNudgedAt = 0;
+
+function openSponsorPanel() {
+  const now = Date.now();
+  if (now - sponsorNudgedAt < SPONSOR_NUDGE_MS) return false;
+  sponsorNudgedAt = now;
+  console.log('[sponsor] free-pi asked for a sponsor view - opening ' + SPONSOR_URL);
+  try {
+    // `start` needs an empty title argument; the URL is ours, not user input.
+    const child = spawn('cmd', ['/c', 'start', '', SPONSOR_URL], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (err) {
+    console.error('[sponsor] could not open a browser: ' + err.message);
+  }
+  return true;
+}
+
+/** Turn an upstream ads_required body into an actionable error for the client. */
+function adsRequiredBody() {
+  return Buffer.from(JSON.stringify({
+    error: {
+      message:
+        'free-pi requires a sponsor view for this account. ' + SPONSOR_URL +
+        ' was opened - keep the card visible for a moment, then retry.',
+      type: 'ads_required',
+      sponsor_url: SPONSOR_URL,
+    },
+  }));
+}
+
 async function runAdLoop() {
   const tick = async () => {
     const account = activeAccount();
@@ -550,6 +595,21 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           upRes.on('end', () => { finish(); onUnauthorized(Buffer.concat(errChunks)); });
           return;
         }
+        if (upRes.statusCode === 403 && !inRes.headersSent) {
+          const errChunks = [];
+          upRes.on('data', d => errChunks.push(d));
+          upRes.on('end', () => {
+            finish();
+            const raw = Buffer.concat(errChunks);
+            if (raw.toString().includes('ads_required')) {
+              openSponsorPanel();
+              relay(403, adsRequiredBody());
+              return;
+            }
+            relay(403, raw);
+          });
+          return;
+        }
         const h = {
           'access-control-allow-origin': '*',
           'content-type': upRes.headers['content-type'] || 'application/json',
@@ -652,6 +712,22 @@ function proxyCompletionsReplay(body, inReq, inRes, attempt, account) {
         }
         inRes.writeHead(upRes.statusCode, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         inRes.end(Buffer.concat(errChunks));
+      });
+      return;
+    }
+    if (upRes.statusCode === 403 && !inRes.headersSent) {
+      const errChunks = [];
+      upRes.on('data', d => errChunks.push(d));
+      upRes.on('end', () => {
+        const raw = Buffer.concat(errChunks);
+        if (raw.toString().includes('ads_required')) {
+          openSponsorPanel();
+          inRes.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+          inRes.end(adsRequiredBody());
+          return;
+        }
+        inRes.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        inRes.end(raw);
       });
       return;
     }
