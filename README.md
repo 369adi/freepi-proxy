@@ -210,6 +210,71 @@ single-use nonce, and each ad is acknowledged once.
 
 ---
 
+## Optional: NotionTool MCP server
+
+DSH ships an MCP client (`@deepseek-ai/dsh-mcp-client`), so a local NotionTool
+instance can expose its tools — including project memory — directly to the
+agent. NotionTool serves streamable HTTP on `127.0.0.1:53768/mcp` and
+authenticates with a bearer token.
+
+**1. Get the token.** NotionTool shows it under Settings → Remote MCP access.
+The bundled helper decrypts the same value from NotionTool's DPAPI-protected
+session file (readable only by your own Windows account):
+
+```powershell
+python tools\notiontool-token.py
+```
+
+Pass `--data-dir <path>` if NotionTool stores its data somewhere else, or
+`--token-only` to print just the token. Keep the token out of the repo.
+
+**2. Store it** in `%USERPROFILE%\.dsh\.env`:
+
+```
+NOTIONTOOL_MCP_TOKEN=<token>
+```
+
+**3. Register the server** in `%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml`,
+inside the preset's `plugins` list:
+
+```yaml
+      - id: mcp-notiontool
+        name: '@deepseek-ai/dsh-mcp-client'
+        config:
+          serverName: notiontool
+          transport: streamable-http
+          url: http://127.0.0.1:53768/mcp
+          headers:
+            Authorization: !!js '''Bearer '' + process.env.NOTIONTOOL_MCP_TOKEN'
+          toolCallTimeoutMs: 120000
+          reconnect:
+            enabled: true
+            maxAttempts: 20
+```
+
+Restart DSH afterwards. Tools appear as `mcp__notiontool__<name>`; NotionTool
+advertises 36 of them, project memory being `nt_memory_read` and
+`nt_memory_update`.
+
+Notes:
+
+- `toolCallTimeoutMs` is raised because NotionTool answers long jobs with
+  `still_running` plus a `job_id` (poll with `nt_job_result`) after about 45 s.
+- NotionTool must be running. With `reconnect.enabled` DSH re-registers the
+  tools when the server comes back.
+- `!!js` expressions are evaluated by the profile loader at load time. Values
+  under `refs:` in `%USERPROFILE%\.dsh\.credentials.yaml` are **not** copied
+  into `process.env`, so name an environment variable (or read the file) rather
+  than expecting a credential reference to appear in the environment.
+
+Verify without DSH:
+
+```powershell
+node -e "const h={'content-type':'application/json',accept:'application/json, text/event-stream',authorization:'Bearer '+require('fs').readFileSync(require('os').homedir()+'/.dsh/.env','utf8').match(/^NOTIONTOOL_MCP_TOKEN=(.+)$/m)[1].trim()};fetch('http://127.0.0.1:53768/mcp',{method:'POST',headers:h,body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list'})}).then(r=>r.text()).then(t=>console.log(t.slice(0,120)))"
+```
+
+---
+
 ## Troubleshooting
 
 Run the doctor:
