@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
 import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
-import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PATH } from './tools/lib/store.mjs';
+import { loadStore, saveStore, findAccount, markExhausted, markInvalid, isMeteredDespiteFreeTier, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, sortForPick, USABLE, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
@@ -1169,6 +1169,13 @@ function usageSnapshot() {
       // true while free-pi wants a sponsor view for this account; the window at
       // /sponsor?account=<id> clears it once the ad was really displayed.
       adsRequired: inAdCooldown(a.id, now),
+      // free-pi advertises a set of "Free Unlimited" models, but it only stops
+      // billing for them while the upstream reports a visible allowance. If
+      // that flag is false the same models silently draw down the daily
+      // allowance, which is how two accounts here reached 0 while every logged
+      // request was a free-unlimited id. Surfaced so the drain is visible in
+      // /usage instead of only in the cost ledger after the fact.
+      meteredDespiteFreeTier: isMeteredDespiteFreeTier(a),
       // When this lane last served a request, and whether it is serving one
       // right now. Without these two a stuck lane is invisible: every number
       // looks healthy while one account quietly does all the work.

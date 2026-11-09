@@ -15,6 +15,7 @@ import {
 } from './freepi-api.mjs';
 import {
   loadStore,
+  mustLoadStore,
   saveStore,
   addAccount,
   findAccount,
@@ -160,7 +161,9 @@ export async function importLegacyCredentials(store, path = LEGACY_CREDENTIALS_P
 
 /** Make sure the store has at least one account and a valid activeAccountId. */
 export async function ensureStore({ file } = {}) {
-  const store = await loadStore(file);
+  // This function may write, so it must not treat an unreadable store as empty:
+  // that would seed a fresh one and overwrite the original file.
+  const store = await mustLoadStore(file);
   if (!store.accounts.length) {
     const imported = await importLegacyCredentials(store);
     if (imported) await saveStore(store, file);

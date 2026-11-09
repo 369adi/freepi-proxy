@@ -435,6 +435,42 @@ behind `GET /budget`.
 The proxy itself never creates accounts; it only tells you when one is needed
 and keeps serving from existing accounts otherwise.
 
+#### "Free Unlimited" models are only free while the allowance is visible
+
+free-pi labels four model ids as *Free Unlimited*: `particle`,
+`deepseek-v4.1-flash`, `glm-5.3-flash` and `deepseek-v4-flash`. That label is
+**conditional**, and the condition is not a property of the model — it is a
+per-account flag the upstream reports as `visible_allowance`, which
+`GET /usage` surfaces as `meteredDespiteFreeTier`:
+
+| account state | a "Free Unlimited" request | effect on the daily allowance |
+| --- | --- | --- |
+| `visibleAllowance: true` | served | **none** — the counter does not move |
+| `visibleAllowance: false` | served | **billed like any other model** |
+
+Measured, not assumed. Three consecutive `particle` calls through an account
+with `visibleAllowance: true` left `remainingCreditsToday` at exactly `6861`.
+Two other accounts on the same proxy ended a day at `5744` and `6000` credits
+consumed while **every single logged request was a free-unlimited id** — no paid
+model appears anywhere in the logs. Same models, opposite billing, and the only
+difference was the flag.
+
+The practical consequence is nasty because it is silent: an account can burn its
+whole daily allowance on models the documentation calls free, while the request
+log looks completely innocent. Two of the three accounts here did exactly that.
+So:
+
+- do not conclude "it was free, therefore something else drained the credits" —
+  check `meteredDespiteFreeTier` in `GET /usage` before trusting the label
+- an account with `meteredDespiteFreeTier: true` should be treated as a **paid**
+  account for budgeting purposes, even on a free-unlimited model id
+- the flag is reported by the upstream on every measurement; the proxy records
+  it but cannot change it, so a request that draws down the allowance is
+  reported in `/usage` rather than blocked
+
+Opening a sponsor window clears a pause (`403 ads_required`), and it does **not**
+return credits. It is not a way to undo a drain that already happened.
+
 #### Manual selection pins your budget
 
 `~/.free-pi/proxy/selected-account.json` pins one account and **disables

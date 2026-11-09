@@ -53,13 +53,72 @@ function normalize(store) {
   return s;
 }
 
+/**
+ * Parse JSON that came from a file, tolerating a byte-order mark.
+ *
+ * PowerShell's `Set-Content`/`Out-File` prepend a UTF-8 BOM, and `JSON.parse`
+ * rejects it with a bare "Unexpected token" that is easy to misread as a
+ * corrupt file. Hand-edited stores and files written by other tooling are a
+ * normal case here, so the mark is stripped rather than treated as corruption.
+ */
+export function parseJsonText(text) {
+  const s = String(text == null ? '' : text);
+  return JSON.parse(s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
+}
+
+/**
+ * Load the store.
+ *
+ * A missing file is normal on first run and yields an empty store. A file that
+ * exists but cannot be parsed is NOT normal: returning an empty store for it
+ * would make `ensureStore()` seed a fresh one and overwrite the original, so a
+ * single stray byte or a half-written file would silently destroy every
+ * account. The distinction is reported through `loadError` on the returned
+ * object, and `saveStore`-callers that could overwrite use `mustLoadStore`.
+ */
 export async function loadStore(file = STORE_PATH) {
+  let text;
   try {
-    const raw = JSON.parse(await fs.readFile(file, 'utf8'));
-    return normalize(raw);
-  } catch {
+    text = await fs.readFile(file, 'utf8');
+  } catch (err) {
+    // ENOENT: first run, nothing to lose. Anything else (EACCES, EISDIR, ...)
+    // is a real problem and must not be mistaken for an empty store.
+    if (err && err.code !== 'ENOENT') {
+      const empty = normalize(null);
+      empty.loadError = err;
+      return empty;
+    }
     return normalize(null);
   }
+  try {
+    return normalize(parseJsonText(text));
+  } catch (err) {
+    const empty = normalize(null);
+    empty.loadError = err;
+    empty.corruptFile = file;
+    return empty;
+  }
+}
+
+/**
+ * Load the store, but refuse to continue when an existing file is unreadable.
+ *
+ * Use this on any path that is about to write: overwriting a corrupt store with
+ * a fresh empty one loses the accounts for good. Read-only paths may keep using
+ * `loadStore` and treat the result as "nothing usable right now".
+ */
+export async function mustLoadStore(file = STORE_PATH) {
+  const store = await loadStore(file);
+  if (store.loadError) {
+    const reason = store.loadError && store.loadError.message ? store.loadError.message : String(store.loadError);
+    const err = new Error(
+      'refusing to overwrite an unreadable account store: ' + file + ' (' + reason + '). ' +
+      'Fix or move the file, then retry.'
+    );
+    err.code = 'STORE_UNREADABLE';
+    throw err;
+  }
+  return store;
 }
 
 export async function saveStore(store, file = STORE_PATH) {
@@ -124,6 +183,22 @@ const utcDay = when => {
   if (!Number.isFinite(ms)) return null;
   return new Date(ms).toISOString().slice(0, 10);
 };
+
+/**
+ * True when the upstream did NOT publish a visible allowance for this account.
+ *
+ * Measured on the live fleet: accounts with `visibleAllowance === true` can call
+ * the "Free Unlimited" models indefinitely without the daily counter moving
+ * (3x `particle` on acc-1: 6861 -> 6861). Accounts with `visibleAllowance ===
+ * false` burned their whole daily allowance on exactly those same models
+ * (acc-2 used 5744, acc-3 used 6000, free-unlimited ids only in the logs).
+ * So "free unlimited" is only literally free while this flag is true; when it
+ * is false those models bill against the daily allowance like any other.
+ */
+export function isMeteredDespiteFreeTier(account) {
+  const usage = account && account.usage;
+  return Boolean(usage) && usage.visibleAllowance === false;
+}
 
 /**
  * Fold a fresh /me response into an account and into the global totals.
