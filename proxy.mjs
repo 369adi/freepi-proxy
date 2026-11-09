@@ -950,6 +950,12 @@ function startServer(models, sponsorHtml) {
           if (res.destroyed || res.writableEnded) return;
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify(usageSnapshot(), null, 2));
+        })
+        .catch(function (err) {
+          console.error('[/usage] ' + err.message);
+          if (res.destroyed || res.writableEnded) return;
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'usage snapshot failed', type: 'proxy_error' } }));
         });
       return;
     }
