@@ -153,7 +153,10 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
       const account = record && typeof accounts === 'function'
         ? (await accounts() || []).find(a => a && a.id === record.accountId) || null
         : await currentAccount();
-      if (!record || record.accountId !== account?.id || body.visible !== true || clock() - record.created < 1000 || clock() - record.created > 120_000) {
+      // The page itself only confirms after the card has been visible for 1500
+      // ms. Requiring the same here means a client cannot shorten that window
+      // by confirming earlier than the page's own rule allows.
+      if (!record || record.accountId !== account?.id || body.visible !== true || clock() - record.created < 1500 || clock() - record.created > 120_000) {
         json(res, 409, { error: 'The sponsor must be displayed in the visible window before confirmation.' }); return true;
       }
       pending.delete(body.nonce);
