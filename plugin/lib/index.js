@@ -475,6 +475,7 @@ async function driveGithubLogin(session, code, opts = {}) {
   const safe = '/sign up|create account|new to github|cancel|abbrechen|different account|another account|sign out|log out/i';
   let codeEntered = false;
   let sawLogin = false;
+  let everSawLogin = false;
   let loginSeenAt = 0;
   let passedPicker = false;
   let lastSignature = '';
@@ -500,6 +501,7 @@ async function driveGithubLogin(session, code, opts = {}) {
     if (/\/login\b/.test(url) && /sign in to github|username or email/i.test(text)) {
       if (!sawLogin) {
         sawLogin = true;
+        everSawLogin = true;
         loginSeenAt = Date.now();
       }
       const pw = state.inputs.find((i) => i.type === 'password');
@@ -584,20 +586,37 @@ async function driveGithubLogin(session, code, opts = {}) {
     }
 
     // Nothing clickable: give up only once the page has been static a while.
+    // While the person is still signing in, a static page is normal - they may
+    // be typing, reading a 2FA prompt, or waiting on a password manager. Give
+    // that case the full login window instead of a 15 s stall timeout, so a
+    // thorough sign-in is never mistaken for a dead page.
     const signature = url + '|' + (state.buttons || []).join(',');
     if (signature === lastSignature) {
-      if (Date.now() - stableSince > 15000) break;
+      const stallMs = opts.waitForLogin && sawLogin ? (opts.loginWaitMs || 10 * 60 * 1000) : 15000;
+      if (Date.now() - stableSince > stallMs) {
+        // A signed-in page that never reaches the authorize step is not a
+        // "nobody logged in" failure; report it as such so the caller can tell
+        // the person what to finish rather than claiming the login is missing.
+        if (sawLogin) {
+          throw new ApiError(
+            0,
+            'login_required',
+            'Login gesehen, aber die Autorisierung wurde nicht abgeschlossen',
+          );
+        }
+        break;
+      }
     } else {
       lastSignature = signature;
       stableSince = Date.now();
     }
   }
 
-  if (sawLogin) {
+  if (sawLogin || everSawLogin) {
     throw new ApiError(
       0,
       'login_required',
-      'bitte einmal im geoeffneten Chrome-Fenster bei GitHub einloggen',
+      'Login gesehen, aber die Autorisierung wurde nicht abgeschlossen',
     );
   }
   throw new ApiError(0, 'login_timeout', 'GitHub-Seite hat nicht reagiert');
@@ -822,12 +841,19 @@ async function loginWithDeviceFlow({
     if (signal?.aborted) throw new ApiError(0, 'aborted', 'cancelled');
 
     // The browser cannot log in on its own: stop early instead of hanging.
+    // With a throw-away profile the person is signing in by hand, so a driver
+    // that gave up on the page is NOT a fatal error - the token poll below is
+    // the source of truth. Keep waiting for GitHub to confirm the code, which
+    // is what actually proves the login worked.
     if (automatonError) {
       if (automation) await automation;
       const failure = automatonError;
       automatonError = null;
-      if (failure.code !== 'login_required' && failure.code !== 'no_browser') throw failure;
-      throw failure;
+      const recoverable = failure.code === 'login_required' || failure.code === 'no_browser';
+      if (!recoverable) throw failure;
+      if (!browser.ephemeral && failure.code === 'login_required') throw failure;
+      // else: fall through and keep polling until the code is approved or the
+      // device code expires. No explicit action needed from the caller.
     }
 
     let result;
@@ -1003,14 +1029,28 @@ async function addAccountWithBrowser(ctx, invocation, browser) {
     });
   } catch (error) {
     if (error.code === 'login_required') {
+      const message = String(error.message || '');
+      const sawSignIn = /gesehen|Login gesehen/i.test(message);
+      if (sawSignIn) {
+        return {
+          kind: 'error',
+          text:
+            'Login war da, aber die Freigabe fuer free-pi wurde nicht abgeschlossen.\n\n' +
+            'Im offenen Fenster fehlt noch der letzte Schritt:\n' +
+            '  1. "Authorize" / "Autorisieren" klicken\n' +
+            '  2. Fenster offen lassen, bis "Device connected" erscheint\n\n' +
+            `Code falls noch sichtbar: ${shown ? shown.userCode : 'siehe Fenster'}\n\n` +
+            'Tipp: mit /freepi-add --manual bestaetigst du jeden Schritt selbst.',
+        };
+      }
       return {
         kind: 'error',
         text:
-          `Zeit abgelaufen: im geoeffneten Fenster wurde nicht bei GitHub eingeloggt.\n\n` +
+          'Zeit abgelaufen: im geoeffneten Fenster wurde nicht bei GitHub eingeloggt.\n\n' +
           `Beim Add wird bewusst ein ${browser.label} benutzt - dein bereits\n` +
-          `angemeldeter Account bleibt unberuehrt, du musst dich NICHT ausloggen.\n` +
-          `Melde im neuen Fenster einfach den Account an, der hinzugefuegt werden soll.\n\n` +
-          `Tipp: mit /freepi-add --manual bestaetigst du jeden Account selbst.`,
+          'angemeldeter Account bleibt unberuehrt, du musst dich NICHT ausloggen.\n' +
+          'Melde im neuen Fenster einfach den Account an, der hinzugefuegt werden soll.\n\n' +
+          'Tipp: mit /freepi-add --manual bestaetigst du jeden Account selbst.',
       };
     }
     throw error;
