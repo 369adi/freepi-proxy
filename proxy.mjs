@@ -20,7 +20,7 @@ import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PA
 import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
-import { budgetSummary, modelMultiplier } from './tools/lib/budget.mjs';
+import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR } from './tools/lib/budget.mjs';
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
 const FREEPI_VERSION = '0.6.15';   // keep in sync with upstream minimum
@@ -92,6 +92,25 @@ function supportsVision(id) {
 }
 
 /**
+ * Rolling samples of the pool's remaining credits, used to estimate how fast
+ * the hours disappear. Bounded so a long-running proxy does not grow.
+ */
+const BURN_SAMPLES = [];
+const BURN_SAMPLE_LIMIT = 240;          // ~2 h at one sample every 30 s
+const BURN_SAMPLE_MIN_GAP_MS = 30_000;
+
+function recordBurnSample(creditsLeft) {
+  if (typeof creditsLeft !== 'number' || !Number.isFinite(creditsLeft)) return;
+  const now = Date.now();
+  const last = BURN_SAMPLES[BURN_SAMPLES.length - 1];
+  // Only advance when the pool actually lost credits: a refill (00:00 UTC)
+  // makes the counter jump up, and mixing that in would cancel the burn out.
+  if (last && (now - last.at < BURN_SAMPLE_MIN_GAP_MS || creditsLeft >= last.credits)) return;
+  BURN_SAMPLES.push({ at: now, credits: creditsLeft });
+  if (BURN_SAMPLES.length > BURN_SAMPLE_LIMIT) BURN_SAMPLES.splice(0, BURN_SAMPLES.length - BURN_SAMPLE_LIMIT);
+}
+
+/**
  * Hour budget for the whole account pool, at the multiplier of one model.
  * Without an explicit model, the cheapest one wins: that is what an unattended
  * agent harness burns, and it makes the number comparable over time.
@@ -106,6 +125,10 @@ function budgetSnapshot(catalog, wantedModel) {
     : cheapest;
   const snapshot = usageSnapshot();
   const summary = budgetSummary(snapshot.accounts, selected.multiplier);
+  // Burn rate is measured on base-rate credits, so it stays comparable when the
+  // model (and with it the multiplier) changes mid-session.
+  recordBurnSample(summary.creditsLeft);
+  const burn = burnRatePerHour(BURN_SAMPLES);
   return {
     model: selected.id,
     modelMultiplier: summary.modelMultiplier,
@@ -118,6 +141,9 @@ function budgetSnapshot(catalog, wantedModel) {
     creditsAllowance: summary.creditsAllowance,
     hoursLeft: summary.hoursLeft,
     hoursAllowance: summary.hoursAllowance,
+    burnRatePerHour: burn,
+    runwayHours: burn == null ? null : runwayHours(summary.creditsLeft / CREDITS_PER_HOUR, burn),
+    burnSamples: BURN_SAMPLES.length,
     nextAction: snapshot.nextAction,
   };
 }

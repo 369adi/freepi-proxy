@@ -1224,6 +1224,16 @@ async function handleUsage(invocation) {
 
     const hours = budget && typeof budget.hoursLeft === 'number' ? `${budget.hoursLeft.toFixed(2)} h` : '?';
     const hoursAll = budget && typeof budget.hoursAllowance === 'number' ? `${budget.hoursAllowance.toFixed(2)} h` : '?';
+    // Burn rate says how fast the remaining hours disappear; without it the
+    // hours figure alone cannot answer "how long do I still have?".
+    const burn = budget && typeof budget.burnRatePerHour === 'number' ? budget.burnRatePerHour : null;
+    const runway = budget && typeof budget.runwayHours === 'number' ? budget.runwayHours : null;
+    const burnLine = burn == null
+      ? 'Verbrauch:                      noch keine Messung'
+      : burn <= 0
+        ? 'Verbrauch:                      keine Aktivitaet - die Stunden bleiben stehen'
+        : `Verbrauch:                      ${burn.toFixed(2)} h/h` +
+          (runway != null && Number.isFinite(runway) ? ` -> noch ${runway.toFixed(2)} h bei diesem Tempo` : '');
     return {
       kind: 'success',
       text: [
@@ -1231,6 +1241,7 @@ async function handleUsage(invocation) {
         `gerade aktiv:                   ${q.inFlight ?? 0}`,
         `in der Warteschlange:           ${q.waiting ?? 0}`,
         `Stunden-Budget:                 ${hours} von ${hoursAll} (Modell ${budget?.model ?? '?'}, ${budget?.modelMultiplier ?? 1}x Rate)`,
+        burnLine,
         ...(selected ? [`Daily allowance: ${num(selected.remaining)} / ${num(selected.allowance)} credits`,
           `Premium balance: ${selected.premiumCredits == null ? 'not reported' : num(selected.premiumCredits)} credits`,
           `Premium breakdown: purchased ${selected.premiumBoughtCredits == null ? '?' : num(selected.premiumBoughtCredits)}, gifted ${selected.premiumGiftedCredits == null ? '?' : num(selected.premiumGiftedCredits)}`,
@@ -1405,6 +1416,32 @@ async function handleDoctor() {
     }
   } catch {
     bad.push(['Proxy', `nicht erreichbar auf ${PROXY_USAGE} - starten mit Start-Proxy.cmd`]);
+  }
+
+  // Hours, not credits: that is the number the harness actually runs out of.
+  try {
+    const bres = await fetch(PROXY_BUDGET, { signal: AbortSignal.timeout(2500) });
+    if (bres.ok) {
+      const b = await bres.json();
+      const left = typeof b.hoursLeft === 'number' ? `${b.hoursLeft.toFixed(2)} h` : '?';
+      const all = typeof b.hoursAllowance === 'number' ? `${b.hoursAllowance.toFixed(2)} h` : '?';
+      const line = `${left} von ${all} auf ${b.model ?? '?'} (${b.modelMultiplier ?? 1}x Rate)`;
+      if (typeof b.hoursLeft === 'number' && b.hoursLeft <= 0.5) {
+        bad.push(['Stunden', `${line} - fast leer, /freepi-add oder bis 00:00 UTC warten`]);
+      } else if (typeof b.hoursLeft === 'number' && typeof b.usableAccounts === 'number' && b.usableAccounts < b.totalAccounts) {
+        warn.push(['Stunden', `${line} - nur ${b.usableAccounts}/${b.totalAccounts} Account(s) tragen dazu bei`]);
+      } else {
+        ok.push(['Stunden', line]);
+      }
+      if (typeof b.burnRatePerHour === 'number' && b.burnRatePerHour > 0) {
+        const runway = typeof b.runwayHours === 'number' && Number.isFinite(b.runwayHours) ? ` -> noch ${b.runwayHours.toFixed(2)} h` : '';
+        ok.push(['Verbrauch', `${b.burnRatePerHour.toFixed(2)} h/h${runway}`]);
+      }
+    } else if (bres.status === 404) {
+      warn.push(['Stunden', 'Proxy kennt /budget noch nicht - Proxy neu starten (Start-Proxy.cmd)']);
+    }
+  } catch {
+    /* a dead proxy is already reported above */
   }
 
   const lines = [
