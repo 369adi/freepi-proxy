@@ -4,6 +4,7 @@
  *   /freepi-add     add a free-pi account (opens GitHub, code pre-filled)
  *   /freepi-status  per-account budget and refill time
  *   /freepi-usage   live proxy load: lanes, in-flight, queue
+ *   /freepi-history credits used per day, newest first
  *   /freepi-doctor  one-shot health check for store, tokens, proxy
  *
  * Zero dependencies beyond Node itself. Account state lives in the proxy's
@@ -28,6 +29,7 @@ const CONSENT_VERSION = '4';
 const PROXY_URL = process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000';
 const PROXY_USAGE = PROXY_URL + '/usage';
 const PROXY_BUDGET = PROXY_URL + '/budget';
+const PROXY_HISTORY = PROXY_URL + '/history';
 const STORE_PATH =
   process.env.FREEPI_ACCOUNTS_PATH ||
   path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
@@ -1258,6 +1260,97 @@ async function handleUsage(invocation) {
 }
 
 /**
+ * Per-day consumption from GET /history. Fixed-width ASCII table, newest day
+ * first, at most 14 rows in text mode (the proxy defaults to 30).
+ */
+async function handleHistory(invocation) {
+  const wantJson = wantsJson(invocation);
+  try {
+    const res = await fetch(PROXY_HISTORY, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) {
+      return { kind: 'error', text: `Proxy antwortet ${res.status} auf ${PROXY_HISTORY}` };
+    }
+    const data = await res.json();
+
+    if (wantJson) {
+      return { kind: 'success', text: JSON.stringify(data, null, 2) };
+    }
+
+    const days = Array.isArray(data.days) ? data.days : [];
+    if (days.length === 0) {
+      return { kind: 'success', text: `Noch keine Verbrauchsdaten auf ${PROXY_HISTORY}.` };
+    }
+    const shown = days.slice(0, 14);
+    const cell = (v, digits) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '?');
+    const lines = [
+      'Datum       daily    premium      hours',
+      '---------- -------  ---------  ---------',
+      ...shown.map((d) => `${String(d.date || '?').padEnd(10)} ${cell(d.daily, 0).padStart(7)}  ${cell(d.premium, 0).padStart(9)}  ${cell(d.hours, 3).padStart(9)}`),
+    ];
+    if (days.length > shown.length) {
+      lines.push(`... ${days.length - shown.length} weitere Tag(e), /freepi-history --json zeigt alle.`);
+    }
+    const t = data.totals || {};
+    lines.push('');
+    lines.push(
+      `Summe der gezeigten ${shown.length} Tag(e): daily ${cell(t.daily, 0)}, ` +
+        `premium ${cell(t.premium, 0)}, ${cell(t.hours, 3)} h (${data.creditsPerHour ?? 5000} credits/h)`,
+    );
+    return { kind: 'success', text: lines.join('\n') };
+  } catch {
+    return { kind: 'error', text: `Proxy nicht erreichbar auf ${PROXY_HISTORY} - laeuft er?` };
+  }
+}
+
+/**
+ * Open the sponsor window of every account.
+ *
+ * free-pi pauses free completions for an account until THAT account has shown
+ * an ad, so one window is not enough - a pool of two accounts needs two
+ * visible windows or every second request fails. This opens one per account
+ * and says so; it never confirms anything itself. The confirmation happens in
+ * the browser, and only after the card was really visible.
+ */
+async function handleAds(invocation) {
+  const input = String(invocation.rawInput || '').replace(/^\/?freepi-ads\b\s*/i, '').trim();
+  const store = loadStore();
+  const accounts = (store && store.accounts) || [];
+  if (!accounts.length) {
+    return { kind: 'error', text: `Kein Account gespeichert unter ${STORE_PATH} - zuerst /freepi-add.` };
+  }
+
+  const only = input ? accounts.find((a) => a.id === input) : null;
+  if (input && !only) {
+    return {
+      kind: 'error',
+      text: [
+        `Unbekannter Account "${input}". Verfuegbar:`,
+        ...accounts.map((a) => `  ${a.id}  @${a.handle || '?'}  ${a.email || ''}`),
+      ].join('\n'),
+    };
+  }
+
+  const targets = only ? [only] : accounts;
+  const lines = ['Werbefenster je Account - offen lassen, sonst pausiert free-pi den Account.'];
+  for (const account of targets) {
+    const url = `${PROXY_URL}/sponsor?account=${encodeURIComponent(account.id)}`;
+    let opened = false;
+    try {
+      // `start` needs an empty title argument; the URL is built from an id.
+      const child = spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', () => {});
+      child.unref();
+      opened = true;
+    } catch {}
+    lines.push(`  ${account.id}  @${account.handle || '?'}  ${opened ? url : 'konnte nicht geoeffnet werden: ' + url}`);
+  }
+  lines.push('');
+  lines.push('Das Fenster bestaetigt die Anzeige selbst, sobald die Werbekarte sichtbar ist.');
+  lines.push('Zustand: /freepi-status zeigt "Werbung fehlt" bei Accounts, die noch warten.');
+  return { kind: 'success', text: lines.join('\n') };
+}
+
+/**
  * Forget an account. The token is gone afterwards, so this always names the
  * account instead of accepting an index.
  */
@@ -1498,6 +1591,12 @@ function apply(ctx) {
         handler: (invocation) => track(handleUsage(invocation)),
       });
       yield ctx.commands.register({
+        name: 'freepi-history',
+        description: 'Show credits used per day (newest first) with hours (/freepi-history --json)',
+        handler: (invocation) => track(handleHistory(invocation)),
+      });
+
+      yield ctx.commands.register({
         name: 'freepi-remove',
         description: 'Forget a saved free-pi account; omit the ID to list them',
         handler: (invocation) => track(handleRemove(invocation)),
@@ -1507,6 +1606,12 @@ function apply(ctx) {
         name: 'freepi-doctor',
         description: 'Check store, tokens, budgets and proxy in one go',
         handler: () => track(handleDoctor()),
+      });
+
+      yield ctx.commands.register({
+        name: 'freepi-ads',
+        description: 'Open the sponsor window for every account (free-pi pauses accounts without ads)',
+        handler: (invocation) => track(handleAds(invocation)),
       });
 
       yield ctx.commands.register({

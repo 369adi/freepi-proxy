@@ -17,10 +17,10 @@ import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
 import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PATH } from './tools/lib/store.mjs';
-import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
+import { decide, describe, stateOf, sortForPick, USABLE, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
-import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR } from './tools/lib/budget.mjs';
+import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR, creditsToHours } from './tools/lib/budget.mjs';
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
 const FREEPI_VERSION = '0.6.15';   // keep in sync with upstream minimum
@@ -357,11 +357,38 @@ function retryCandidates(exclude) {
   const skip = exclude instanceof Set ? exclude : new Set([exclude].filter(Boolean));
   const now = Date.now();
   return STORE.accounts
-    .filter(a => !a.disabled && !skip.has(a.id) && !a.tokenBad && a.token && !laneBusy.has(a.id))
+    .filter(a => !a.disabled && !skip.has(a.id) && !a.tokenBad && a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now))
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
-    .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
-    .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
+    .filter(x => USABLE.has(x.state))
+    // Daily allowance first, premium-only accounts last (sortForPick).
+    .sort(sortForPick)
     .map(x => x.account);
+}
+
+// ------------------------------------------- accounts waiting for a sponsor ad
+//
+// free-pi answers 403 {"code":"ads_required"} until an account has really seen
+// an ad. Retrying such an account on every request only produces 403s that the
+// harness misreads as "API key is invalid", so it is parked until its sponsor
+// window has shown something (or the cooldown expires, whichever is first).
+
+const AD_COOLDOWN_MS = 10 * 60 * 1000;
+const adBlocked = new Map();   // account id -> when the block was recorded
+
+function markAdsRequired(id) {
+  adBlocked.set(id, Date.now());
+}
+
+/** Called by the sponsor panel once an account has displayed a real ad. */
+function clearAdsRequired(id) {
+  adBlocked.delete(id);
+}
+
+function inAdCooldown(id, now = Date.now()) {
+  const at = adBlocked.get(id);
+  if (at === undefined) return false;
+  if (now - at > AD_COOLDOWN_MS) { adBlocked.delete(id); return false; }
+  return true;
 }
 
 // ------------------------------------------------ multi-account request lanes
@@ -373,7 +400,11 @@ function retryCandidates(exclude) {
 
 const laneBusy = new Set();   // account ids currently serving a request
 
-/** All accounts usable right now, most remaining budget first. */
+/**
+ * All accounts usable right now, best first: accounts with daily allowance
+ * before premium-only ones, then most spendable credits, then idlest. A
+ * premium-only account still gets a lane, but only after every normal one.
+ */
 function usableAccounts() {
   if (!STORE) return [];
   if (MANUAL_ACCOUNT_ID) {
@@ -384,8 +415,8 @@ function usableAccounts() {
   return STORE.accounts
     .filter(a => !a.disabled && !a.tokenBad && a.token)
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
-    .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
-    .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
+    .filter(x => USABLE.has(x.state))
+    .sort(sortForPick)
     .map(x => x.account);
 }
 
@@ -523,16 +554,25 @@ function renderAd(ad) {
 // passing a bare 403 to the client.
 const SPONSOR_URL = 'http://127.0.0.1:' + PORT + '/sponsor';
 const SPONSOR_NUDGE_MS = 5 * 60 * 1000;
-let sponsorNudgedAt = 0;
+const sponsorNudgedAt = new Map();   // account id -> last time we opened its panel
 
-function openSponsorPanel() {
+/** Window URL for one account; every account needs its own. */
+function sponsorUrlFor(account) {
+  return account?.id ? SPONSOR_URL + '?account=' + encodeURIComponent(account.id) : SPONSOR_URL;
+}
+
+function openSponsorPanel(account) {
   const now = Date.now();
-  if (now - sponsorNudgedAt < SPONSOR_NUDGE_MS) return false;
-  sponsorNudgedAt = now;
-  console.log('[sponsor] free-pi asked for a sponsor view - opening ' + SPONSOR_URL);
+  const key = account?.id || '-';
+  // Per account: a blocked account needs its own window even when another one
+  // was opened a moment ago.
+  if (now - (sponsorNudgedAt.get(key) || 0) < SPONSOR_NUDGE_MS) return false;
+  sponsorNudgedAt.set(key, now);
+  const url = sponsorUrlFor(account);
+  console.log('[sponsor] free-pi asked for a sponsor view - opening ' + url);
   try {
     // `start` needs an empty title argument; the URL is ours, not user input.
-    const child = spawn('cmd', ['/c', 'start', '', SPONSOR_URL], {
+    const child = spawn('cmd', ['/c', 'start', '', url], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
@@ -798,7 +838,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             const raw = Buffer.concat(errChunks);
             releaseLaneOnce();
             if (raw.toString().includes('ads_required')) {
-              openSponsorPanel();
+              // Park this account until its own sponsor window has shown an ad,
+              // so the next requests go to a working account instead of
+              // repeating the same 403 on every call.
+              markAdsRequired(account.id);
+              openSponsorPanel(account);
               relay(403, adsRequiredBody());
               return;
             }
@@ -909,8 +953,61 @@ function usageSnapshot() {
     nextAction: MANUAL_ACCOUNT_ID ? { action: 'manual', accountId: MANUAL_ACCOUNT_ID } : STORE ? decide(STORE, now, STORE.settings) : null,
     totals: STORE ? STORE.totals : null,
     queue: queueDepth(),
-    accounts: (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
+    accounts: (STORE ? STORE.accounts : []).map(a => ({
+      ...describe(a, now, STORE.settings),
+      // true while free-pi wants a sponsor view for this account; the window at
+      // /sponsor?account=<id> clears it once the ad was really displayed.
+      adsRequired: inAdCooldown(a.id, now),
+    })),
   };
+}
+
+/**
+ * Per-day consumption history from the store totals. daily and premium are
+ * separate wallets and are never added into one counter; `total` only sums
+ * them for reading, `hours` converts the total at the base rate.
+ *
+ * dates is the union of both maps, newest first. ?limit keeps the newest N.
+ */
+function historySnapshot(limit) {
+  const totals = (STORE && STORE.totals) || {};
+  const byDay = totals.byDay && typeof totals.byDay === 'object' ? totals.byDay : {};
+  const byDayPremium = totals.byDayPremium && typeof totals.byDayPremium === 'object' ? totals.byDayPremium : {};
+  const DAY = /^\d{4}-\d{2}-\d{2}$/;
+  const days = [...new Set([...Object.keys(byDay), ...Object.keys(byDayPremium)])]
+    .filter(d => DAY.test(d))
+    .sort()
+    .reverse()
+    .slice(0, limit)
+    .map(function (date) {
+      const daily = byDay[date] ?? 0;
+      const premium = byDayPremium[date] ?? 0;
+      const total = Math.round((daily + premium) * 1e6) / 1e6;
+      return {
+        date,
+        daily,
+        premium,
+        total,
+        hours: Math.round((creditsToHours(total) ?? 0) * 1000) / 1000,
+      };
+    });
+  const sum = key => Math.round(days.reduce((acc, d) => acc + d[key], 0) * 1e6) / 1e6;
+  const daily = sum('daily');
+  const premium = sum('premium');
+  return {
+    days,
+    totals: { daily, premium, hours: Math.round((creditsToHours(daily + premium) ?? 0) * 1000) / 1000 },
+    creditsPerHour: CREDITS_PER_HOUR,
+  };
+}
+
+/** ?limit=N, default 30, capped at 365. Anything non-numeric is ignored. */
+function historyLimit(url) {
+  const raw = url.searchParams.get('limit');
+  if (raw === null || !/^\d+$/.test(raw.trim())) return 30;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n < 1) return 30;
+  return Math.min(n, 365);
 }
 
 function startServer(models, sponsorHtml) {
@@ -918,7 +1015,15 @@ function startServer(models, sponsorHtml) {
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
 
-  const sponsorPanel = createSponsorPanel({ currentAccount: async () => { await syncStore(); return activeAccount(); }, sessionId: SESSION_ID, usage: usageSnapshot, html: sponsorHtml, port: PORT });
+  const sponsorPanel = createSponsorPanel({
+    currentAccount: async () => { await syncStore(); return activeAccount(); },
+    accounts: async () => { await syncStore(); return STORE.accounts || []; },
+    sessionId: SESSION_ID,
+    usage: usageSnapshot,
+    html: sponsorHtml,
+    port: PORT,
+    onDisplayed: (accountId) => clearAdsRequired(accountId),
+  });
   const server = http.createServer(async function(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1:' + PORT);
     if (url.pathname.startsWith('/sponsor')) { await sponsorPanel(req, res, url); return; }
@@ -982,6 +1087,25 @@ function startServer(models, sponsorHtml) {
           if (res.destroyed || res.writableEnded) return;
           res.writeHead(500, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'usage snapshot failed', type: 'proxy_error' } }));
+        });
+      return;
+    }
+
+    // Per-day consumption: credits per UTC day from the persisted totals.
+    // ?limit=N returns the newest N days (default 30, max 365).
+    if (req.method === 'GET' && url.pathname === '/history') {
+      syncStore()
+        .catch(() => null)
+        .then(function () {
+          if (res.destroyed || res.writableEnded) return;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(historySnapshot(historyLimit(url)), null, 2));
+        })
+        .catch(function (err) {
+          console.error('[/history] ' + err.message);
+          if (res.destroyed || res.writableEnded) return;
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'history snapshot failed', type: 'proxy_error' } }));
         });
       return;
     }
