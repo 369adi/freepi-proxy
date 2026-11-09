@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// free-pi proxy ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â OpenAI-compatible local gateway with multi-account rotation.
+// free-pi proxy - OpenAI-compatible local gateway with multi-account rotation.
 //
 // One local endpoint, many free-pi accounts: the rotator measures each account's
 // live budget via GET /me, keeps using the active one until it gets low, then
 // switches to another existing account. A brand-new GitHub account is only
 // needed when *every* known account is out of budget and no daily refill is
-// imminent ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â see tools/lib/policy.mjs for that decision.
+// imminent - see tools/lib/policy.mjs for that decision.
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs/promises';
@@ -333,7 +333,7 @@ async function chooseAccount() {
       STORE.activeAccountId = target.id;
       target.lastUsedAt = new Date().toISOString();
       await persist();
-      console.log(`[rotator] switch -> ${target.id} (${target.handle || target.email || '?'}) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${decision.reason}`);
+      console.log(`[rotator] switch -> ${target.id} (${target.handle || target.email || '?'}) - ${decision.reason}`);
       return target;
     }
   }
@@ -347,7 +347,7 @@ async function chooseAccount() {
   }
 
   if (decision.action === 'wait') {
-    console.warn(`[rotator] all accounts exhausted; next refill ${decision.until} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â requests will fail until then`);
+    console.warn(`[rotator] all accounts exhausted; next refill ${decision.until} - requests will fail until then`);
     const fallback = activeAccount();
     return fallback; // let upstream answer with the real quota error
   }
@@ -498,7 +498,7 @@ async function promote(account, reason) {
   STORE.activeAccountId = account.id;
   account.lastUsedAt = new Date().toISOString();
   await persist();
-  console.log(`[rotator] retry on ${account.id} (${account.handle || account.email || '?'}) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${reason}`);
+  console.log(`[rotator] retry on ${account.id} (${account.handle || account.email || '?'}) - ${reason}`);
 }
 
 // ---------------------------------------------------------------- upstream I/O
@@ -695,7 +695,7 @@ async function runUsageLoop() {
         if (target) {
           STORE.activeAccountId = target.id;
           await persist();
-          console.log(`[rotator] proactive switch -> ${target.id} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${d.reason}`);
+          console.log(`[rotator] proactive switch -> ${target.id} - ${d.reason}`);
         }
       } else if (d.action === 'mint') {
         console.warn(`[rotator] budget exhausted everywhere; new account would be ${d.email}`);
@@ -911,9 +911,17 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         const h = {
           'access-control-allow-origin': '*',
           'content-type': upRes.headers['content-type'] || 'application/json',
+          // Which lane actually served this request. Without it you cannot tell
+          // rotation from "one account did everything" - the number that matters
+          // when a client suddenly starts getting throttled.
+          'x-free-pi-account': account.id,
+          'x-free-pi-handle': encodeURIComponent(account.handle || ''),
+          // Exposed so browser clients can read it at all.
+          'access-control-expose-headers': 'x-free-pi-account, x-free-pi-handle',
         };
         if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
         if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
+        noteServed(account, upRes.statusCode);
         inRes.writeHead(upRes.statusCode, h);
         upRes.pipe(inRes);
         upRes.on('end', releaseLaneOnce);
@@ -948,6 +956,9 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
 
     const relay = (status, buf) => {
       if (inRes.headersSent) { inRes.end(); return; }
+      // Count the refusal against the lane that caused it, so /usage shows a
+      // lane that keeps failing instead of one that merely looks busy.
+      noteServed(account, status);
       inRes.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       inRes.end(buf);
     };
@@ -1032,9 +1043,35 @@ function usageSnapshot() {
       // true while free-pi wants a sponsor view for this account; the window at
       // /sponsor?account=<id> clears it once the ad was really displayed.
       adsRequired: inAdCooldown(a.id, now),
+      // When this lane last served a request, and whether it is serving one
+      // right now. Without these two a stuck lane is invisible: every number
+      // looks healthy while one account quietly does all the work.
+      lastUsedAt: a.lastUsedAt || null,
+      busy: laneBusy.has(a.id),
     })),
+    // Filled in from the cost ledger by /usage: who served what.
+    served: laneServed,
   };
 }
+
+/**
+ * Per-account request tally since the proxy started. Cheap to read and the
+ * only way to tell "rotation works" from "one account is doing everything".
+ *
+ * ok counts responses we passed through with a 2xx status; failed counts the
+ * rest, so a lane that keeps erroring is visible instead of looking busy.
+ */
+const laneServed = {};
+
+function noteServed(account, status) {
+  if (!account || !account.id) return;
+  const row = laneServed[account.id] || (laneServed[account.id] = { ok: 0, failed: 0, lastAt: null, lastStatus: null });
+  if (status >= 200 && status < 300) row.ok += 1;
+  else row.failed += 1;
+  row.lastAt = new Date().toISOString();
+  row.lastStatus = status;
+}
+
 
 /**
  * Per-day consumption history from the store totals. daily and premium are
@@ -1104,6 +1141,8 @@ function startServer(models, sponsorHtml) {
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
     res.setHeader('access-control-allow-headers', 'content-type, authorization, x-request-id');
+    // Let browser clients read which lane served a request (see send()).
+    res.setHeader('access-control-expose-headers', 'x-free-pi-account, x-free-pi-handle');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
