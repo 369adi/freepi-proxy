@@ -463,16 +463,41 @@ async function clickByLabel(session, source, avoid) {
 }
 
 /**
- * Drive the GitHub device-login page end to end: enter the code, continue,
- * authorize. Requires the persistent browser profile to be signed in already;
- * if it is not, this throws a login_required error so the caller can tell the
- * user to sign in once.
+ * Explicit "do not touch" labels. Anything a person might click during sign-in,
+ * account switching, or OAuth provider choice lives here, so a stray regex can
+ * never navigate away while they are still on the page.
  */
+const NEVER_CLICK =
+  '/sign up|create account|new to github|cancel|abbrechen|different account|another account|sign out|log out|sign in with|continue with|use another|switch account|passkey|forgot password|reset password/i';
+
+/**
+ * True while the page is still part of a human sign-in: a provider chooser, a
+ * password / 2FA / passkey prompt, or the "Sign in to GitHub" form. On those
+ * pages the driver must not click anything at all - every button there either
+ * submits a half-filled form or bounces the person back to the start.
+ */
+function isSignInPage(url, text) {
+  const u = String(url || '');
+  const t = String(text || '').toLowerCase();
+  // A finished device flow must never be mistaken for a sign-in page, even
+  // though its URL lives under /login/.
+  if (/device\/(success|connected)|\/login\/device\/success/i.test(u)) return false;
+  if (/device connected|you are now|all set|successfully authenticated/i.test(t)) return false;
+  if (/\/(login|session|sessions|oauth_authorize)\b|\/login\/oauth/i.test(u)) return true;
+  if (/accounts\.google\.com|login\.microsoftonline|appleid\.apple\.com/.test(u)) return true;
+  if (/sign in to github|username or email|sign in with google|continue with google|choose an account/i.test(t)) {
+    return true;
+  }
+  if (/two-factor|authentication code|verify your identity|security code|passkey|use your password/i.test(t)) {
+    return true;
+  }
+  return false;
+}
 async function driveGithubLogin(session, code, opts = {}) {
   const deadline = Date.now() + (opts.timeoutMs || 120000);
   const signal = opts.signal;
   const deviceUrl = opts.verificationUriComplete || opts.verificationUri || null;
-  const safe = '/sign up|create account|new to github|cancel|abbrechen|different account|another account|sign out|log out/i';
+  const safe = NEVER_CLICK;
   let codeEntered = false;
   let sawLogin = false;
   let everSawLogin = false;
@@ -480,6 +505,9 @@ async function driveGithubLogin(session, code, opts = {}) {
   let passedPicker = false;
   let lastSignature = '';
   let stableSince = Date.now();
+  // Grace period: the tab has just opened and may still be redirecting. Acting
+  // inside this window is what pressed buttons under the person's hands.
+  const settleUntil = Date.now() + (opts.settleMs ?? 4000);
 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new ApiError(0, 'aborted', 'abgebrochen');
@@ -494,21 +522,23 @@ async function driveGithubLogin(session, code, opts = {}) {
     const url = state.url || '';
     const text = (state.text || '').toLowerCase();
 
-    // GitHub asks to sign in first: this profile has no session yet. With a
-    // throw-away profile that is the normal case, not an error - the window is
-    // on screen, so wait for the user to sign in as the account to add instead
-    // of aborting. Nothing about the already-signed-in profile is touched.
-    if (/\/login\b/.test(url) && /sign in to github|username or email/i.test(text)) {
+    // Let the page settle before touching it at all. A person takes a few
+    // seconds to orient; clicking during that gap is what caused the automaton
+    // to fight the sign-in it was supposed to be waiting for.
+    if (Date.now() < settleUntil) continue;
+
+    // Any page that is still part of the human sign-in (GitHub form, Google /
+    // Microsoft chooser, 2FA, passkey). The driver must be completely passive
+    // here: clicking anything submits a half-filled form, picks the wrong
+    // account, or bounces straight back to the start of the flow.
+    const onSignIn = isSignInPage(url, text);
+    if (onSignIn) {
       if (!sawLogin) {
         sawLogin = true;
         everSawLogin = true;
         loginSeenAt = Date.now();
       }
-      const pw = state.inputs.find((i) => i.type === 'password');
-      if (pw && pw.value) {
-        const clicked = await clickByLabel(session, '/^sign in/i', safe);
-        if (clicked !== 'none') continue;
-      }
+      // Never touch the page. Keep the window open and let the person finish.
       if (opts.waitForLogin) {
         if (Date.now() - loginSeenAt > (opts.loginWaitMs || 10 * 60 * 1000)) {
           throw new ApiError(
@@ -517,12 +547,12 @@ async function driveGithubLogin(session, code, opts = {}) {
             'kein Login im geoeffneten Fenster - bitte erneut versuchen',
           );
         }
-        continue; // keep the window open and wait
+        continue;
       }
       throw new ApiError(
         0,
         'login_required',
-        'bitte einmal im geoeffneten Chrome-Fenster bei GitHub einloggen',
+        'bitte einmal im geoeffneten Fenster bei GitHub einloggen',
       );
     }
     sawLogin = false;
@@ -533,8 +563,11 @@ async function driveGithubLogin(session, code, opts = {}) {
     }
 
     // Account chooser: "Signed in as X" + a "Continue as <user>" button.
+    // Only an explicit "Continue as <name>" is safe to press; a bare
+    // "Continue" is how GitHub renders provider buttons like "Continue with
+    // Google", which would restart the whole sign-in.
     if (!passedPicker && /select_account|signed in as/i.test(url + ' ' + text)) {
-      const go = await clickByLabel(session, '/^continue|^weiter/i', /different|another/i);
+      const go = await clickByLabel(session, '/^continue as\\s+\\S|^weiter als\\s+\\S/i', NEVER_CLICK);
       if (go !== 'none' && go !== 'err') {
         passedPicker = true;
         await sleep(2500);
@@ -555,17 +588,19 @@ async function driveGithubLogin(session, code, opts = {}) {
       if (filled !== 'none' && !/^(err|none)/.test(filled)) {
         codeEntered = true;
         await sleep(800);
-        await clickByLabel(session, '/^continue|^weiter|^submit|^next/i', safe);
+        await clickByLabel(session, '/^continue|^weiter|^submit|^next/i', NEVER_CLICK);
         await sleep(2500);
         continue;
       }
     }
 
-    // Authorize / grant access.
+    // Authorize / grant access. This regex is intentionally narrow: it must
+    // match the OAuth consent buttons only, never a plain "Continue", because
+    // that also matches provider buttons on the sign-in page.
     const clicked = await clickByLabel(
       session,
-      '/authorize|autorisieren|grant access|^continue|^weiter|^confirm|approve access|^accept/i',
-      safe,
+      '/^authorize|^autorisieren|grant access|zugriff gewaehren|approve access|^accept|^akzeptieren|authorize freepi/i',
+      NEVER_CLICK,
     );
     if (clicked !== 'none' && clicked !== 'err') {
       await sleep(2000);
@@ -574,7 +609,17 @@ async function driveGithubLogin(session, code, opts = {}) {
 
     // Nowhere left to go. If we walked the account picker already but never saw
     // the code form, jump straight to the code URL rather than giving up.
-    if (passedPicker && !codeEntered && deviceUrl && !/device\?user_code/.test(url)) {
+    // Only do this when the page is demonstrably settled (not a sign-in page,
+    // no navigation in flight): a hard location.href jump during a Google or
+    // 2FA step is exactly what throws the person back to the login screen.
+    const stillMoving = isSignInPage(url, text) || /google|microsoft|apple|okta/i.test(url);
+    if (
+      passedPicker &&
+      !codeEntered &&
+      deviceUrl &&
+      !stillMoving &&
+      !/device\?user_code/.test(url)
+    ) {
       codeEntered = false;
       try {
         await session.eval(`(() => { location.href = ${JSON.stringify(deviceUrl)}; return 'go'; })()`);
@@ -821,7 +866,10 @@ async function loginWithDeviceFlow({
 
           await driveGithubLogin(session, userCode, {
             signal,
-            waitForLogin: Boolean(browser.ephemeral),
+            // Always wait: the window is on screen, so a person can always sign
+            // in. Tying this to the ephemeral flag meant a reused profile threw
+            // "login required" the moment a sign-in page appeared.
+            waitForLogin: true,
             loginWaitMs: Math.max(60_000, Math.min(deadline - Date.now(), 10 * 60 * 1000)),
             timeoutMs: Math.max(60_000, Math.min(deadline - Date.now(), 10 * 60 * 1000)),
             verificationUriComplete:
