@@ -615,6 +615,26 @@ function adsRequiredBody() {
 }
 
 /**
+ * free-pi allows a signed-in account only a few parallel CLI sessions. Crashed
+ * or abandoned runs keep their slot until it expires, and the upstream wording
+ * ("run /close-other-session") only applies to the official CLI, not here.
+ */
+function sessionCapBody(account, retryAfterSeconds) {
+  const wait = retryAfterSeconds > 0 ? Math.ceil(retryAfterSeconds / 60) : 0;
+  return Buffer.from(JSON.stringify({
+    error: {
+      message:
+        'free-pi reports too many parallel sessions on ' + (account.handle || account.id) +
+        '. This is a session cap, not a credit problem - no credits were used. ' +
+        (wait ? 'A slot frees itself in about ' + wait + ' min. ' : '') +
+        'Waiting or switching account helps; retrying immediately does not.',
+      type: 'concurrent_session',
+      retry_after_seconds: retryAfterSeconds || 0,
+    },
+  }));
+}
+
+/**
  * Wrap a raw upstream error payload in the OpenAI error envelope. Clients
  * render `error.message`; a bare upstream body is silently swallowed.
  */
@@ -690,7 +710,10 @@ async function runUsageLoop() {
 
 // ---------------------------------------------------------------- chat proxy
 
-const QUOTA_STATUS = new Set([402, 429]);
+// 409 carries free-pi's session-cap rejection ("concurrent_session"), which is
+// not a credit problem; it is handled separately below and must not fall
+// through to the generic error path, where the reason is lost.
+const QUOTA_STATUS = new Set([402, 409, 429]);
 
 /**
  * Forward one chat completion. If the upstream rejects it because the account's
@@ -837,6 +860,23 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
               }, 400 * retries);
               return;
             }
+            if (code === 'concurrent_session') {
+              // Different from `concurrent`: this is an account-wide cap on
+              // parallel CLI sessions (4 for a signed-in account), usually from
+              // crashed or abandoned runs. It is not a credit problem and the
+              // account is not broken, so retrying here does nothing - the slot
+              // frees itself after retry_after_seconds. Say so plainly instead
+              // of relaying a bare 409 the user cannot act on.
+              let retryAfter = 0;
+              try { retryAfter = Number(JSON.parse(raw.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
+              console.warn(
+                '[proxy] upstream session cap reached on ' + account.id +
+                (retryAfter ? ' - frees in about ' + Math.ceil(retryAfter / 60) + ' min' : ''),
+              );
+              releaseLaneOnce();
+              relay(429, sessionCapBody(account, retryAfter));
+              return;
+            }
             onQuota(upRes.statusCode, raw);
           });
           return;
@@ -931,6 +971,24 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     };
 
     const onQuota = async (status, buf) => {
+      // A 409 is a session cap, not a spent budget: marking the account
+      // exhausted here would retire a perfectly good account.
+      if (status === 409) {
+        let code = '';
+        try { code = JSON.parse(buf.toString()).code || ''; } catch { /* ignore */ }
+        if (code === 'concurrent_session') {
+          let retryAfter = 0;
+          try { retryAfter = Number(JSON.parse(buf.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
+          console.warn(
+            '[proxy] session cap on ' + account.id +
+            (retryAfter ? ' - frees in about ' + Math.ceil(retryAfter / 60) + ' min' : ''),
+          );
+          if (await tryNext('session cap')) return;
+          releaseLaneOnce();
+          relay(429, sessionCapBody(account, retryAfter));
+          return;
+        }
+      }
       markExhausted(account, `upstream ${status}`);
       account.usage = account.usage || {};
       account.usage.remainingCreditsToday = 0;
