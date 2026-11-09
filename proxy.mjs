@@ -478,19 +478,51 @@ function retryCandidates(exclude) {
 const AD_COOLDOWN_MS = 10 * 60 * 1000;
 const adBlocked = new Map();   // account id -> when the block was recorded
 
+// Which accounts are currently waiting for a display is worth surviving a
+// restart. Without it a restarted proxy believes every account is fine, so it
+// stops reopening the window and stops telling the caller why a request was
+// refused. Kept next to the store but in its own file: it is derived state and
+// must never risk the account data itself.
+const AD_STATE_FILE = path.join(os.homedir(), '.free-pi', 'proxy', 'ad-state.json');
+
+function loadAdState() {
+  try {
+    const raw = fsSync.readFileSync(AD_STATE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    const now = Date.now();
+    for (const [id, at] of Object.entries(data.blocked || {})) {
+      // Anything older than the cooldown is stale anyway.
+      if (typeof at === 'number' && now - at <= AD_COOLDOWN_MS) adBlocked.set(id, at);
+    }
+  } catch { /* first run or unreadable: start empty */ }
+}
+
+function saveAdState() {
+  try {
+    fsSync.mkdirSync(path.dirname(AD_STATE_FILE), { recursive: true });
+    const blocked = {};
+    for (const [id, at] of adBlocked) blocked[id] = at;
+    const tmp = AD_STATE_FILE + '.tmp';
+    fsSync.writeFileSync(tmp, JSON.stringify({ version: 1, blocked }) + '\n');
+    fsSync.renameSync(tmp, AD_STATE_FILE);
+  } catch { /* a failed write must not break a request */ }
+}
+
 function markAdsRequired(id) {
   adBlocked.set(id, Date.now());
+  saveAdState();
 }
 
 /** Called by the sponsor panel once an account has displayed a real ad. */
 function clearAdsRequired(id) {
   adBlocked.delete(id);
+  saveAdState();
 }
 
 function inAdCooldown(id, now = Date.now()) {
   const at = adBlocked.get(id);
   if (at === undefined) return false;
-  if (now - at > AD_COOLDOWN_MS) { adBlocked.delete(id); return false; }
+  if (now - at > AD_COOLDOWN_MS) { adBlocked.delete(id); saveAdState(); return false; }
   return true;
 }
 
@@ -1793,6 +1825,9 @@ function startServer(models, sponsorHtml) {
 async function main() {
   const { store, seeded } = await ensureStore();
   STORE = store;
+  // Restore which accounts were waiting for a display before the last stop, so
+  // their windows get reopened instead of the proxy pretending all is well.
+  loadAdState();
   await syncManualSelection();
   if (!STORE.accounts.length) {
     console.error('No free-pi account available.');
