@@ -25,18 +25,39 @@ check('grace period skips actions', /if \(Date\.now\(\) < settleUntil\) continue
 check('waitForLogin no longer tied to ephemeral', /waitForLogin: true,/.test(code));
 
 // ---- the click regexes themselves ---------------------------------------
-const pickerMatch = code.match(/clickByLabel\(session, '(\/\^continue as[^']*)'/);
-check('picker uses explicit "continue as"', Boolean(pickerMatch));
+// The device-activation page shows "Signed in as <user>" plus a bare Continue.
+// That Continue must be clickable, otherwise the flow stalls while a human
+// watches a button nobody presses.
+const continueMatch = code.match(
+  /clickByLabel\(session, '(\/\\\\bcontinue\\\\b[^']*)'/,
+);
+check('device-activation Continue is clicked', Boolean(continueMatch));
+check(
+  'Continue click is guarded by NEVER_CLICK',
+  /clickByLabel\(session, '\/\\\\bcontinue\\\\b[\s\S]{0,120}?NEVER_CLICK/.test(code),
+);
 
 // The old bug: a bare ^continue matched "Continue with Google".
 const bareContinue = /\^continue\|/;
-check('no bare ^continue wildcard left in picker', !bareContinue.test(pickerMatch?.[1] || '\u0000'));
+check('no bare ^continue wildcard left in the driver', !bareContinue.test(code));
 
-const authorizeMatch = code.match(/'\/(\^authorize[^']*)'/);
+const authorizeMatch = code.match(
+  /'\/authorize\|autorisieren\|grant access\|zugriff gewaehren\|approve access\|akzeptieren\/i'/,
+);
 check('authorize regex found', Boolean(authorizeMatch));
 check(
   'authorize regex does not match plain Continue',
-  !/\^continue/.test(authorizeMatch?.[1] || '\u0000'),
+  !/\^continue/.test(authorizeMatch?.[0] || '\u0000'),
+);
+
+// The authorize button ships disabled and a page script may never enable it.
+check(
+  'disabled authorize button is unlocked before submit',
+  /if \(b\.disabled\) \{\s*b\.disabled = false;[\s\S]{0,900}?requestSubmit\(b\)/.test(code),
+);
+check(
+  'form.requestSubmit used for input[type=submit]',
+  /requestSubmit\(b\)/.test(code),
 );
 
 // ---- behaviour of the extracted functions --------------------------------

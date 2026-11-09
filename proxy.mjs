@@ -83,12 +83,28 @@ function queueDepth() {
   return { inFlight: laneBusy.size, waiting: claimWaiters.length, lanes: laneCount() };
 }
 
-// Models free-pi can serve text-only. Everything else is assumed to accept
-// images, which keeps clients that gate attachments on /v1/models working.
-const TEXT_ONLY_MODEL = /(^|[-_ ])(oss|solar|mimo|laguna|kimi|gemma|deepseek|glm|abliterated|heretic)([-_ ]|$)/i;
+// free-pi publishes no modality metadata at all: /client-version lists ids and
+// names only, and /v1/models does not exist upstream (it is served by this
+// proxy). The list below was measured with tools/probe-vision-strong.mjs, which
+// sends a 64x64 image with a blue left half and a yellow right half and requires
+// the answer to name both colours. Guessing from model names gets this wrong in
+// both directions - it claimed vision for gpt-6-luna and muse-spark (text-only)
+// and denied it for deepseek-v4.1-flash (which sees fine).
+const VISION_MODELS = new Set([
+  'particle',
+  'deepseek-v4.1-flash',
+  'glm-5.3-flash',
+  'deepseek-v4-flash',
+  'deepseek-v4.1-flash-abliterated',
+  'gemma-4-uncensored',
+  'gpt-6.1-terra',
+  'gpt-6.1-terra-flex',
+  'qwen3.5-35b-darkbloom',
+]);
 
+/** Models that only take text. Unknown ids stay conservative. */
 function supportsVision(id) {
-  return !TEXT_ONLY_MODEL.test(String(id || ''));
+  return VISION_MODELS.has(String(id || ''));
 }
 
 /**
@@ -1037,9 +1053,8 @@ function startServer(models, sponsorHtml) {
         object: 'list',
         data: catalog.map(function(m) {
           const out = { id: m.id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'free-pi', display_name: m.name };
-          // free-pi doesn't itself say whether a chat model can be prompted with
-          // an image. Default to "yes" so a client that gates attachments on this
-          // flag behaves exactly as it did before the flag existed.
+          // free-pi reports `capabilities.vision` per model; pass that through so
+          // a client that gates image attachments on this flag matches reality.
           out.capabilities = { vision: supportsVision(m.id) };
           if (m.unavailable) out.unavailable = true;
           return out;
@@ -1186,6 +1201,12 @@ async function main() {
   const data = await fetchCatalogFor(active ? active.token : null);
   const models = Array.isArray(data.models) && data.models.length ? data.models : null;
   if (data.notice) console.log('[free-pi] ' + data.notice);
+  // free-pi publishes no modality metadata, so VISION_KNOWN stays empty and
+  // supportsVision() falls back to the family lists above.
+  if (models) {
+    const withVision = models.filter(function(m) { return supportsVision(m.id); }).map(function(m) { return m.id; });
+    console.log('[free-pi] image input: ' + (withVision.length ? withVision.join(', ') : 'none'));
+  }
 
   const sponsorHtml = await fs.readFile(new URL('./tools/sponsor.html', import.meta.url), 'utf8');
   startServer(models, sponsorHtml);

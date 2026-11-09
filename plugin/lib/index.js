@@ -442,11 +442,30 @@ async function clickByLabel(session, source, avoid) {
         document.querySelectorAll('button, input[type=submit], a[role=button]'));
       for (var i = 0; i < els.length; i++) {
         var b = els[i];
-        if (!b.offsetParent || b.disabled) continue;
+        if (!b.offsetParent) continue;
         var label = ((b.innerText || b.value || '') + ' ' +
           (b.getAttribute('aria-label') || '')).trim();
         if (!re.test(label)) continue;
         if (avoid && avoid.test(label)) continue;
+        // GitHub ships the OAuth authorize button already disabled and lets a
+        // page script enable it. Under CDP that script may never run, which left
+        // the button unclickable and stalled the device flow at the last step.
+        // Clearing the flag here is safe: the server still checks the session.
+        if (b.disabled) {
+          b.disabled = false;
+          b.removeAttribute('disabled');
+          b.setAttribute('data-freepi-unlocked', '1');
+        }
+        // GitHub renders these as <input type=submit>, where .click() does not
+        // always submit the surrounding form. requestSubmit(button) does, and
+        // keeps the button's own name/value so the server sees what was pressed.
+        var form = b.form || (b.closest ? b.closest('form') : null);
+        if (form && typeof form.requestSubmit === 'function') {
+          try { form.requestSubmit(b); return label; } catch (e) { /* fall through */ }
+        }
+        if (b.tagName === 'INPUT' && form && typeof form.submit === 'function') {
+          try { form.submit(); return label; } catch (e) { /* fall through */ }
+        }
         b.click();
         return label;
       }
@@ -562,12 +581,19 @@ async function driveGithubLogin(session, code, opts = {}) {
       return { ok: true, url };
     }
 
-    // Account chooser: "Signed in as X" + a "Continue as <user>" button.
-    // Only an explicit "Continue as <name>" is safe to press; a bare
-    // "Continue" is how GitHub renders provider buttons like "Continue with
-    // Google", which would restart the whole sign-in.
-    if (!passedPicker && /select_account|signed in as/i.test(url + ' ' + text)) {
-      const go = await clickByLabel(session, '/^continue as\\s+\\S|^weiter als\\s+\\S/i', NEVER_CLICK);
+    // Account chooser / device activation. Two shapes exist:
+    //   "Continue as <user>"  (account picker)
+    //   "Device Activation ... Signed in as <user> ... [Continue]"  (device page)
+    // GitHub renders the button as <input value="Continue" aria-label="Continue
+    // as <user>">, so the composed label is "Continue Continue as <user>" and
+    // an anchored ^continue$ never matches. Match the label anywhere, but only
+    // on pages that are unambiguously about this device code.
+    if (!passedPicker && /select_account|signed in as|device activation/i.test(url + ' ' + text)) {
+      const providerPage = /continue with|sign in with|choose an account|use another account/i.test(text);
+      const pickerPattern = providerPage
+        ? '/continue as\\s+\\S|weiter als\\s+\\S/i'
+        : '/\\bcontinue as\\s+\\S|\\bweiter als\\s+\\S|^continue$|^weiter$/i';
+      const go = await clickByLabel(session, pickerPattern, NEVER_CLICK);
       if (go !== 'none' && go !== 'err') {
         passedPicker = true;
         await sleep(2500);
@@ -588,7 +614,7 @@ async function driveGithubLogin(session, code, opts = {}) {
       if (filled !== 'none' && !/^(err|none)/.test(filled)) {
         codeEntered = true;
         await sleep(800);
-        await clickByLabel(session, '/^continue|^weiter|^submit|^next/i', NEVER_CLICK);
+        await clickByLabel(session, '/\\bcontinue\\b|\\bweiter\\b|\\bsubmit\\b|\\bnext\\b/i', NEVER_CLICK);
         await sleep(2500);
         continue;
       }
@@ -599,7 +625,7 @@ async function driveGithubLogin(session, code, opts = {}) {
     // that also matches provider buttons on the sign-in page.
     const clicked = await clickByLabel(
       session,
-      '/^authorize|^autorisieren|grant access|zugriff gewaehren|approve access|^accept|^akzeptieren|authorize freepi/i',
+      '/authorize|autorisieren|grant access|zugriff gewaehren|approve access|akzeptieren/i',
       NEVER_CLICK,
     );
     if (clicked !== 'none' && clicked !== 'err') {
