@@ -155,10 +155,37 @@ export async function target(port, want = null) {
 /**
  * Start a browser that keeps its cookies between runs. Returns a handle with
  * `cdp`, `port`, and `kill()`.
+ *
+ * A profile directory can only be held by one Chrome. Launching a second one on
+ * the same profile silently hands off to the running instance and never binds
+ * the debugging port, so the wait loop below times out with "browser never
+ * exposed CDP" while a perfectly usable browser is already on screen. So before
+ * launching anything, look for a live port that already speaks CDP for this
+ * profile and reuse it.
  */
 export async function openBrowser({ port = null, url = WEBMAIL_URL, profileDir = PROFILE_DIR, headless = false } = {}) {
   const exe = findBrowser();
   if (!exe) throw new Error('no Chrome or Edge found');
+
+  const reuse = async (p) => {
+    const page = await target(p, hostOf(url));
+    if (!page || !page.url || page.url === 'about:blank') return null;
+    const cdp = await new Session(page.webSocketDebuggerUrl).open();
+    return { cdp, port: p, reused: true, kill() { cdp.close(); } };
+  };
+
+  // 1. An explicit port the caller already knows about.
+  if (port) {
+    const hit = await reuse(port);
+    if (hit) return hit;
+  }
+  // 2. Whatever port we recorded for this profile last time.
+  const known = lastPortFor(profileDir);
+  if (known && known !== port) {
+    const hit = await reuse(known);
+    if (hit) return hit;
+  }
+
   const p = port || (await freePort());
   fs.mkdirSync(profileDir, { recursive: true });
 
@@ -181,11 +208,22 @@ export async function openBrowser({ port = null, url = WEBMAIL_URL, profileDir =
     if (page && page.url && page.url !== 'about:blank') break;
     await sleep(300);
   }
-  if (!page) throw new Error('browser never exposed CDP');
+  if (!page) {
+    // The launch probably handed off to an instance that ignores our port.
+    const known2 = lastPortFor(profileDir);
+    if (known2) {
+      const hit = await reuse(known2);
+      if (hit) return hit;
+    }
+    throw new Error('browser never exposed CDP on port ' + p +
+      ' - the profile ' + profileDir + ' may already be open in another window');
+  }
+  rememberPort(profileDir, p);
   const cdp = await new Session(page.webSocketDebuggerUrl).open();
   return {
     cdp,
     port: p,
+    reused: false,
     kill() {
       cdp.close();
       try {
@@ -195,6 +233,32 @@ export async function openBrowser({ port = null, url = WEBMAIL_URL, profileDir =
       }
     },
   };
+}
+
+/** Ports we have successfully driven, keyed by profile directory. */
+const PORT_MEMO = path.join(os.tmpdir(), 'freepi-webmail-ports.json');
+
+function readPortMemo() {
+  try {
+    return JSON.parse(fs.readFileSync(PORT_MEMO, 'utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+
+function lastPortFor(profileDir) {
+  const n = readPortMemo()[path.resolve(profileDir)];
+  return Number.isInteger(n) ? n : null;
+}
+
+function rememberPort(profileDir, port) {
+  try {
+    const m = readPortMemo();
+    m[path.resolve(profileDir)] = port;
+    fs.writeFileSync(PORT_MEMO, JSON.stringify(m, null, 2));
+  } catch {
+    /* best effort */
+  }
 }
 
 // ---------------------------------------------------------------- reading
@@ -225,16 +289,19 @@ export const SNAPSHOT = `(() => {
 })()`;
 
 /**
- * Is the webmail logged in right now? Heuristic but conservative: a login form
- * on screen means no, a message list means yes.
+ * The one definition of "logged in": a live OX AppSuite API call carrying a
+ * session token was made by this page. Text on screen is a bad signal - an OX
+ * error banner, a cookie notice or a stray "Anmelden" menu item all flip it.
  */
+export const MAIL_SESSION = `(() => {
+  const es = performance.getEntriesByType('resource') || [];
+  return es.some(e => /\/appsuite\/api\//.test(e.name) && /[?&]session=[0-9a-f]{16,64}/i.test(e.name));
+})()`;
+
+/** Is the webmail logged in right now? See MAIL_SESSION. */
 export async function isLoggedIn(cdp) {
-  const s = await cdp.eval(SNAPSHOT);
-  if (!s || s.__error) return false;
-  const text = String(s.text || '');
-  const hasPassword = (s.inputs || []).some((i) => i.type === 'password');
-  const looksLikeInbox = /posteingang|inbox|nachrichten|messages/i.test(text) && !hasPassword;
-  return looksLikeInbox && !/anmelden|sign in|login|passwort/i.test(text.slice(0, 400));
+  const v = await cdp.eval(MAIL_SESSION);
+  return v === true;
 }
 
 /**
@@ -283,4 +350,4 @@ export async function findGithubLinks(cdp, { to, timeoutMs = 180000, intervalMs 
   return { ok: false };
 }
 
-export { sleep, findBrowser };
+export { sleep, findBrowser, lastPortFor, rememberPort };

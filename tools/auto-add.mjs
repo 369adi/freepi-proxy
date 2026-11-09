@@ -91,7 +91,7 @@ const CHROME_CANDIDATES = [
 // ---------------------------------------------------------------- args
 
 function parseArgs(argv) {
-  const o = { count: null, dryRun: false, resume: false, status: false, forget: false, prefix: null, start: null, keepOpen: false, waitMin: 15 };
+  const o = { count: null, dryRun: false, resume: false, status: false, forget: false, prefix: null, start: null, keepOpen: false, waitMin: 15, pauseMin: 3 };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--count') o.count = Number(argv[++i]);
@@ -103,12 +103,16 @@ function parseArgs(argv) {
     else if (a === '--start') o.start = Number(argv[++i]);
     else if (a === '--keep-open') o.keepOpen = true;
     else if (a === '--wait-min') o.waitMin = Number(argv[++i]);
+    else if (a === '--pause-min') o.pauseMin = Number(argv[++i]);
     else if (a === '--help' || a === '-h') o.help = true;
   }
   return o;
 }
 
 const ARGS = parseArgs(process.argv.slice(2));
+
+// Pause between accounts in one batch. Sign-ups are throttled hard and fast.
+const PACING_MS = Math.max(0, Number(ARGS.pauseMin || 0)) * 60 * 1000;
 
 if (ARGS.help) {
   console.log(`auto-add.mjs - mint free-pi accounts over a catch-all domain
@@ -121,13 +125,17 @@ if (ARGS.help) {
   --status       print the state table and exit
   --forget       drop unfinished rows and move the counter past them
   --wait-min N   minutes to wait for the human step per account (default 15)
+  --pause-min N  minutes between two accounts in one batch (default 3)
   --keep-open    leave the browser window and profile up after each account
 
 Each account needs its own GitHub identity, because free-pi only accepts GitHub
-OAuth. GitHub guards its sign-up page with a DataDome CAPTCHA, which this tool
-will not bypass: it opens the page and waits for you to confirm once per account,
-then finishes everything else automatically (verification link, device code,
-consent, token, store).
+OAuth. The tool mints a free username, signs up, reads the launch code out of the
+mailbox on its own, enters it, then finishes the device flow, the consent and the
+store write. The mailbox is read from a separate tab so the sign-up session is
+never navigated away, which is what invalidates the launch code.
+
+GitHub throttles sign-up bursts. A rate limit is reported as such and the batch
+stops; it is temporary and needs no repair, only waiting.
 `);
   process.exit(0);
 }
@@ -183,8 +191,10 @@ function saveState(state) {
 
 const loadStoreRaw = () => {
   try {
-    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
-  } catch {
+    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (e) {
+    if (!fs.existsSync(STORE_PATH)) return null;
+    console.warn('store unreadable (' + e.message + ') - falling back to default prefix/domain');
     return null;
   }
 };
@@ -233,8 +243,9 @@ function printStatus() {
 // ---------------------------------------------------------------- CDP
 
 class CdpPage {
-  constructor(wsUrl) {
+  constructor(wsUrl, port = null) {
     this.wsUrl = wsUrl;
+    this.port = port;
     this.ws = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -291,7 +302,12 @@ class CdpPage {
 
   async eval(expression) {
     const r = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-    if (!r) return null;
+    if (!r) {
+      this.nulls = (this.nulls || 0) + 1;
+      if (this.nulls > 5) throw new Error('cdp connection lost');
+      return null;
+    }
+    this.nulls = 0;
     if (r.exceptionDetails) return { __error: r.exceptionDetails.text || 'eval failed' };
     return r.result ? r.result.value : null;
   }
@@ -367,9 +383,13 @@ if (!apiMod) {
   console.error('cannot load tools/lib/freepi-api.mjs');
   process.exit(1);
 }
-const mailbox = await import(pathToFileURL(path.join(HERE, 'lib', 'mailbox.mjs')).href).catch(() => null);
 const storeMod = await import(pathToFileURL(path.join(HERE, 'lib', 'store.mjs')).href).catch(() => null);
 const webHealth = await import(pathToFileURL(path.join(HERE, 'lib', 'webmail.mjs')).href).catch(() => null);
+for (const [name, mod] of [['store.mjs', storeMod], ['webmail.mjs', webHealth]])
+  if (!mod) {
+    console.error('missing tools/lib/' + name);
+    process.exit(1);
+  }
 
 const CONSENT_VERSION = '4';
 
@@ -519,6 +539,50 @@ function makeUsername(email, attempt = 0) {
 }
 
 /**
+ * Is the username still free? Checked against the public API before it is ever
+ * typed into the form.
+ *
+ * Why this exists: the sign-up ran for days against "gh-8", which belongs to a
+ * stranger since 2014. GitHub never accepted the name, the sign-up silently
+ * produced no account, and the verification page then rejected every code as
+ * "Invalid launch code" because there was no pending sign-up to verify. One
+ * cheap HEAD request up front turns that whole class of dead end into a retry.
+ */
+async function usernameIsFree(name) {
+  const url = 'https://api.github.com/users/' + encodeURIComponent(name);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'user-agent': 'freepi-proxy-auto-add', accept: 'application/vnd.github+json' },
+    });
+    if (res.status === 404) return true;
+    if (res.status === 200) return false;
+    // Rate limited or otherwise unknowable: do not pretend either way.
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mint a username that the API confirms is free. Falls back to the plain
+ * generator when the API cannot be reached, so a network hiccup is not fatal.
+ */
+async function makeFreeUsername(email, { log, tries = 6 } = {}) {
+  for (let i = 0; i < tries; i += 1) {
+    const name = makeUsername(email, i);
+    const free = await usernameIsFree(name);
+    if (free === true) return name;
+    if (free === null) {
+      if (log) log('  could not check @' + name + ' against the api, using it as is');
+      return name;
+    }
+    if (log) log('  @' + name + ' is taken, trying another');
+  }
+  return makeUsername(email, tries);
+}
+
+/**
  * GitHub names the usernames it would accept when ours is taken. Those are
  * guaranteed free, so use them instead of guessing again.
  */
@@ -540,9 +604,90 @@ async function suggestUsername(cdp) {
  * interstitial; a retry in the same profile loads the form. We only ever
  * retry - we never try to solve or bypass the challenge.
  */
-async function loadSignupForm(cdp, { attempts = 6, log } = {}) {
+/** Detect GitHub's secondary rate limit page. */
+const RATE_LIMITED = `(() => {
+  const t = String(document.title || '');
+  const b = String((document.body || {}).innerText || '');
+  return /too many requests|rate limit|exceeded a secondary/i.test(t + ' ' + b.slice(0, 900));
+})()`;
+
+// GitHub answers a burst of sign-ups with a secondary rate limit that clears in
+// minutes but can take up to an hour. Retrying through it makes it worse and
+// looks exactly like a bot, so the only sane answer is to stop and wait.
+const RATE_LIMIT_WAIT_MS = 15 * 60 * 1000;
+
+/**
+ * Detect the harder block: GitHub refusing the sign-up page outright.
+ *
+ * Observed on this machine after a batch of sign-ups: GET https://github.com/signup
+ * returns 403 for the whole network while /, /login and api.github.com all still
+ * answer 200. DataDome shows "Der Zugriff ist vorübergehend eingeschränkt" even
+ * after a human solves the slider. No amount of retrying, no fresh profile and
+ * no browser trick clears that - only the network's reputation recovering does.
+ * Surfacing it as its own condition is what stops the batch from hammering a
+ * door that is bolted rather than merely stiff.
+ */
+const SIGNUP_BLOCKED = `(() => {
+  const t = String(document.title || '');
+  const b = String((document.body || {}).innerText || '');
+  const s = t + ' ' + b.slice(0, 900);
+  if (/Zugriff ist vor(ü|ue)bergehend eingeschr(ä|ae)nkt/i.test(s)) return true;
+  if (/access is temporarily restricted|temporarily restricted|temporarily blocked/i.test(s)) return true;
+  return false;
+})()`;
+
+async function signupEndpointBlocked() {
+  // A plain request with no browser gets the same 403, so this is a cheap and
+  // unambiguous probe: no JavaScript, no profile, no challenge to solve.
+  try {
+    const r = await fetch('https://github.com/signup', {
+      method: 'GET',
+      redirect: 'manual',
+      headers: {
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36',
+      },
+    });
+    return { blocked: r.status === 403, status: r.status };
+  } catch (e) {
+    return { blocked: false, status: 0, error: String((e && e.message) || e) };
+  }
+}
+
+async function waitOutRateLimit(cdp, { log, maxWaitMs = RATE_LIMIT_WAIT_MS } = {}) {
+  const start = Date.now();
+  let wait = 120000;
+  while (Date.now() - start < maxWaitMs) {
+    if (log) log('  github is rate limiting - waiting ' + Math.round(wait / 1000) + 's');
+    await sleep(wait);
+    await cdp.navigate('https://github.com/signup');
+    await sleep(3500);
+    const blocked = await cdp.eval(SIGNUP_BLOCKED);
+    if (blocked === true) return { ok: false, blocked: true, waitedMs: Date.now() - start };
+    const limited = await cdp.eval(RATE_LIMITED);
+    if (limited === false) {
+      if (log) log('  rate limit cleared');
+      return { ok: true, waitedMs: Date.now() - start };
+    }
+    wait = Math.min(wait * 2, 600000);
+  }
+  return { ok: false, waitedMs: Date.now() - start };
+}
+
+async function loadSignupForm(cdp, { attempts = 6, log, allowRateWait = true } = {}) {
+  // Probe the endpoint once before driving a browser at all. If GitHub is
+  // refusing /signup for this network there is nothing to wait out and nothing
+  // to retry, so say so in one step instead of burning profiles on a 403.
+  if (allowRateWait) {
+    const probe = await signupEndpointBlocked();
+    if (probe.blocked) {
+      if (log) log('  github is refusing the sign-up page for this network (HTTP 403)');
+      return { ok: false, blocked: true };
+    }
+  }
   for (let i = 1; i <= attempts; i += 1) {
     await cdp.navigate('https://github.com/signup');
+    let limited = false;
     for (let w = 0; w < 16; w += 1) {
       await sleep(700);
       const st = await cdp.eval(SIGNUP_STATE);
@@ -554,6 +699,29 @@ async function loadSignupForm(cdp, { attempts = 6, log } = {}) {
       // The challenge needs a moment; if it is present, let it settle.
       if (st.captcha) break;
       if (st.emailVisible) return { ok: true, state: st };
+      // Bail out of the inner wait immediately: no amount of reloading fixes
+      // a rate limit, and every extra request pushes the window further out.
+      if (await cdp.eval(RATE_LIMITED)) {
+        limited = true;
+        break;
+      }
+      if (await cdp.eval(SIGNUP_BLOCKED)) {
+        if (log) log('  github says access is temporarily restricted');
+        return { ok: false, blocked: true };
+      }
+    }
+    if (limited) {
+      if (!allowRateWait) return { ok: false, rateLimited: true };
+      const w = await waitOutRateLimit(cdp, { log });
+      if (w.blocked) return { ok: false, blocked: true };
+      if (!w.ok) return { ok: false, rateLimited: true };
+      return loadSignupForm(cdp, { attempts, log, allowRateWait: false });
+    }
+    // A challenge we cannot pass is not something to keep retrying either.
+    const stuck = await cdp.eval(SIGNUP_STATE);
+    if (stuck && stuck.captcha && i >= 2) {
+      if (log) log('  a real captcha is standing in the way - needs a human');
+      return { ok: false, captcha: true };
     }
     if (log && i > 1) log('  attempt ' + i + ': still the interstitial');
     await sleep(2500);
@@ -566,10 +734,15 @@ const SIGNUP_STATE = `(() => {
   const all = Array.from(document.querySelectorAll('input'));
   const email = document.querySelector('input[name="user[email]"], #email');
   const pass = document.querySelector('input[name="user[password]"], #password');
+  // A visible DataDome widget means a real challenge needs a human. The 0x0
+  // octocaptcha frame is always in the DOM on the sign-up page and completing
+  // on its own, so counting it as a challenge aborts sign-ups that would work.
+  const challenge = Array.from(document.querySelectorAll('iframe[src*="captcha-delivery"], iframe[src*="captcha"], iframe[src*="octocaptcha"], [data-sitekey]'))
+    .some(el => el.offsetWidth > 40 && el.offsetHeight > 40);
   return {
     url: location.href,
     title: document.title,
-    captcha: !!document.querySelector('iframe[src*="captcha-delivery"], iframe[src*="captcha"], [data-sitekey]'),
+    captcha: challenge,
     inputs: all.filter(vis).map(i => ({ name: i.name || null, id: i.id || null, type: i.type })),
     emailVisible: !!(email && vis(email)),
     passwordVisible: !!(pass && vis(pass)),
@@ -657,16 +830,399 @@ async function checkVerified(cdp) {
 }
 
 /**
+ * Read a GitHub verification code out of the mailbox without touching the UI.
+ *
+ * The STRATO mailbox runs OX AppSuite, and every message is reachable through
+ * one JSON endpoint. The catch: /appsuite/api/* rejects requests without a live
+ * `session` token, and the short `session` cookie is a stale SES-0203 leftover
+ * that is useless for this. The live token is only ever exposed inside the
+ * page, so we read it from the resource-timing entries of the already
+ * logged-in profile - no click, no extra window, no credentials.
+ *
+ * The body needs &full=1. Without it the endpoint returns headers and the
+ * structural parts only, and the code - which lives in the HTML part - is
+ * simply not in the payload.
+ */
+/**
+ * Open the webmail in a separate tab of the SAME browser instance and return a
+ * CDP session bound to that tab only.
+ *
+ * Two things matter here. First, the mailbox must not steal the sign-up tab:
+ * the launch code is bound to the session that requested it, so navigating that
+ * tab away throws the sign-up away. Second, the mail profile may already be
+ * logged in and held by another Chrome, so an existing tab is reused when one
+ * exists rather than launching a second browser that cannot bind its port.
+ */
+/**
+ * Picks the browser that is actually logged into the mailbox.
+ *
+ * The sign-up profile is a brand-new blank profile, so a webmail tab opened
+ * there shows the STRATO login form and can never read a code. The logged-in
+ * mailbox lives in the persistent mail profile, which webHealth already manages
+ * and whose CDP port it remembers. That profile comes first; the sign-up profile
+ * is only a fallback for the case where it happens to be logged in too.
+ */
+async function pickMailPorts(cdp) {
+  const ports = [];
+  try {
+    const memo = webHealth.lastPortFor(webHealth.PROFILE_DIR);
+    if (memo) {
+      const alive = await fetch('http://127.0.0.1:' + memo + '/json/version')
+        .then((r) => r.ok)
+        .catch(() => false);
+      if (alive) ports.push({ port: memo, fromMemo: true });
+    }
+  } catch {
+    /* no memo yet */
+  }
+  if (cdp && cdp.port && !ports.some((p) => p.port === cdp.port)) {
+    ports.push({ port: cdp.port, fromMemo: false });
+  }
+  return ports;
+}
+
+async function openMailTab(cdp, log = null) {
+  let candidates = await pickMailPorts(cdp);
+  if (!candidates.length && webHealth && typeof webHealth.openBrowser === 'function') {
+    try {
+      const b = await webHealth.openBrowser();
+      candidates = [{ port: b.port, fromMemo: true }];
+    } catch (e) {
+      return { ok: false, error: 'could not start the mail profile: ' + e.message };
+    }
+  }
+  if (!candidates.length) return { ok: false, error: 'no browser with a mailbox is running' };
+
+  for (const cand of candidates) {
+    const port = cand.port;
+
+    const list = async () =>
+      fetch('http://127.0.0.1:' + port + '/json/list')
+        .then((r) => r.json())
+        .catch(() => []);
+
+    const findMail = async () => {
+      const tabs = await list();
+      const hit = (tabs || []).find(
+        (t) => t.type === 'page' && /webmail\.|appsuite/i.test(String(t.url || ''))
+      );
+      if (hit) return new CdpPage(hit.webSocketDebuggerUrl, port);
+      return null;
+    };
+
+    const existing = await findMail();
+    if (existing) {
+      await existing.open();
+      // Only a tab that actually reached AppSuite carries a live session; the
+      // STRATO login page does not, so treating "a mail tab exists" as success
+      // is what made the reader retry against a logged-out page.
+      const live = await existing.eval(
+        `(() => { const u = Array.from(performance.getEntriesByType('resource')).map(e => e.name); return u.some(n => /\\\\/appsuite\\\\/api\\\\//.test(n) && /[?&]session=[0-9a-f]{32}/.test(n)); })()`
+      );
+      if (live === true) return { ok: true, cdp: existing };
+      if (!cand.fromMemo) { if (log) log('  skipping mail tab on ' + cand.port + ' (not the mail profile)'); continue; }
+      await existing.navigate(webHealth.WEBMAIL_URL);
+      await sleep(6000);
+      const live2 = await existing.eval(
+        `(() => { const u = Array.from(performance.getEntriesByType('resource')).map(e => e.name); return u.some(n => /\\\\/appsuite\\\\/api\\\\//.test(n) && /[?&]session=[0-9a-f]{32}/.test(n)); })()`
+      );
+      if (live2 === true) return { ok: true, cdp: existing };
+      continue;
+    }
+
+    // No mail tab yet: create one. Target.createTarget is allowed even though
+    // Target.createBrowserContext is not.
+    const created = await fetch(
+      'http://127.0.0.1:' + port + '/json/new?' + encodeURIComponent(webHealth.WEBMAIL_URL),
+      { method: 'PUT' }
+    )
+      .then((r) => r.json())
+      .catch(() => null);
+
+    await sleep(1500);
+    const tab = created && created.webSocketDebuggerUrl ? created : null;
+    if (!tab) continue;
+    const page = new CdpPage(tab.webSocketDebuggerUrl, port);
+    await page.open();
+    await sleep(7000);
+    const live = await page.eval(
+      `(() => { const u = Array.from(performance.getEntriesByType('resource')).map(e => e.name); return u.some(n => /\\\\/appsuite\\\\/api\\\\//.test(n) && /[?&]session=[0-9a-f]{32}/.test(n)); })()`
+    );
+    if (live === true) return { ok: true, cdp: page };
+  }
+
+  return {
+    ok: false,
+    error:
+      'no logged-in mailbox found - the mail profile is not signed in; run ' +
+      '`node tools\\_mail-login.mjs` once with the STRATO password',
+  };
+}
+
+async function readGithubCode(cdp, { email, timeoutMs = 240000, log } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let session = null;
+  let lastSeen = null;
+  let poll = 0;
+
+  // The mailbox lives in the same Chrome but in its OWN tab. Navigating the
+  // sign-up tab to the webmail is what destroyed the sign-up session earlier:
+  // the launch code is only valid in the context that requested it, so the tab
+  // that will submit the code must never leave github.com.
+  const mail = await openMailTab(cdp, log);
+  if (!mail.ok) return { ok: false, error: 'no mailbox tab: ' + mail.error };
+  const mcdp = mail.cdp;
+
+  while (Date.now() < deadline) {
+    poll += 1;
+
+    if (!session) {
+      session = await mcdp.eval(`(() => {
+        const es = performance.getEntriesByType('resource') || [];
+        for (const e of es) {
+          const m = String(e.name || '').match(/[?&]session=([0-9a-f]{16,64})/i);
+          if (m) return m[1];
+        }
+        return null;
+      })()`);
+      if (typeof session !== 'string' || !session) {
+        // The listing page has not issued an api call yet. One reload is enough.
+        if (poll === 1) await mcdp.navigate(webHealth.WEBMAIL_URL);
+        session = null;
+        await sleep(2500);
+        continue;
+      }
+    }
+
+    const inbox = await mcdp.eval(`(async () => {
+      const s = ${JSON.stringify(session)};
+      // The column list decides the row shape. 600/601/603 alone return only
+      // sender, so the recipient filter below would match nothing and the
+      // reader would sit there "waiting for the github notice" forever.
+      const u = '/appsuite/api/mail?action=all&session=' + s +
+        '&folder=default0%2FINBOX&columns=600,601,602,603,604,605,606,607,608' +
+        '&sort=600&order=desc&limit=10';
+      try {
+        const r = await fetch(u, { credentials: 'include' });
+        const j = await r.json();
+        if (j && j.code) return { error: String(j.code) };
+        return { rows: (j.data || []).map(d => ({
+          id: d[0],
+          from: (d[3] && d[3][0] && d[3][0][0]) || '',
+          to: (d[4] && d[4][0] && d[4][0][1]) || '',
+          subject: typeof d[7] === 'string' ? d[7] : '',
+        })) };
+      } catch (e) { return { error: String(e && e.message || e) }; }
+    })()`);
+
+    if (inbox && inbox.error) {
+      if (/SES-0203|SVL-0002/.test(inbox.error)) {
+        // Expired between the scrape and the call; scrape again.
+        session = null;
+        await sleep(1500);
+        continue;
+      }
+      if (log) log('  mail: ' + inbox.error);
+      await sleep(3000);
+      continue;
+    }
+
+    const local = String(email).split('@')[0].toLowerCase();
+    const cands = ((inbox && inbox.rows) || []).filter((r) => {
+      if (!/github/i.test(String(r.from))) return false;
+      const to = String(r.to || '').toLowerCase();
+      // Own address only when the row names one - a generic arisya.de row could
+      // belong to a sibling sign-up and would hand us the wrong code.
+      return !to || to.includes(local);
+    });
+
+    if (!cands.length) {
+      if (log && poll % 4 === 0) log('  mail: waiting for the github notice');
+      await sleep(4000);
+      continue;
+    }
+
+    for (const row of cands.slice(0, 3)) {
+      if (lastSeen && row.id === lastSeen.id) {
+        // Same message, already parsed and it held no code. Keep waiting for
+        // a newer one instead of re-fetching the same body forever.
+        continue;
+      }
+      const body = await mcdp.eval(`(async () => {
+        const s = ${JSON.stringify(session)};
+        const u = '/appsuite/api/mail?action=get&session=' + s +
+          '&folder=default0%2FINBOX&id=' + ${JSON.stringify(String(row.id))} +
+          '&columns=600,601,602&full=1';
+        try {
+          const r = await fetch(u, { credentials: 'include' });
+          return await r.text();
+        } catch (e) { return 'ERR:' + String(e && e.message || e); }
+      })()`);
+
+      if (typeof body !== 'string' || body.startsWith('ERR:')) {
+        if (/SES-0203|SVL-0002/.test(body || '')) session = null;
+        continue;
+      }
+      lastSeen = row;
+
+      // The code sits in the HTML part inside a styled <span>. Match the markup
+      // form first; a bare 8-digit scan would also pick up routing ids.
+      const marked = body.match(/>\s*(\d{8})\s*<\/span>/);
+      if (marked) return { ok: true, code: marked[1], mailId: row.id };
+
+      const confirm = body.match(/account_verifications\/confirm\/([0-9a-f-]+)\/(\d{8})/);
+      if (confirm) return { ok: true, code: confirm[2], link: 'https://github.com/account_verifications/confirm/' + confirm[1] + '/' + confirm[2], mailId: row.id };
+
+      if (log) log('  mail ' + row.id + ' has no code yet, waiting for a newer one');
+    }
+
+    await sleep(4000);
+  }
+
+  return { ok: false, error: 'no github verification code arrived within ' + Math.round(timeoutMs / 1000) + 's' };
+}
+
+/**
+ * Enter the 8-digit launch code on the GitHub verification screen and submit.
+ *
+ * The inputs are named `launch_code[]` (one digit each, maxlength 1) - NOT the
+ * `launch_code[][number]` the markup suggests at a glance. They are React
+ * controlled, so a bare `.value =` is dropped on the next render: the value has
+ * to go in through the prototype setter with input/change events behind it,
+ * otherwise the form submits empty and GitHub answers "Invalid launch code".
+ */
+async function enterLaunchCode(cdp, code) {
+  const digits = String(code || '').replace(/\D/g, '');
+  if (digits.length !== 8) return { ok: false, error: 'code is not 8 digits: ' + code };
+
+  const state = await cdp.eval(`(() => {
+    const ins = Array.from(document.querySelectorAll('input[name="launch_code[]"], input[autocomplete=one-time-code]'));
+    return { count: ins.length, url: location.href, title: document.title };
+  })()`);
+  if (!state || state.__error) return { ok: false, error: 'could not read the verification page' };
+  if (!state.count) return { ok: false, error: 'no code fields on ' + state.url };
+
+  const typed = await cdp.eval(`(() => {
+    const c = ${JSON.stringify(digits)};
+    const ins = Array.from(document.querySelectorAll('input[name="launch_code[]"], input[autocomplete=one-time-code]'));
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    for (const el of ins) {
+      setter.call(el, '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    for (let i = 0; i < ins.length && i < c.length; i += 1) {
+      ins[i].focus();
+      setter.call(ins[i], c[i]);
+      ins[i].dispatchEvent(new Event('input', { bubbles: true }));
+      ins[i].dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return ins.map(el => el.value).join('');
+  })()`);
+  if (typed !== digits) return { ok: false, error: 'fields hold "' + typed + '" instead of "' + digits + '"' };
+
+  const submitted = await cdp.eval(`(() => {
+    const ins = Array.from(document.querySelectorAll('input[name="launch_code[]"], input[autocomplete=one-time-code]'));
+    const f = ins[0] && ins[0].form;
+    if (!f) return 'no-form';
+    const b = f.querySelector('button[type=submit], button, input[type=submit]');
+    if (b) { if (b.disabled) { b.disabled = false; b.removeAttribute('disabled'); } f.requestSubmit(b); return 'submitted'; }
+    f.submit();
+    return 'form-submit';
+  })()`);
+
+  return { ok: submitted === 'submitted' || submitted === 'form-submit', result: submitted };
+}
+
+/**
+ * Drive the whole verification screen: wait for it, read the code from the
+ * mailbox, type it, submit, and report what GitHub said.
+ *
+ * The code is only valid inside the sign-up session that asked for it. That is
+ * why this runs in the same profile and tab as the sign-up - a code read in a
+ * different browser context is rejected as invalid no matter how correct it is.
+ */
+async function solveVerification(cdp, { email, timeoutMs = 240000, log } = {}) {
+  // Wait for the code form to finish rendering before touching anything.
+  let ready = false;
+  for (let w = 0; w < 20; w += 1) {
+    const n = await cdp.eval(`document.querySelectorAll('input[name="launch_code[]"], input[autocomplete=one-time-code]').length`);
+    if (typeof n === 'number' && n > 0) { ready = true; break; }
+    await sleep(1000);
+  }
+  if (!ready) {
+    const st = await cdp.eval(PAGE_STATE);
+    return {
+      ok: false,
+      error: 'the verification screen never showed its code fields (at ' + String(st && st.url) + ')',
+    };
+  }
+
+  let resendUsed = false;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (log) log('reading the code from the mailbox');
+    // A fresh address has no mail yet: GitHub needs a moment to send it. Give
+    // the first look most of the window and only fall back to Resend after it.
+    const found = await readGithubCode(cdp, { email, timeoutMs: Math.min(120000, timeoutMs), log });
+    if (!found.ok) {
+      if (!resendUsed) {
+        resendUsed = true;
+        if (log) log('  no code yet - asking github for a new one');
+        await cdp.eval(`(() => {
+          const b = Array.from(document.querySelectorAll('button, a'))
+            .filter(el => /resend/i.test(el.innerText || ''))[0];
+          if (b) { b.click(); return 'clicked'; }
+          return 'none';
+        })()`);
+        await sleep(5000);
+        continue;
+      }
+      return { ok: false, error: found.error };
+    }
+    if (log) log('  code ' + found.code + ' from mail ' + found.mailId);
+
+    const typed = await enterLaunchCode(cdp, found.code);
+    if (!typed.ok) {
+      if (log) log('  ' + typed.error);
+      await sleep(2000);
+      continue;
+    }
+
+    // Watch for the redirect, or for the page telling us it was wrong.
+    for (let w = 0; w < 12; w += 1) {
+      await sleep(1500);
+      const st = await cdp.eval(PAGE_STATE);
+      if (!st || st.__error) continue;
+      const blob = String(st.url) + ' ' + String(st.text || '');
+      if (/invalid launch code|code (is )?incorrect|did ?n.t match|expired/i.test(blob)) {
+        if (log) log('  github rejected the code');
+        break;
+      }
+      if (!/account_verifications/i.test(String(st.url))) {
+        return { ok: true, url: st.url, code: found.code };
+      }
+      if (/verified|confirmed|success/i.test(blob)) {
+        return { ok: true, url: st.url, code: found.code };
+      }
+    }
+  }
+
+  return { ok: false, error: 'the code was never accepted' };
+}
+
+/**
  * Open the verification link from the mailbox, in the sign-up profile.
  * The mail profile stays logged in, so this needs no credentials.
  */
 async function verifyByMail(email, { timeoutMs = 240000, log } = {}) {
-  let webmail;
-  try {
-    webmail = await webHealth.openBrowser({ url: webHealth.WEBMAIL_URL });
-  } catch (e) {
-    return { ok: false, error: 'could not open the mail profile: ' + (e && e.message) };
-  }
+  // Reuse the shared lookup instead of launching the mail profile again. The
+  // profile is single-owner, so a second launch hands off to the running Chrome
+  // and never binds its debug port - which is exactly how this fallback used to
+  // die with "browser never exposed CDP".
+  const mail = await openMailTab(null, log);
+  if (!mail.ok) return { ok: false, error: 'could not open the mail profile: ' + mail.error };
+  const webmail = { cdp: mail.cdp };
   try {
     const inThere = await webHealth.isLoggedIn(webmail.cdp);
     if (!inThere) {
@@ -721,8 +1277,43 @@ async function verifyByMail(email, { timeoutMs = 240000, log } = {}) {
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) };
   } finally {
-    if (webmail) webmail.kill();
+    // `webmail` is only a { cdp } wrapper around the shared mail profile's tab,
+    // so it normally has no kill() at all. Calling it unconditionally threw a
+    // TypeError out of `finally`, which discarded the finished `{ ok: true }`
+    // above and made this fallback unable to ever succeed. The tab belongs to
+    // the shared profile and must stay open, so this is a no-op by default.
+    if (webmail && typeof webmail.kill === 'function') webmail.kill();
   }
+}
+
+/**
+ * Add one account without losing what the running proxy wrote meanwhile.
+ *
+ * Two hazards, both silent in the old code:
+ *  - `loadStore()` returns an EMPTY store for an unreadable file (it only sets
+ *    `loadError`), so one save would have wiped every existing account. That is
+ *    why `mustLoadStore()` (throws STORE_UNREADABLE) is used here instead.
+ *  - Load -> modify -> save with the proxy writing accounts.json on every usage
+ *    poll loses whichever side writes second. So the file's mtime is sampled
+ *    before and after the change; if it moved, the proxy won and this attempt
+ *    is thrown away and reloaded rather than overwriting it.
+ *
+ * Returns { store, account } or { dup: true } when the email is already known.
+ */
+async function addAccountSafely(fields, { me = null, file = STORE_PATH } = {}) {
+  const mtimeOf = async () => ((await fs.promises.stat(file).catch(() => null)) || {}).mtimeMs || 0;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const store = await storeMod.mustLoadStore(file);
+    if (storeMod.findAccountByEmail(store, fields.email)) return { dup: true };
+    const before = await mtimeOf();
+    const account = storeMod.addAccount(store, fields);
+    if (me) storeMod.recordUsage(store, account, me);
+    await sleep(30);
+    if ((await mtimeOf()) !== before) continue; // proxy wrote -> reload and retry
+    await storeMod.saveStore(store, file);
+    return { store, account };
+  }
+  throw new Error('accounts.json kept changing under us; retry when the proxy is idle');
 }
 
 async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
@@ -730,7 +1321,7 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
   let child = null;
   try {
     const password = makePassword();
-    let username = makeUsername(email);
+    let username = await makeFreeUsername(email, { log });
 
     // Save the password before it is used anywhere. If the run dies mid-signup
     // the account may still exist on GitHub, and this file is then the only way
@@ -754,13 +1345,25 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
     // The sign-up profile starts blank so each account is genuinely separate.
     const launched = await launchBrowser(port, profileDir, 'https://github.com/signup');
     child = launched.child;
-    cdp = await new CdpPage(launched.page.webSocketDebuggerUrl).open();
+    cdp = await new CdpPage(launched.page.webSocketDebuggerUrl, port).open();
     await sleep(2000);
 
     // --- step 1: get the real form ----------------------------------------
     log('loading the sign-up form');
     let form = await loadSignupForm(cdp, { log });
     if (!form.ok) {
+      if (form.blocked) {
+        return {
+          ok: false, stage: 'signup', blocked: true,
+          error: 'github refuses the sign-up page for this network (HTTP 403) - the network has to recover first, retrying only makes it worse',
+        };
+      }
+      if (form.rateLimited) {
+        return { ok: false, stage: 'signup', rateLimited: true, error: 'github is rate limiting sign-ups - nothing to fix, wait and retry' };
+      }
+      if (form.captcha) {
+        return { ok: false, stage: 'signup', captcha: true, needsHuman: true, error: 'a real captcha is standing in the way - it has to be solved by hand once' };
+      }
       return { ok: false, stage: 'signup', needsHuman: true, error: 'sign-up form never appeared (DataDome kept the door shut)' };
     }
 
@@ -768,9 +1371,23 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
     let filled = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (attempt > 0) {
-        username = makeUsername(email, attempt);
+        username = await makeFreeUsername(email, { log });
         form = await loadSignupForm(cdp, { log });
-        if (!form.ok) return { ok: false, stage: 'signup', needsHuman: true, error: 'sign-up form disappeared' };
+        if (!form.ok) {
+          if (form.blocked) {
+            return {
+              ok: false, stage: 'signup', blocked: true,
+              error: 'github refuses the sign-up page for this network (HTTP 403) - the network has to recover first',
+            };
+          }
+          if (form.rateLimited) {
+            return { ok: false, stage: 'signup', rateLimited: true, error: 'github is rate limiting sign-ups - nothing to fix, wait and retry' };
+          }
+          if (form.captcha) {
+            return { ok: false, stage: 'signup', captcha: true, needsHuman: true, error: 'a real captcha is standing in the way - it has to be solved by hand once' };
+          }
+          return { ok: false, stage: 'signup', needsHuman: true, error: 'sign-up form disappeared' };
+        }
       }
       log('creating @' + username + ' for ' + email);
       filled = await fillSignup(cdp, { email, password, username });
@@ -781,7 +1398,9 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
       let settled = null;
       let sawCaptcha = false;
       let unknown = null;      // last real URL that proved nothing either way
-      for (let w = 0; w < 16; w += 1) {
+      // The sign-up POST is behind a silent DataDome check plus a hashed
+      // password stretch; 24 s was too short and produced phantom failures.
+      for (let w = 0; w < 40; w += 1) {
         await sleep(1500);
         const st = await cdp.eval(SIGNUP_STATE);
         if (!st || st.__error) continue;
@@ -936,36 +1555,55 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
 
     // --- step 3: verify the email -----------------------------------------
     // Required: GitHub refuses OAuth authorisation for unverified addresses.
-    // The verification link must be opened in THIS profile, because the
-    // session it verifies is the one logged in here.
+    //
+    // Two ways to prove the address. The code form is the one GitHub actually
+    // offers after sign-up, so it is tried first; the link inside the mail is
+    // only the fallback. Both run in THIS profile: a code belongs to the
+    // sign-up session that requested it and is worthless anywhere else.
     let verified = await checkVerified(cdp);
     if (!verified) {
-      log('verifying ' + email + ' via the logged-in webmail');
-      const v = await verifyByMail(email, { log });
-      if (!v.ok) {
-        return {
-          ok: false,
-          stage: 'verify',
-          needsHuman: true,
-          error: v.error || 'could not verify the email',
-          email,
-          password,
-        };
-      }
-
-      log('opening the verification link');
-      await cdp.navigate(v.link);
-      await sleep(4000);
-      for (let w = 0; w < 12; w += 1) {
-        const st = await cdp.eval(PAGE_STATE);
-        if (st && !st.__error) {
-          const blob = String(st.url) + ' ' + String(st.text || '');
-          if (/verified|confirmed|success|ok/i.test(blob) && !/could not|invalid|expired/i.test(blob)) break;
+      log('verifying ' + email + ' - reading the code from the mailbox');
+      const solved = await solveVerification(cdp, { email, log });
+      if (solved.ok) {
+        log('code accepted, github moved to ' + solved.url);
+        verified = true;
+      } else {
+        log('code path failed: ' + solved.error);
+        // Fall back to the confirmation link out of the same mailbox.
+        log('trying the confirmation link instead');
+        const v = await verifyByMail(email, { log });
+        if (!v.ok) {
+          return {
+            ok: false,
+            stage: 'verify',
+            needsHuman: true,
+            error: v.error || 'could not verify the email',
+            email,
+            password,
+          };
         }
-        await sleep(2000);
+
+        log('opening the verification link');
+        await cdp.navigate(v.link);
+        await sleep(4000);
+        for (let w = 0; w < 12; w += 1) {
+          const st = await cdp.eval(PAGE_STATE);
+          if (st && !st.__error) {
+            const blob = String(st.url) + ' ' + String(st.text || '');
+            if (/verified|confirmed|success|ok/i.test(blob) && !/could not|invalid|expired/i.test(blob)) break;
+          }
+          await sleep(2000);
+        }
+        verified = await checkVerified(cdp);
+        if (!verified) {
+          // Opening the link proves the address even when no banner is left to
+          // read: it lands on a real page instead of the verify screen again.
+          const st = await cdp.eval(PAGE_STATE);
+          const u = String((st && st.url) || '');
+          if (u && !/account_verifications|login/i.test(u)) verified = true;
+        }
+        log(verified ? 'email confirmed on GitHub' : 'link opened; GitHub shows no verify banner');
       }
-      verified = await checkVerified(cdp);
-      log(verified ? 'email confirmed on GitHub' : 'link opened; GitHub shows no verify banner');
     }
 
     // Backup for the normal path: GitHub sometimes wants the address confirmed
@@ -1022,17 +1660,20 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
     log('account confirmed' + (handle ? ' @' + handle : '') + (credits !== null ? ', ' + credits + ' credits today' : ''));
 
     // --- store -------------------------------------------------------------
-    const store = await storeMod.loadStore();
-    if (store.accounts.some((a) => (a.email || '').toLowerCase() === email.toLowerCase())) {
-      return { ok: true, handle, email, note: 'already in store' };
+    const added = await addAccountSafely(
+      { token, email, handle, notes: 'auto-add.mjs' },
+      { me, file: STORE_PATH }
+    );
+    if (added.dup) {
+      return {
+        ok: false,
+        stage: 'store',
+        error: email + ' is already in the account store - no second account was created',
+        handle,
+        email,
+      };
     }
-    storeMod.addAccount(store, { token, email, handle, notes: 'auto-add.mjs' });
-    if (me) {
-      const acc = store.accounts[store.accounts.length - 1];
-      storeMod.recordUsage(store, acc, me);
-    }
-    await storeMod.saveStore(store);
-    const stored = store.accounts[store.accounts.length - 1];
+    const stored = added.account;
     log('written to store as ' + stored.id);
 
     // Move the password from the email key to the account id, so a later lookup
@@ -1162,6 +1803,15 @@ async function main() {
     const slot = `[${i + 1}/${plan.length}]`;
     const log = (m) => console.log(`${slot} ${email}: ${m}`);
 
+    // Sign-ups are the one thing GitHub throttles fastest. A silent pause of a
+    // few minutes between accounts keeps the batch inside the normal rate and
+    // is far cheaper than waiting out a block afterwards.
+    if (i > 0) {
+      const pause = PACING_MS;
+      log('pausing ' + Math.round(pause / 1000) + 's so github does not throttle the batch');
+      await sleep(pause);
+    }
+
     const row = state.accounts.find((a) => a.email === email) || { email };
     if (!state.accounts.includes(row)) state.accounts.push(row);
     row.status = 'running';
@@ -1187,6 +1837,26 @@ async function main() {
       row.error = res.error || 'unknown';
       bad += 1;
       log('not done at ' + (res.stage || '?') + ': ' + res.error);
+      if (res.blocked) {
+        // The whole network is refused, not just this address. Every further
+        // attempt deepens it, so the batch ends here and says why.
+        saveState(state);
+        console.log('');
+        console.log('Stopped: github is refusing the sign-up page for this network.');
+        console.log('Nothing in the code is wrong. GitHub answers 403 on /signup for this');
+        console.log('IP while / and /login still work - the network itself has to recover.');
+        console.log('Wait hours, not minutes. Retrying in the meantime makes it last longer.');
+        break;
+      }
+      if (res.rateLimited) {
+        // Hammering a rate limit is what turns a soft block into a hard one, so
+        // stop the whole batch instead of moving to the next address.
+        saveState(state);
+        console.log('');
+        console.log('Stopped: github is rate limiting sign-ups.');
+        console.log('Nothing is broken - wait 15 to 60 minutes, then run --resume.');
+        break;
+      }
       if (res.needsHuman) {
         saveState(state);
         console.log('');
@@ -1217,7 +1887,13 @@ async function main() {
   if (ok) console.log('restart the proxy so it picks up the new accounts.');
 }
 
-main().catch((e) => {
-  console.error('auto-add failed: ' + (e && e.stack ? e.stack : e));
-  process.exit(1);
-});
+// Exported for tests and for reuse by other tools; main() only runs when this
+// file is executed directly, so importing it has no side effects.
+export { makeUsername, makeFreeUsername, usernameIsFree, enterLaunchCode, readGithubCode, solveVerification, parseArgs };
+
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  main().catch((e) => {
+    console.error('auto-add failed: ' + (e && e.stack ? e.stack : e));
+    process.exit(1);
+  });
+}
