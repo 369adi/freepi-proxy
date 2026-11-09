@@ -208,7 +208,8 @@ function Get-QuietSponsorAccounts([int]$QuietSeconds) {
         if (-not $a.id) { continue }
         $last = $a.lastDisplay
         if (-not $last) {
-            # Never confirmed in this run at all.
+            # Nothing recorded for this account in the current run or the last
+            # one it was written in, so the window has never confirmed.
             $quiet += $a.id
             continue
         }

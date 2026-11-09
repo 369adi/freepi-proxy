@@ -28,6 +28,42 @@ function loadCookie() {
 }
 
 /**
+ * When each account last confirmed a display. Kept on disk because the guardian
+ * uses it to decide which windows to replace: in memory alone every window looks
+ * unconfirmed after a restart and the whole pool gets reopened for nothing.
+ *
+ * Only timestamps are stored, never an ad, a nonce or a click token - a restored
+ * entry says "this account displayed something at that time", which is exactly
+ * what happened.
+ */
+function displayStore() {
+  const file = path.join(os.homedir(), '.free-pi', 'proxy', 'sponsor-displays.json');
+  const read = () => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const entries = parsed && typeof parsed === 'object' && parsed.accounts;
+      if (!entries || typeof entries !== 'object') return new Map();
+      const out = new Map();
+      for (const [id, value] of Object.entries(entries)) {
+        const at = value && value.at;
+        if (typeof id === 'string' && typeof at === 'string' && at) out.set(id, { at });
+      }
+      return out;
+    } catch { return new Map(); }
+  };
+  const write = (map) => {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const accounts = Object.fromEntries(map);
+      const tmp = file + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ version: 1, accounts }, null, 2));
+      fs.renameSync(tmp, file);
+    } catch { /* an unwritable home still works, it just forgets */ }
+  };
+  return { read, write };
+}
+
+/**
  * Sponsor panel: one visible window per account.
  *
  * free-pi is free because ads pay for it, and it gates free completions until
@@ -53,7 +89,8 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
   // ad, or one account would acknowledge another account's creative.
   const latest = new Map();
   const fetching = new Map();
-  const lastDisplay = new Map();
+  const lastDisplay = displayStore().read();
+  const displays = displayStore();
   // The panel is only reachable from this machine, on the proxy's own port.
   // localhost and 127.0.0.1 are the same origin as far as the user is
   // concerned, so both are accepted (and both appear in the allowlist).
@@ -198,6 +235,7 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
         if (acknowledged.size > 500) acknowledged.delete(acknowledged.values().next().value);
       }
       lastDisplay.set(account.id, { at: new Date(clock()).toISOString() });
+      displays.write(lastDisplay);
       // The proxy lifts this account's ad cooldown so it serves requests again.
       if (typeof onDisplayed === 'function') {
         try { onDisplayed(account.id); } catch {}
