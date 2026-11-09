@@ -168,14 +168,45 @@ No sign-out is needed between adds: each `/freepi-add` starts a fresh profile on
 a free debug port, and only one add runs at a time (a lock file prevents two
 GitHub device flows from colliding).
 
-### When free-pi asks for a sponsor view
+### Sponsor windows: one per account
 
-If the account has to watch a sponsor card before it may use the model again,
-upstream answers `403 {"code":"ads_required"}`. The proxy then opens
-`http://127.0.0.1:4000/sponsor` once (at most every five minutes) and returns an
-`ads_required` error that names that URL. Keep the card visible for a moment and
-retry — the panel only reports an impression after the card really was visible
-for at least a second.
+free-pi is free because ads pay for it, and it gates that **per account**: until
+account X has really displayed an ad, upstream answers
+`403 {"code":"ads_required"}` for X. Showing an ad for account Y does nothing
+for X. That is why a pooled setup needs one visible window per account — and
+why an unhandled 403 shows up in a harness as "API key is invalid", since the
+harness maps every 403 to an auth failure.
+
+Open one window per account:
+
+```
+/freepi-ads            # every account
+/freepi-ads acc-2      # just one
+```
+
+The same is available outside DSH:
+
+```powershell
+Show-Sponsor.cmd
+```
+
+Every window points at `http://127.0.0.1:4000/sponsor?account=<id>` and
+`GET /sponsor/accounts` lists the exact URLs. Keep them visible.
+
+What the proxy does when free-pi still asks for an ad:
+
+- the account is **parked for ten minutes** and skipped by the request lanes,
+  so following requests go to a working account instead of repeating the same
+  403. `GET /accounts` shows `adsRequired: true` for such an account.
+- that account's own window clears the block as soon as the card was really
+  visible, so it rejoins the rotation immediately.
+- an unknown account id never falls back to another account's window, and an
+  impression can only be confirmed by the account that owns the nonce — one
+  window can never acknowledge another account's ad.
+
+Confirmation stays honest and unchanged: an impression is forwarded only after
+the complete card was visible for at least one second, with the cookie and a
+single-use nonce, and each ad is acknowledged once.
 
 ---
 
@@ -309,8 +340,9 @@ that queues and still completes.
 
 `npm test` runs every unit test through `node --test`: the rotation policy
 (`tools\test-policy.test.mjs`), the hour-budget arithmetic
-(`tools\test-budget.test.mjs`), the store and sponsor/usage paths, and the DSH
-plugin lifecycle. `tools\lib\budget.mjs` holds the pure credit -> hour maths
+(`tools\test-budget.test.mjs`), the store and sponsor/usage paths, the
+per-account sponsor windows (`tools\test-sponsor-accounts.test.mjs`), and the
+DSH plugin lifecycle. `tools\lib\budget.mjs` holds the pure credit -> hour maths
 behind `GET /budget`.
 
 ### Running out of budget

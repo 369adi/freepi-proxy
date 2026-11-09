@@ -157,3 +157,59 @@ test('usage is remembered and rolled over at refill', () => {
   assert.equal(account.history[0].usedCredits, 6000);
   assert.equal(account.day.usedCredits, 0);
 });
+
+// ---------------------------------------------------------------- premium
+//
+// free-pi has two wallets: the daily allowance (resets, 15000 credits) and
+// premium credits that do NOT reset. An account with 0 daily credits but
+// premium credits left is still usable, and must not be thrown away or treated
+// as exhausted - that is the whole point of the premium state.
+
+test('an account with premium credits left is premium, not exhausted', () => {
+  const store = emptyStore();
+  const a = acct(store, 'acc-1', { remaining: 0 });
+  a.usage.premiumCredits = 1998;
+  assert.equal(stateOf(a, NOW, store.settings), STATE.PREMIUM);
+});
+
+test('zero everywhere really is exhausted', () => {
+  const store = emptyStore();
+  const a = acct(store, 'acc-1', { remaining: 0 });
+  a.usage.premiumCredits = 0;
+  assert.equal(stateOf(a, NOW, store.settings), STATE.EXHAUSTED);
+});
+
+test('daily allowance wins over premium for the same account', () => {
+  const store = emptyStore();
+  const a = acct(store, 'acc-1', { remaining: 15000 });
+  a.usage.premiumCredits = 1998;
+  assert.equal(stateOf(a, NOW, store.settings), STATE.READY, 'premium is the fallback, not the label');
+});
+
+test('a low account with premium left is still LOW, and gets used up', () => {
+  const store = emptyStore();
+  const a = acct(store, 'acc-1', { remaining: 900 }); // below the watermark
+  a.usage.premiumCredits = 5000;
+  assert.equal(stateOf(a, NOW, store.settings), STATE.LOW);
+});
+
+test('premium-only accounts are picked last so daily budget is spent first', () => {
+  const store = emptyStore();
+  const premiumOnly = acct(store, 'acc-1', { remaining: 0, lastUsedAgo: 0 });
+  premiumOnly.usage.premiumCredits = 9999;
+  const daily = acct(store, 'acc-2', { remaining: 15000, lastUsedAgo: 5 * HOUR });
+  assert.equal(stateOf(premiumOnly, NOW, store.settings), STATE.PREMIUM);
+  assert.equal(stateOf(daily, NOW, store.settings), STATE.READY);
+  // Even though acc-1 was used more recently, the daily account wins.
+  assert.equal(decide(store, NOW).accountId, daily.id);
+});
+
+test('a pool that is premium-only keeps serving instead of minting', () => {
+  const store = emptyStore();
+  const a = acct(store, 'acc-1', { remaining: 0 });
+  a.usage.premiumCredits = 4000;
+  store.activeAccountId = a.id;
+  const decision = decide(store, NOW);
+  assert.notEqual(decision.action, 'mint', 'premium credits are real budget');
+  assert.equal(decision.action, 'keep');
+});
