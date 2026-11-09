@@ -124,6 +124,9 @@ const KNOWN_MODELS = new Set();
  * "deepseek-v4-flash") and only returns ids that actually look related. When
  * nothing is close, an empty list beats a misleading guess - suggesting
  * "claude-sonnet-5.5" for "definitely-not-a-real-model-xyz" is noise.
+ *
+ * Results are deduped by their segment key so a single model cannot occupy two
+ * suggestion slots under two spellings.
  */
 function nearestModels(wanted, limit) {
   const target = String(wanted || '').toLowerCase();
@@ -139,11 +142,25 @@ function nearestModels(wanted, limit) {
     if (!shared) continue;                     // nothing in common, not a candidate
     // Prefer ids that share more segments and are closer in length.
     const distance = Math.abs(have.length - want.length) - shared;
-    scored.push({ id, distance, shared });
+    scored.push({ id, key: have.join('-'), distance, shared });
   }
 
-  scored.sort((a, b) => (b.shared - a.shared) || (a.distance - b.distance) || a.id.localeCompare(b.id));
-  return scored.slice(0, limit || 3).map((x) => x.id);
+  scored.sort((a, b) =>
+    (b.shared - a.shared) ||
+    (a.distance - b.distance) ||
+    // Prefer the plain spelling over the "vendor/id" one when both survive.
+    (a.id.length - b.id.length) ||
+    a.id.localeCompare(b.id));
+
+  const out = [];
+  const seen = new Set();
+  for (const s of scored) {
+    if (seen.has(s.key)) continue;
+    seen.add(s.key);
+    out.push(s.id);
+    if (out.length >= (limit || 3)) break;
+  }
+  return out;
 }
 
 /**
@@ -786,7 +803,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     try {
       const parsed = JSON.parse(body);
       if (parsed && typeof parsed.model === 'string') wantedModel = parsed.model.trim();
-      if (wantedModel) console.log('[proxy] -> ' + wantedModel);
+      if (wantedModel) console.log('[proxy] -> ' + JSON.stringify(wantedModel));
     } catch {}
     if (wantedModel && KNOWN_MODELS.size && !KNOWN_MODELS.has(wantedModel)) {
       const near = nearestModels(wantedModel, 3);
@@ -1208,16 +1225,20 @@ function startServer(models, sponsorHtml) {
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
 
-  // Teach the completions handler which ids are real. Both forms are accepted:
-  // the raw free-pi id and the slash form some clients are configured with
-  // ("deepseek/deepseek-v4-flash"), so validation never rejects a spelling the
-  // proxy itself would have forwarded happily.
+  // Teach the completions handler which ids are real.
+  //
+  // Only the ids free-pi itself reports are accepted. An earlier version also
+  // accepted a "vendor/id" spelling on the assumption that clients like to write
+  // it; a live probe proved free-pi rejects that form with 404, so accepting it
+  // here would only hide the real reason behind a clear local error.
   KNOWN_MODELS.clear();
   for (const m of catalog) {
-    if (!m || !m.id) continue;
-    KNOWN_MODELS.add(m.id);
-    const bare = String(m.id).split('/').pop();
-    if (bare) KNOWN_MODELS.add(bare);
+    if (m && m.id) KNOWN_MODELS.add(String(m.id));
+  }
+  if (!KNOWN_MODELS.size) {
+    // Validation is skipped when the set is empty, which would silently restore
+    // the behaviour this check exists to prevent. Say so instead.
+    console.log('[proxy] WARNING: model catalog empty, model ids are NOT validated');
   }
 
   const sponsorPanel = createSponsorPanel({

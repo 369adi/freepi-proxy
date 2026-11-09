@@ -549,6 +549,28 @@ A *known* ID that free-pi refuses (for example `409` when a model needs
 credits) is passed through unchanged, because that is an upstream condition,
 not a typo.
 
+### Use the exact id, and expect a canonical name back
+
+Two catalog facts worth knowing, both measured against the live API:
+
+**The catalog has no vendor prefixes.** Every id is bare — `particle`,
+`deepseek-v4-flash`, `glm-5.3-flash`. Writing `deepseek/deepseek-v4-flash` is
+not a valid id and the upstream rejects it. Earlier versions of this README
+showed the slashed form; that was wrong. Use `GET /v1/models` as the source of
+truth.
+
+**free-pi answers with a canonical model name, not the id you sent.** Ask for
+`deepseek-v4-flash` and a successful response can carry
+`"model": "deepseek-ai/deepseek-v41-flash-1017"`; ask for `particle` and you may
+get `"model": "particle-ai/particle-1"`. The proxy forwards the upstream body
+verbatim, so you will see that name in the response.
+
+This is a label, not an error — but do not build logic that compares the
+requested id to `response.model` for equality. If you need to know which model
+served a request, keep the id you sent or read the `x-free-pi-account` response
+header for the account. The id you send is the one that gets routed; the name
+that comes back is free-pi's own canonical spelling of it.
+
 ---
 
 ## Keeping up with free-pi-cli releases
