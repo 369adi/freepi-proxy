@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadStore, STORE_PATH, LEGACY_CREDENTIALS_PATH } from './lib/store.mjs';
 import { getMe, getCatalog, ApiError, VERSION, BASE, tokenExpired } from './lib/freepi-api.mjs';
 
@@ -123,6 +123,30 @@ async function main() {
     }
   } else {
     ok('rotation mode', 'automatic (no account pinned)');
+  }
+
+  // 5d. budget helper
+  //
+  // The /budget endpoint and the usage rollup both depend on tools/lib/budget.mjs.
+  // If that file is missing or its maths drifted, the proxy still starts but
+  // reports wrong hours - so check it exists AND that it computes what it claims,
+  // not just that the file is present.
+  const budgetPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'lib', 'budget.mjs');
+  if (!fs.existsSync(budgetPath)) {
+    bad('budget helper missing', budgetPath);
+  } else {
+    try {
+      const b = await import(pathToFileURL(budgetPath).href);
+      const hours = b.creditsToHours ? b.creditsToHours(15000) : null;
+      const okMaths = hours === 3;               // 15000 credits / 5000 per hour
+      const hasApi = ['budgetSummary', 'runwayHours', 'burnRatePerHour', 'fmtHours']
+        .every((fn) => typeof b[fn] === 'function');
+      if (!hasApi) bad('budget helper incomplete', 'missing one of budgetSummary/runwayHours/burnRatePerHour/fmtHours');
+      else if (!okMaths) bad('budget helper maths broken', 'creditsToHours(15000) returned ' + hours + ', expected 3');
+      else ok('budget helper', '5000 credits = 1 h, summary + runway present');
+    } catch (err) {
+      bad('budget helper unreadable', err.message);
+    }
   }
 
   // 6. port / running proxy

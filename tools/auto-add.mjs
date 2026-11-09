@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// auto-add.mjs — mint many free-pi accounts over a catch-all domain.
+// auto-add.mjs â€” mint many free-pi accounts over a catch-all domain.
 //
 // THE HARD FACT THIS IS BUILT AROUND
 // free-pi has exactly one auth path: GitHub OAuth. Verified against Clerk's own
@@ -51,6 +51,34 @@ const STATE_PATH =
 const STORE_PATH =
   process.env.FREEPI_ACCOUNTS_PATH || path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
 const SESSIONS_ROOT = path.join(os.homedir(), '.free-pi', 'sessions');
+
+// Where a sign-up must NEVER end up. GitHub's /signup page carries a "Continue
+// with Google" button in its own GET form (action /sessions/social/google/initiate),
+// deliberately outside the octocaptcha form - so it is a clean redirect with no
+// DataDome token, and it is the one path that gets past the challenge. It is also
+// useless to us: it needs a Google identity, and we have one Google account for
+// ten GitHub accounts. Worse, the old code treated any redirect it did not
+// recognise as success, so a run that fell into the Google login reported
+// "signed up" and then waited four minutes for a verification mail that could
+// never arrive. Treat these as a hard, named failure instead.
+const FOREIGN_AUTH = /accounts\.google\.com|appleid\.apple\.com|login\.microsoftonline\.com|\/sessions\/social\/|\/sessions\/oauth|\/login\/oauth/i;
+
+function foreignAuth(url) {
+  const m = String(url || '').match(FOREIGN_AUTH);
+  return m ? m[0] : null;
+}
+
+// A GitHub URL that proves the account was actually created. Deliberately a
+// whitelist: the previous code used "any URL I do not recognise" as proof of
+// success, which is how a redirect into the social login got mistaken for a
+// finished sign-up. Unknown pages are now watched instead of believed.
+const SIGNED_UP_PAGE =
+  /\/account_verifications|\/verify|\/welcome|\/dashboard|\/settings|\/codespaces|\/onboarding|\/organizations\/|\/emails\//i;
+
+function isSignedUpPage(url) {
+  return SIGNED_UP_PAGE.test(String(url || ''));
+}
+
 
 const CHROME_CANDIDATES = [
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -752,6 +780,7 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
       // /signup means the submit did not take, whatever the page claims.
       let settled = null;
       let sawCaptcha = false;
+      let unknown = null;      // last real URL that proved nothing either way
       for (let w = 0; w < 16; w += 1) {
         await sleep(1500);
         const st = await cdp.eval(SIGNUP_STATE);
@@ -769,10 +798,23 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
           settled = { url, signedUp: true };
           break;
         }
+        // Off to Google/Apple/Microsoft? That is the social-login form we cannot
+        // complete - stop immediately with the reason instead of pretending the
+        // sign-up worked and burning the verification timeout afterwards.
+        const foreign = foreignAuth(url);
+        if (foreign) {
+          settled = { url, signedUp: false, foreign };
+          break;
+        }
         if (/\/signup|\/join|\/session\/|layout|render|reveal|plan|select/i.test(url)) continue;
-        // Anything else means we were redirected somewhere real.
-        settled = { url, signedUp: true };
-        break;
+        if (isSignedUpPage(url)) {
+          settled = { url, signedUp: true };
+          break;
+        }
+        // Somewhere real, but not a page that proves the account exists. Record
+        // it and keep watching: the redirect chain may still reach the verify
+        // screen, and a wrong "success" costs four minutes plus a bad diagnosis.
+        unknown = url;
       }
 
       // The challenge often outlasts the first window. Give it one more pass
@@ -789,10 +831,55 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
             settled = { url, signedUp: true };
             break;
           }
+          const foreign = foreignAuth(url);
+          if (foreign) {
+            settled = { url, signedUp: false, foreign };
+            break;
+          }
           if (/\/signup|\/join/i.test(url)) continue;
-          settled = { url, signedUp: true };
-          break;
+          if (isSignedUpPage(url)) {
+            settled = { url, signedUp: true };
+            break;
+          }
+          unknown = url;
         }
+      }
+
+      // Redirected to a page that neither proves nor refutes the sign-up (a
+      // login wall, a two-factor prompt, ...). Never claim success here: fall
+      // through to the error/diagnosis path so the real reason is reported.
+      if (!settled && unknown) {
+        return {
+          ok: false,
+          stage: 'signup',
+          needsHuman: true,
+          email,
+          password,
+          error:
+            'github sent the sign-up to ' +
+            unknown +
+            ', which does not confirm the account was created. check the window; ' +
+            'nothing was recorded for this address.',
+        };
+      }
+
+      // A social-login redirect is a dead end, not a retry: the next attempt
+      // would land in the same place. Report it and stop the whole run.
+      if (settled && settled.foreign) {
+        return {
+          ok: false,
+          stage: 'signup',
+          needsHuman: true,
+          email,
+          password,
+          error:
+            'github redirected the sign-up to ' +
+            settled.foreign +
+            ' (' +
+            settled.url +
+            '). that is the social-login path, which needs a google/apple identity we do not have. ' +
+            'nothing was created. do not click "continue with google" - use the email form instead.',
+        };
       }
 
       if (settled) break;

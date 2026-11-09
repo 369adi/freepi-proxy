@@ -507,7 +507,7 @@ POSIX, so treat it like an SSH key rather than a vault.
 
 ---
 
-## No model remapping
+## Model IDs: validated, not remapped
 
 The proxy forwards the model ID **verbatim, 1:1** to free-pi — it never
 rewrites the model name.  Configure opencode to request a free-pi model
@@ -516,6 +516,38 @@ directly, for example:
 ```json
 { "model": "deepseek/deepseek-v4-flash" }
 ```
+
+### Unknown IDs are rejected up front
+
+free-pi itself does **not** error on an unknown model ID: it silently
+substitutes a default and answers `200`, with a *different* `model` string in
+the response body. Left alone, that would make the proxy lie to you — you ask
+for one model, get another, and nothing reports a problem.
+
+So the proxy checks the requested ID against the live catalog before it claims
+an account lane. An unknown ID gets the same answer OpenAI gives:
+
+```json
+{
+  "error": {
+    "message": "The model `deepseek-v4-flsh` does not exist or you do not have access to it. Did you mean `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4.1-flash`? ...",
+    "type": "invalid_request_error",
+    "param": "model",
+    "code": "model_not_found"
+  }
+}
+```
+
+HTTP status is `404`, and no account slot is consumed. `GET /v1/models` lists
+every accepted ID, in both the raw (`deepseek-v4-flash`) and the slashed
+(`deepseek/deepseek-v4-flash`) spelling.
+
+If catalog discovery failed at startup the check is skipped rather than
+guessing — an offline start must not reject work that would otherwise succeed.
+
+A *known* ID that free-pi refuses (for example `409` when a model needs
+credits) is passed through unchanged, because that is an upstream condition,
+not a typo.
 
 ---
 

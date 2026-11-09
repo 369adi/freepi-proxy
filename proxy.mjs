@@ -108,6 +108,45 @@ function supportsVision(id) {
 }
 
 /**
+ * Every model id free-pi advertises, filled once discovery has run.
+ *
+ * Kept module-level because the completions handler has to validate the
+ * requested id before it claims a lane, and that handler is defined outside
+ * startServer(). Empty means "we never learned the catalog" (discovery failed,
+ * e.g. offline start) - the check is skipped rather than rejecting valid work.
+ */
+const KNOWN_MODELS = new Set();
+
+/**
+ * Closest catalog ids to a mistyped one, for a "did you mean" hint.
+ *
+ * Scores by shared hyphen/dot-separated segments (so "deepseek-v4-flsh" finds
+ * "deepseek-v4-flash") and only returns ids that actually look related. When
+ * nothing is close, an empty list beats a misleading guess - suggesting
+ * "claude-sonnet-5.5" for "definitely-not-a-real-model-xyz" is noise.
+ */
+function nearestModels(wanted, limit) {
+  const target = String(wanted || '').toLowerCase();
+  if (!target) return [];
+  const parts = (s) => String(s).toLowerCase().split(/[-/._]+/).filter(Boolean);
+  const want = parts(target);
+
+  const scored = [];
+  for (const id of KNOWN_MODELS) {
+    const have = parts(id);
+    let shared = 0;
+    for (const p of have) if (want.includes(p) && p.length > 2) shared += 1;
+    if (!shared) continue;                     // nothing in common, not a candidate
+    // Prefer ids that share more segments and are closer in length.
+    const distance = Math.abs(have.length - want.length) - shared;
+    scored.push({ id, distance, shared });
+  }
+
+  scored.sort((a, b) => (b.shared - a.shared) || (a.distance - b.distance) || a.id.localeCompare(b.id));
+  return scored.slice(0, limit || 3).map((x) => x.id);
+}
+
+/**
  * Rolling samples of the pool's remaining credits, used to estimate how fast
  * the hours disappear. Bounded so a long-running proxy does not grow.
  */
@@ -730,7 +769,40 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       inRes.end(JSON.stringify({ error: { message: 'The selected account needs a valid sign-in. Use /freepi-switch to select an existing account.', type: 'selected_account_unavailable' } }));
       return;
     }
-    try { const p = JSON.parse(body); if (p.model) console.log('[proxy] -> ' + p.model); } catch {}
+    // Reject model ids the catalog does not know, BEFORE a lane is claimed.
+    //
+    // free-pi does not error on an unknown id: it silently substitutes a default
+    // and answers 200 with a different "model" in the body. Measured: asking for
+    // "definitely-not-a-real-model-xyz" returned 200 served by
+    // deepseek-ai/deepseek-v41-flash-1017. A client that mistypes a model would
+    // therefore believe it got what it asked for, and our own "failed" counter
+    // could never move. Answer with an OpenAI-shaped 404 instead, which is what
+    // OpenAI, vLLM and Ollama all do for an unknown model.
+    //
+    // An empty catalog means discovery failed (offline start); in that case we
+    // cannot judge and must not block, so the check is skipped rather than
+    // guessing.
+    let wantedModel = null;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed.model === 'string') wantedModel = parsed.model.trim();
+      if (wantedModel) console.log('[proxy] -> ' + wantedModel);
+    } catch {}
+    if (wantedModel && KNOWN_MODELS.size && !KNOWN_MODELS.has(wantedModel)) {
+      const near = nearestModels(wantedModel, 3);
+      inRes.writeHead(404, { 'content-type': 'application/json' });
+      inRes.end(JSON.stringify({
+        error: {
+          message: 'The model `' + wantedModel + '` does not exist or you do not have access to it.'
+            + (near.length ? ' Did you mean ' + near.map(m => '`' + m + '`').join(', ') + '?' : '')
+            + ' GET /v1/models lists every id this proxy accepts.',
+          type: 'invalid_request_error',
+          param: 'model',
+          code: 'model_not_found',
+        },
+      }));
+      return;
+    }
 
     // Take a free account lane if one exists; otherwise wait in the queue and
     // claim a lane as soon as another request frees it.
@@ -1049,6 +1121,16 @@ function usageSnapshot() {
       lastUsedAt: a.lastUsedAt || null,
       busy: laneBusy.has(a.id),
     })),
+    // The hour picture the dollar-like credit numbers hide. free-pi meters in
+    // hours (1 h = 5000 credits) and each model costs a multiple of the base
+    // rate, so "12705 credits left" is anywhere between 2.5 h and 40 min
+    // depending on the model. Computed from the same rows, at 1x: the number an
+    // agent harness actually runs out of first.
+    budget: budgetSummary(
+      (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
+      1,
+      USABLE,
+    ),
     // Filled in from the cost ledger by /usage: who served what.
     served: laneServed,
   };
@@ -1125,6 +1207,18 @@ function startServer(models, sponsorHtml) {
   const catalog = (Array.isArray(models) && models.length)
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
+
+  // Teach the completions handler which ids are real. Both forms are accepted:
+  // the raw free-pi id and the slash form some clients are configured with
+  // ("deepseek/deepseek-v4-flash"), so validation never rejects a spelling the
+  // proxy itself would have forwarded happily.
+  KNOWN_MODELS.clear();
+  for (const m of catalog) {
+    if (!m || !m.id) continue;
+    KNOWN_MODELS.add(m.id);
+    const bare = String(m.id).split('/').pop();
+    if (bare) KNOWN_MODELS.add(bare);
+  }
 
   const sponsorPanel = createSponsorPanel({
     currentAccount: async () => { await syncStore(); return activeAccount(); },
