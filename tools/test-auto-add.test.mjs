@@ -32,6 +32,13 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const FILE = fileURLToPath(new URL('./auto-add.mjs', import.meta.url));
+// Tests that expect parseArgs to exit cannot run in-process: the real argv
+// reaches parseArgs at import time. They run this address in a child process.
+const AUTO_ADD = pathToFileURL(FILE).href; void AUTO_ADD;
 
 import {
   makeUsername,
@@ -163,13 +170,14 @@ test('usernameIsFree is exported but intentionally untested (network I/O)', () =
 // ---------------------------------------------------------------- parseArgs
 //
 // parseArgs(argv) walks the array with a single index and mutates one options
-// object. It never throws and never validates: unknown flags are silently
-// dropped, every numeric flag goes through Number(...), and a flag missing its
-// value consumes `undefined`. The tests below pin exactly that behaviour.
+// object. It validates hard: an unknown flag, a flag without a value or a
+// number that is NaN/negative ends the process with a message, because main()
+// reads the result with `||` and would otherwise silently use a default.
+// Cases that exit run in a child process (see runCli below).
 
 test('parseArgs returns the documented defaults for an empty argv', () => {
   assert.deepEqual(parseArgs([]), {
-    count: null,       // "not given" - main() falls back to 1 (line 1745)
+    count: null,       // "not given" - main() falls back to 1
     dryRun: false,
     resume: false,
     status: false,
@@ -179,14 +187,22 @@ test('parseArgs returns the documented defaults for an empty argv', () => {
     keepOpen: false,
     waitMin: 15,
     pauseMin: 3,
+    email: null,       // "not given" - a generated address is used
+    help: false,       // F: help is part of the full default object
   });
 });
 
-test('parseArgs throws when argv is omitted entirely', () => {
-  // Not a documented use - the only caller always passes process.argv.slice(2)
-  // (line 112). But there is no `argv = []` default, so a bare call dereferences
-  // undefined and throws a TypeError at the loop header (line 95).
-  assert.throws(() => parseArgs(), TypeError);
+test('parseArgs defaults argv to an empty array', () => {
+  // FIX A: a bare call used to throw a TypeError at the loop header.
+  assert.deepEqual(parseArgs(), parseArgs([]));
+});
+
+test('parseArgs no longer accepts NaN, 0 or negative numbers in-process', () => {
+  // These are checked by parseArgs itself, so the child process is the only
+  // way to observe them; kept as a guard that parseArgs really validates.
+  for (const argv of [['--count', 'abc'], ['--count', '0'], ['--count', '-3']]) {
+    assert.equal(runCli(...argv).status, 1, argv.join(' ') + ' must exit 1');
+  }
 });
 
 test('parseArgs --count yields a number, not a string', () => {
@@ -198,8 +214,8 @@ test('parseArgs --count yields a number, not a string', () => {
 test('parseArgs --count converts numeric strings of any spelling', () => {
   assert.equal(parseArgs(['--count', '5.5']).count, 5.5);
   assert.equal(parseArgs(['--count', ' 7 ']).count, 7);
-  assert.equal(parseArgs(['--count', '0']).count, 0);
-  assert.equal(parseArgs(['--count', '-3']).count, -3);
+  // 0 and -3 are parsed as numbers but rejected by the validation pass; the
+  // in-process calls for them live in the child-process tests below.
 });
 
 test('parseArgs --pause-min sets pauseMin to 7', () => {
@@ -233,11 +249,11 @@ test('parseArgs boolean flags set their field to true', () => {
   }
 });
 
-test('parseArgs -h and --help set help (not part of the default object)', () => {
+test('parseArgs -h and --help set help, false by default', () => {
   assert.equal(parseArgs(['--help']).help, true);
   assert.equal(parseArgs(['-h']).help, true);
-  // `help` is absent from the initial object, so it is undefined by default.
-  assert.equal(parseArgs([]).help, undefined);
+  // FIX F: `help` is now part of the initial object instead of being absent.
+  assert.equal(parseArgs([]).help, false);
 });
 
 test('parseArgs --prefix and --start are picked up', () => {
@@ -247,58 +263,17 @@ test('parseArgs --prefix and --start are picked up', () => {
   assert.equal(typeof o.start, 'number');
 });
 
-test('parseArgs does NOT support --email; an email is never stored', () => {
-  // GAP: there is no `--email` branch in parseArgs (lines 97-107). Addresses
-  // are derived from prefix + number instead. The flag is silently ignored.
-  const o = parseArgs(['--email', 'x@y.de']);
-  assert.equal(o.email, undefined);
-  assert.equal('email' in o, false);
-  assert.deepEqual(o, parseArgs([]), '--email changes nothing');
-});
-
-test('parseArgs silently ignores unknown arguments', () => {
-  // No else-branch, so an unrecognised token is skipped without an error.
-  const o = parseArgs(['--bogus', 'value', 'positional', '-x']);
-  assert.deepEqual(o, parseArgs([]));
-  // And it does not disturb parsing of a known flag that follows.
-  assert.equal(parseArgs(['--bogus', '--count', '2']).count, 2);
-});
-
-test('parseArgs with unknown argument does not throw', () => {
-  assert.doesNotThrow(() => parseArgs(['--nope']));
-  assert.doesNotThrow(() => parseArgs(['random']));
-});
-
-test('parseArgs --count abc yields NaN', () => {
-  // BUG: no NaN validation. Number('abc') is NaN, and main() then does
-  // ARGS.count || ... (line 1745); NaN is falsy, so the run silently falls
-  // back to the default count instead of reporting the typo.
-  const o = parseArgs(['--count', 'abc']);
-  assert.ok(Number.isNaN(o.count), 'expected NaN for --count abc');
-});
-
-test('parseArgs --count with no value yields NaN', () => {
-  // BUG: no NaN validation. argv[++i] runs off the end => Number(undefined)
-  // => NaN, and the flag is not reported as malformed.
-  assert.ok(Number.isNaN(parseArgs(['--count']).count));
-});
-
-test('parseArgs numeric flags all accept garbage as NaN', () => {
-  // BUG: no NaN validation. The same hole exists for --start, --wait-min
-  // and --pause-min. NaN waitMin reaches addOne() as a timeout.
-  assert.ok(Number.isNaN(parseArgs(['--wait-min', 'abc']).waitMin));
-  assert.ok(Number.isNaN(parseArgs(['--pause-min', 'x']).pauseMin));
-  // --start falls back to the store number via `||`, so NaN is masked there.
-  assert.ok(Number.isNaN(parseArgs(['--start', 'abc']).start));
-});
-
-test('parseArgs --prefix with no value stores undefined', () => {
-  // BUG: no value check. The field is set to undefined, so the default object
-  // no longer has prefix: null and main() falls through to settings.prefix.
-  const o = parseArgs(['--prefix']);
-  assert.equal(o.prefix, undefined);
-  assert.equal('prefix' in o, true);
-});
+// FIXES A-F replaced the former tests that pinned the broken behaviour:
+//   'parseArgs throws when argv is omitted entirely'   -> FIX A (default [])
+//   'parseArgs does NOT support --email'               -> FIX B (--email branch)
+//   'parseArgs silently ignores unknown arguments'     -> FIX C (rejects them)
+//   'parseArgs with unknown argument does not throw'   -> FIX C
+//   'parseArgs --count abc yields NaN'                 -> FIX E
+//   'parseArgs --count with no value yields NaN'       -> FIX D/E
+//   'parseArgs numeric flags all accept garbage as NaN'-> FIX E
+//   'parseArgs --prefix with no value stores undefined'-> FIX D
+//   'help is not part of the default object'           -> FIX F
+// The replacement assertions live in 'parseArgs rejects bad input' below.
 
 test('parseArgs is last-one-wins for repeated flags', () => {
   const o = parseArgs(['--count', '1', '--count', '4']);
@@ -316,10 +291,106 @@ test('parseArgs reads flags in any position mixed with values', () => {
   assert.equal(o.status, false);
 });
 
+// ---------------------------------------------------------------- parseArgs rejects bad input
+//
+// These cases exit the process, so they cannot be called in-process; each one
+// runs the module in a child process and checks the status and the message.
+
+function runCli(...args) {
+  return spawnSync(process.execPath, ['--no-warnings', FILE, ...args], { encoding: 'utf8', timeout: 60000 });
+}
+
 test('parseArgs leaves the input array untouched', () => {
   const argv = ['--count', '5', '--dry-run'];
   parseArgs(argv);
   assert.deepEqual(argv, ['--count', '5', '--dry-run']);
+});
+
+test('a malformed number exits instead of becoming NaN', () => {
+  for (const [flag, bad] of [['--count', 'abc'], ['--start', 'abc'], ['--wait-min', 'abc'], ['--pause-min', 'x']]) {
+    const r = runCli(flag, bad);
+    assert.equal(r.status, 1, flag + ' ' + bad + ' must exit 1');
+    assert.match(r.stderr, /must be a number/, flag + ' must name the bad value');
+    assert.doesNotMatch(r.stdout, /would add|account\(s\)/, 'nothing may run');
+  }
+});
+
+test('a negative number exits', () => {
+  for (const [flag, bad] of [['--count', '-3'], ['--wait-min', '-1'], ['--pause-min', '-5']]) {
+    const r = runCli(flag, bad);
+    assert.equal(r.status, 1, flag + ' ' + bad + ' must exit 1');
+    assert.match(r.stderr, /must be a number/);
+  }
+});
+
+test('--count 0 exits, because the old || would turn it into 1', () => {
+  const r = runCli('--count', '0');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /--count must be at least 1/);
+});
+
+test('--start 0 exits for the same reason', () => {
+  const r = runCli('--start', '0');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /--start must be at least 1/);
+});
+
+test('a flag without a value exits instead of storing undefined', () => {
+  for (const flag of ['--count', '--prefix', '--start', '--wait-min', '--pause-min', '--email']) {
+    const r = runCli(flag);
+    assert.equal(r.status, 1, flag + ' alone must exit 1');
+    assert.ok(r.stderr.includes('missing value for ' + flag), flag + ' must be named');
+  }
+});
+
+test('a flag does not swallow the next flag as its value', () => {
+  // `--count --dry-run` used to give count NaN and still enable dry-run.
+  const r = runCli('--count', '--dry-run');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /missing value for --count/);
+});
+
+test('unknown arguments are rejected with the list of known flags', () => {
+  for (const bad of ['--dryrun', '--bogus', 'random', '-x']) {
+    const r = runCli(bad);
+    assert.equal(r.status, 1, bad + ' must exit 1');
+    assert.ok(r.stderr.includes('unknown argument: ' + bad), 'message must name ' + bad);
+    assert.match(r.stderr, /known: --count .*--email --help/);
+  }
+});
+
+test('the known-flag list is complete, not invented', () => {
+  // Every flag the help text documents must be accepted by parseArgs.
+  const r = runCli('--help');
+  assert.equal(r.status, 0);
+  const documented = [...r.stdout.matchAll(/^\s+(--[a-z-]+)/gm)].map((m) => m[1]);
+  assert.ok(documented.includes('--email'), '--email must be documented');
+  assert.deepEqual(documented.sort(), [
+    '--count', '--dry-run', '--email', '--forget', '--keep-open', '--pause-min',
+    '--prefix', '--resume', '--start', '--status', '--wait-min',
+  ]);
+});
+
+test('--email is stored as the given address, normalized', () => {
+  const o = parseArgs(['--email', '  X@Y.de ']);
+  assert.equal(o.email, 'x@y.de');
+  assert.equal(parseArgs([]).email, null, 'no email by default');
+});
+
+test('--email rejects something that is not an address', () => {
+  for (const bad of ['nope', 'a@b', 'a b@c.de', '@y.de']) {
+    const r = runCli('--email', bad);
+    assert.equal(r.status, 1, bad + ' must exit 1');
+    assert.match(r.stderr, /--email is not an address/);
+  }
+});
+
+test('--email with --count or --resume exits rather than guessing', () => {
+  for (const extra of [['--count', '2'], ['--resume']]) {
+    const r = runCli('--email', 'gh-99@arisya.de', '--dry-run', ...extra);
+    assert.equal(r.status, 1, extra.join(' ') + ' with --email must exit 1');
+    assert.match(r.stderr, /--email takes exactly one address/);
+  }
 });
 
 test('parseArgs returns a fresh object per call (no shared state)', () => {

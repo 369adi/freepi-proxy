@@ -90,21 +90,75 @@ const CHROME_CANDIDATES = [
 
 // ---------------------------------------------------------------- args
 
-function parseArgs(argv) {
-  const o = { count: null, dryRun: false, resume: false, status: false, forget: false, prefix: null, start: null, keepOpen: false, waitMin: 15, pauseMin: 3 };
+// Deliberately loose: it only has to catch a typo like `--email gh-99`, not to
+// be RFC 5322. The real check is whether GitHub accepts the address.
+const ADDRESS_SHAPE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+function parseArgs(argv = []) {
+  const o = { count: null, dryRun: false, resume: false, status: false, forget: false, prefix: null, start: null, keepOpen: false, waitMin: 15, pauseMin: 3, email: null, help: false };
+  const KNOWN = '--count --start --prefix --resume --status --forget --dry-run --keep-open --wait-min --pause-min --email --help';
+  // Takes the value at argv[i + 1] and returns the index of that value.
+  const takeValue = (flag, i) => {
+    const v = argv[i + 1];
+    if (v === undefined || String(v).startsWith('--')) {
+      console.error('missing value for ' + flag);
+      console.error('known: ' + KNOWN);
+      process.exit(1);
+    }
+    return i + 1;
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === '--count') o.count = Number(argv[++i]);
-    else if (a === '--dry-run') o.dryRun = true;
+    if (a === '--count') {
+      i = takeValue(a, i);
+      o.count = Number(argv[i]);
+    } else if (a === '--dry-run') o.dryRun = true;
     else if (a === '--resume') o.resume = true;
     else if (a === '--status') o.status = true;
     else if (a === '--forget') o.forget = true;
-    else if (a === '--prefix') o.prefix = argv[++i];
-    else if (a === '--start') o.start = Number(argv[++i]);
-    else if (a === '--keep-open') o.keepOpen = true;
-    else if (a === '--wait-min') o.waitMin = Number(argv[++i]);
-    else if (a === '--pause-min') o.pauseMin = Number(argv[++i]);
-    else if (a === '--help' || a === '-h') o.help = true;
+    else if (a === '--prefix') {
+      i = takeValue(a, i);
+      o.prefix = argv[i];
+    } else if (a === '--start') {
+      i = takeValue(a, i);
+      o.start = Number(argv[i]);
+    } else if (a === '--keep-open') o.keepOpen = true;
+    else if (a === '--wait-min') {
+      i = takeValue(a, i);
+      o.waitMin = Number(argv[i]);
+    } else if (a === '--pause-min') {
+      i = takeValue(a, i);
+      o.pauseMin = Number(argv[i]);
+    } else if (a === '--email') {
+      i = takeValue(a, i);
+      o.email = String(argv[i]).trim().toLowerCase();
+    } else if (a === '--help' || a === '-h') o.help = true;
+    else {
+      console.error('unknown argument: ' + a);
+      console.error('known: ' + KNOWN);
+      process.exit(1);
+    }
+  }
+  // main() reads these with `||`, so NaN would silently fall back to a default
+  // and the run would look fine while doing something else than asked.
+  for (const k of ['count', 'start', 'waitMin', 'pauseMin']) {
+    const v = o[k];
+    if (v === null || v === undefined) continue;
+    if (!Number.isFinite(v) || v < 0) {
+      console.error('--' + k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()) + ' must be a number >= 0, got ' + v);
+      process.exit(1);
+    }
+  }
+  // 0 accounts is not a run, and 0 as a start number is a typo, not a choice.
+  for (const k of ['count', 'start']) {
+    if (o[k] === 0) {
+      console.error('--' + k + ' must be at least 1');
+      process.exit(1);
+    }
+  }
+  if (o.email !== null && !ADDRESS_SHAPE.test(o.email)) {
+    console.error('--email is not an address: ' + o.email);
+    process.exit(1);
   }
   return o;
 }
@@ -127,6 +181,7 @@ if (ARGS.help) {
   --wait-min N   minutes to wait for the human step per account (default 15)
   --pause-min N  minutes between two accounts in one batch (default 3)
   --keep-open    leave the browser window and profile up after each account
+  --email A      use exactly this address instead of a generated one
 
 Each account needs its own GitHub identity, because free-pi only accepts GitHub
 OAuth. The tool mints a free username, signs up, reads the launch code out of the
@@ -391,38 +446,6 @@ for (const [name, mod] of [['store.mjs', storeMod], ['webmail.mjs', webHealth]])
     process.exit(1);
   }
 
-const CONSENT_VERSION = '4';
-
-/**
- * Wait until the person has finished the GitHub sign-up in the open window and
- * a session exists. Detected by /login/device being reachable while logged in,
- * or by asking GitHub's own UI for a username.
- */
-async function waitForGitHubSession(cdp, { timeoutMs, onTick }) {
-  const deadline = Date.now() + timeoutMs;
-  let lastNote = '';
-  while (Date.now() < deadline) {
-    const state = await cdp.eval(PAGE_STATE);
-    if (state && !state.__error && state.url) {
-      const url = String(state.url);
-      const text = String(state.text || '');
-      // Signed-in GitHub pages carry the user's own login in the header nav.
-      const signedIn =
-        /\/login\/device/.test(url) ||
-        /\/settings|\/dashboard|dashboard\.github/.test(url) ||
-        /signed in as|your profile/i.test(text);
-      if (signedIn) return { ok: true, url, text };
-      const note = /captcha/i.test(text) ? 'captcha on screen' : url.replace('https://github.com', '');
-      if (note !== lastNote) {
-        if (onTick) onTick(note);
-        lastNote = note;
-      }
-    }
-    await sleep(2000);
-  }
-  return { ok: false };
-}
-
 /** Ask GitHub who is logged in, by reading the meta user-login tag. */
 async function githubUser(cdp) {
   const r = await cdp.eval(
@@ -658,8 +681,11 @@ async function waitOutRateLimit(cdp, { log, maxWaitMs = RATE_LIMIT_WAIT_MS } = {
   const start = Date.now();
   let wait = 120000;
   while (Date.now() - start < maxWaitMs) {
+    // Clamp the sleep to the time left in the budget: `wait` grows to 600000 ms,
+    // which used to overshoot the 15 minute limit by up to ten minutes.
+    const rest = Math.max(0, maxWaitMs - (Date.now() - start));
     if (log) log('  github is rate limiting - waiting ' + Math.round(wait / 1000) + 's');
-    await sleep(wait);
+    await sleep(Math.min(wait, rest));
     await cdp.navigate('https://github.com/signup');
     await sleep(3500);
     const blocked = await cdp.eval(SIGNUP_BLOCKED);
@@ -1313,12 +1339,18 @@ async function addAccountSafely(fields, { me = null, file = STORE_PATH } = {}) {
     await storeMod.saveStore(store, file);
     return { store, account };
   }
-  throw new Error('accounts.json kept changing under us; retry when the proxy is idle');
+  // Tagged so `addOne` can tell "the account already exists on GitHub and only
+  // the file write lost a race" apart from a real sign-up/login failure. Without
+  // the tag the caller reported stage 'login' for a finished account.
+  const e = new Error('accounts.json kept changing under us; retry when the proxy is idle');
+  e.code = 'STORE_RACE';
+  throw e;
 }
 
 async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
   let cdp = null;
   let child = null;
+  const codeTimeoutMs = Math.max(60000, (waitMin || 15) * 60000);
   try {
     const password = makePassword();
     let username = await makeFreeUsername(email, { log });
@@ -1563,7 +1595,7 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
     let verified = await checkVerified(cdp);
     if (!verified) {
       log('verifying ' + email + ' - reading the code from the mailbox');
-      const solved = await solveVerification(cdp, { email, log });
+      const solved = await solveVerification(cdp, { email, log, timeoutMs: codeTimeoutMs });
       if (solved.ok) {
         log('code accepted, github moved to ' + solved.url);
         verified = true;
@@ -1668,7 +1700,7 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
       return {
         ok: false,
         stage: 'store',
-        error: email + ' is already in the account store - no second account was created',
+        error: email + ' is already in the account store - check whether it has a token; no second account was created',
         handle,
         email,
       };
@@ -1691,7 +1723,25 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
 
     return { ok: true, token, handle, email, accountId: stored.id };
   } catch (err) {
-    return { ok: false, stage: 'login', error: err && err.message ? err.message : String(err) };
+    const msg = err && err.message ? err.message : String(err);
+    // Store failures are not login failures. `mustLoadStore` throws
+    // STORE_UNREADABLE (corrupt accounts.json) and `addAccountSafely` throws
+    // STORE_RACE; both used to fall into stage 'login', so the batch had no
+    // reason to stop and burned a full GitHub sign-up per remaining address.
+    // needsHuman stops the batch (see the loop below).
+    if (err && err.code === 'STORE_UNREADABLE') {
+      return { ok: false, stage: 'store', needsHuman: true, error: msg, email };
+    }
+    if (err && err.code === 'STORE_RACE') {
+      return {
+        ok: false,
+        stage: 'store',
+        needsHuman: true,
+        error: 'the GitHub account was created but could not be saved to accounts.json (' + email + ')',
+        email,
+      };
+    }
+    return { ok: false, stage: 'login', error: msg };
   } finally {
     if (cdp) cdp.close();
     // keepOpen used to mean "leave the profile on disk". It now also means
@@ -1754,6 +1804,14 @@ async function main() {
   const domain = settings.domain;
 
   const state = loadState();
+  // A row left at 'running' means the last process died mid-signup. Without
+  // this, --resume would pick it up again and burn the address a second time.
+  for (const a of state.accounts) {
+    if (a.status === 'running') {
+      a.status = 'failed';
+      a.error = 'interrupted';
+    }
+  }
   const known = new Set(state.accounts.map((a) => a.email));
   const plan = [];
 
@@ -1765,12 +1823,35 @@ async function main() {
   // --start wins, then the counter left behind by --forget, then the store.
   let n = ARGS.start || state.nextNumber || settings.nextNumber;
   let guard = 0;
-  while (plan.length < want && guard++ < 100000) {
+  const GUARD_LIMIT = 100000;
+  while (plan.length < want && guard++ < GUARD_LIMIT) {
     const email = `${prefix}-${n}@${domain}`;
     n += 1;
     if (known.has(email) || settings.taken.has(email.toLowerCase())) continue;
     plan.push(email);
     known.add(email);
+  }
+  // Hitting the guard used to end the loop silently, so the user got fewer
+  // accounts than --count asked for with no hint why.
+  if (guard >= GUARD_LIMIT && plan.length < want)
+    console.warn('stopped planning after ' + GUARD_LIMIT + ' attempts; lower --count or use a different prefix');
+
+  // --email names exactly one address, so no generated one is used with it.
+  // The number in it still advances the counter, otherwise the next plain run
+  // would rebuild that same address and GitHub would refuse the duplicate.
+  if (ARGS.email) {
+    if (want !== 1 || ARGS.resume) {
+      console.error('--email takes exactly one address; do not combine it with --count or --resume');
+      process.exit(1);
+    }
+    const num = Number((ARGS.email.match(/-(\d+)@/) || [])[1]);
+    if (Number.isFinite(num) && num > 0) state.nextNumber = Math.max(state.nextNumber || 0, num + 1);
+    if (known.has(ARGS.email) || [...known].some((e) => String(e).toLowerCase() === ARGS.email) || settings.taken.has(ARGS.email)) {
+      console.error('--email ' + ARGS.email + ' is already in the state or the store, pick a fresh one');
+      process.exit(1);
+    }
+    plan.length = 0;
+    plan.push(ARGS.email);
   }
 
   if (!plan.length) {
@@ -1815,6 +1896,7 @@ async function main() {
     const row = state.accounts.find((a) => a.email === email) || { email };
     if (!state.accounts.includes(row)) state.accounts.push(row);
     row.status = 'running';
+    row.attempt = (row.attempt || 0) + 1;
     row.startedAt = new Date().toISOString();
     row.error = null;
     saveState(state);

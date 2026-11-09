@@ -111,6 +111,7 @@ function Test-Minimized([int]$Hwnd) {
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
 '@ -ErrorAction SilentlyContinue
         return [GuardianWin.Api]::IsIconic([IntPtr]$Hwnd)
     } catch { return $false }
@@ -129,6 +130,31 @@ function Get-MainWindowHandle([int]$ProcessId) {
     return 0
 }
 
+function Move-WindowTo([int]$Hwnd, [int]$X, [int]$Y) {
+    if ($Hwnd -le 0) { return $false }
+    try {
+        [GuardianWin.Api]::MoveWindow([IntPtr]$Hwnd, $X, $Y, 760, 820, $true) | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+# Every sponsor window has to sit somewhere, and if they all start at the same
+# spot only the topmost one is on screen while the others are covered. Covered
+# means Chromium reports the page as hidden and the display never confirms, so
+# each account gets its own slot in a cascade.
+function Get-SlotFor([string]$SafeId) {
+    $ids = @(Get-SponsorSlotIds)
+    $index = [array]::IndexOf($ids, $SafeId)
+    if ($index -lt 0) { $index = 0 }
+    return @{ X = 30 + ($index * 44); Y = 30 + ($index * 44) }
+}
+
+function Get-SponsorSlotIds() {
+    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
+    if (-not (Test-Path $root)) { return @('acc-1') }
+    return @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Sort-Object)
+}
+
 function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) {
     $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
     $profile = Join-Path $root $SafeId
@@ -138,22 +164,47 @@ function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) 
         # existing one is not minimised, otherwise free-pi pauses the account.
         $procId = [int]$OpenWindows[$SafeId]
         $hwnd = Get-MainWindowHandle $procId
-        if ($hwnd -gt 0 -and (Test-Minimized $hwnd)) {
-            if (Restore-Window $hwnd) { Write-Guardian ("Sponsor window for " + $SafeId + " was minimised; restored it.") }
+        if ($hwnd -gt 0) {
+            if (Test-Minimized $hwnd) {
+                if (Restore-Window $hwnd) { Write-Guardian ("Sponsor window for " + $SafeId + " was minimised; restored it.") }
+            }
+            $slot = Get-SlotFor $SafeId
+            [void](Move-WindowTo $hwnd $slot.X $slot.Y)
         }
         return $false
     }
 
     if (-not $Browser) { return $false }
     New-Item -ItemType Directory -Path $profile -Force | Out-Null
+    # Same profile marker the proxy writes: without it Edge opens the welcome
+    # tab and the sponsor card stops being the visible document.
+    try { Set-Content -LiteralPath (Join-Path $profile 'First Run') -Value '' -Force } catch { }
     try {
-        Start-Process -FilePath $Browser -ArgumentList @(
+        $started = Start-Process -FilePath $Browser -ArgumentList @(
             ('--app=' + $Url),
             ('--user-data-dir=' + $profile),
             '--no-first-run',
             '--no-default-browser-check',
-            '--window-size=720,600'
-        ) | Out-Null
+            '--disable-sync',
+            '--disable-features=EdgeSyncConfirmation,MsEdgeFirstRunExperience,EdgePromoPopup',
+            '--no-service-autorun',
+            '--disable-component-update',
+            '--window-size=760,820'
+        ) -PassThru
+        # Give the window its own place on the desktop. Edge starts every app
+        # window at the same coordinates, so without this every account after
+        # the first is covered by the previous one and never confirms a display.
+        $slot = Get-SlotFor $SafeId
+        for ($attempt = 0; $attempt -lt 8; $attempt++) {
+            Start-Sleep -Milliseconds 400
+            $proc = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
+            if ($proc -and $proc.MainWindowHandle -ne 0) {
+                if (Move-WindowTo ([int]$proc.MainWindowHandle) $slot.X $slot.Y) {
+                    Write-Guardian ('Placed the sponsor window for ' + $SafeId + ' at ' + $slot.X + ',' + $slot.Y + '.')
+                }
+                break
+            }
+        }
         Write-Guardian ('Opened sponsor window for ' + $SafeId)
         return $true
     } catch {

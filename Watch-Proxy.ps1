@@ -7,13 +7,13 @@ New-Item -ItemType Directory -Path $proxyLogs -Force | Out-Null
 $proxyWatchLog = Join-Path $proxyLogs 'watchdog.log'
 $proxyPidFile = Join-Path $proxyLogs 'proxy.pid'
 $proxyChild = $null
-$sponsorOpened = $false
+$sponsorNextCheck = [DateTime]::MinValue
 
 function Show-ProxySponsor {
-    if (-not $script:sponsorOpened) {
+    if ([DateTime]::UtcNow -ge $script:sponsorNextCheck) {
+        $script:sponsorNextCheck = [DateTime]::UtcNow.AddSeconds(30)
         try {
             & (Join-Path $proxyDirectory 'Show-Sponsor.ps1')
-            $script:sponsorOpened = $true
         } catch { Write-ProxyEvent ('Open http://127.0.0.1:4000/sponsor to display ads. ' + $_.Exception.Message) }
     }
 }
@@ -39,6 +39,7 @@ try {
                     do {
                         Start-Sleep -Seconds 5
                         $proxyExisting = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/v1/models' -TimeoutSec 3
+                        Show-ProxySponsor
                     } while ($proxyExisting.object -eq 'list')
                 }
             } catch { }
@@ -57,18 +58,35 @@ try {
             while (-not $proxyChild.WaitForExit(1000)) {
                 if ([DateTime]::UtcNow -lt $proxyNextCheck) { continue }
                 $proxyNextCheck = [DateTime]::UtcNow.AddSeconds(10)
+                # /health answers from memory and never waits for a lane, so a
+                # busy proxy still counts as healthy. Probing /v1/models made a
+                # proxy that was merely serving a slow model look dead, and the
+                # supervisor killed it mid-request - the client saw "connection
+                # error". Never kill a live process that still answers here.
                 try {
-                    $proxyHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/v1/models' -TimeoutSec 4
-                    if ($proxyHealth.object -ne 'list') { throw 'Unexpected model response' }
+                    $proxyHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/health' -TimeoutSec 8
+                    if ($proxyHealth.status -ne 'ok') { throw 'Unexpected health response' }
                     Show-ProxySponsor
                     if ($null -eq $proxyLastHealthy) { Write-ProxyEvent 'Local API is healthy.' }
                     $proxyLastHealthy = [DateTime]::UtcNow
                 } catch {
-                    $proxyHealthReference = if ($null -eq $proxyLastHealthy) { $proxyStarted } else { $proxyLastHealthy }
-                    if (([DateTime]::UtcNow - $proxyHealthReference).TotalSeconds -gt 45) {
-                        Write-ProxyEvent 'Local API did not respond for 45 seconds; restarting this proxy process.'
-                        Stop-Process -Id $proxyChild.Id -Force -ErrorAction SilentlyContinue
-                        $proxyChild.WaitForExit()
+                    # Older proxy without /health: fall back to the model list.
+                    try {
+                        $proxyHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:4000/v1/models' -TimeoutSec 8
+                        if ($proxyHealth.object -ne 'list') { throw 'Unexpected model response' }
+                        Show-ProxySponsor
+                        if ($null -eq $proxyLastHealthy) { Write-ProxyEvent 'Local API is healthy.' }
+                        $proxyLastHealthy = [DateTime]::UtcNow
+                    } catch {
+                        $proxyHealthReference = if ($null -eq $proxyLastHealthy) { $proxyStarted } else { $proxyLastHealthy }
+                        # 180 s instead of 45 s: a long generation or a full queue
+                        # is not a dead proxy, and every false restart breaks a
+                        # client request that was still running.
+                        if (([DateTime]::UtcNow - $proxyHealthReference).TotalSeconds -gt 180) {
+                            Write-ProxyEvent 'Local API did not respond for 180 seconds; restarting this proxy process.'
+                            Stop-Process -Id $proxyChild.Id -Force -ErrorAction SilentlyContinue
+                            $proxyChild.WaitForExit()
+                        }
                     }
                 }
             }

@@ -59,6 +59,7 @@ function hostOf(u) {
 
 // ---------------------------------------------------------------- CDP
 
+// currently unused by auto-add.mjs; kept for the manual webmail flow
 export class Session {
   constructor(wsUrl) {
     this.wsUrl = wsUrl;
@@ -136,6 +137,7 @@ export class Session {
   }
 }
 
+// currently unused by auto-add.mjs; kept for the manual webmail flow
 export async function target(port, want = null) {
   try {
     const l = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json());
@@ -264,6 +266,7 @@ function rememberPort(profileDir, port) {
 // ---------------------------------------------------------------- reading
 
 /** Compact, provider-agnostic snapshot of whatever is on screen. */
+// currently unused by auto-add.mjs; kept for the manual webmail flow
 export const SNAPSHOT = `(() => {
   const vis = el => !!el && el.offsetParent !== null;
   const rows = [];
@@ -308,6 +311,7 @@ export async function isLoggedIn(cdp) {
  * Wait until the person logs in, then return. Polls the page rather than
  * asking for credentials.
  */
+// currently unused by auto-add.mjs; kept for the manual webmail flow
 export async function waitForLogin(cdp, { timeoutMs = 600000, onTick } = {}) {
   const deadline = Date.now() + timeoutMs;
   let last = '';

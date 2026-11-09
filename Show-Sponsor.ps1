@@ -40,12 +40,17 @@ foreach ($account in $list) {
     if ($running) { continue }
 
     New-Item -ItemType Directory -Path $profile -Force | Out-Null
+    try { Set-Content -LiteralPath (Join-Path $profile 'First Run') -Value '' -Force } catch { }
     Start-Process -FilePath $sponsorBrowser -ArgumentList @(
         '--app=' + $address,
         '--user-data-dir="' + $profile + '"',
         '--no-first-run',
         '--no-default-browser-check',
-        '--window-size=720,600'
+        '--disable-sync',
+        '--disable-features=EdgeSyncConfirmation,MsEdgeFirstRunExperience,EdgePromoPopup',
+        '--no-service-autorun',
+        '--disable-component-update',
+        '--window-size=760,820'
     ) -WindowStyle Normal
     $opened++
     Write-Host ('sponsor window opened for ' + $account.id + ($(if ($account.handle) { ' (@' + $account.handle + ')' } else { '' })))

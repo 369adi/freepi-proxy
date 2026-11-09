@@ -856,11 +856,20 @@ function openSponsorPanel(account) {
   const profile = sponsorProfileDir(key);
   try {
     fsSync.mkdirSync(profile, { recursive: true });
+    // Suppress everything that could steal the window from the sponsor page:
+    // the sync prompt, the default-browser question, the welcome tab and the
+    // component promos all open their own page and then the sponsor card is no
+    // longer the visible document, which pauses the allowance for that account.
+    fsSync.writeFileSync(path.join(profile, 'First Run'), '', { flag: 'w' });
     const child = spawn(exe, [
       '--app=' + url,
       '--user-data-dir=' + profile,
       '--no-first-run',
       '--no-default-browser-check',
+      '--disable-sync',
+      '--disable-features=EdgeSyncConfirmation,MsEdgeFirstRunExperience,EdgePromoPopup',
+      '--no-service-autorun',
+      '--disable-component-update',
       // The card plus the usage grid needs roughly 700px of height; a window
       // smaller than the card would keep the display confirmation paused.
       '--window-size=760,820',
