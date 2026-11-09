@@ -27,6 +27,7 @@ const CLIENT_VERSION = '0.6.15';
 const CONSENT_VERSION = '4';
 const PROXY_URL = process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000';
 const PROXY_USAGE = PROXY_URL + '/usage';
+const PROXY_BUDGET = PROXY_URL + '/budget';
 const STORE_PATH =
   process.env.FREEPI_ACCOUNTS_PATH ||
   path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
@@ -615,6 +616,18 @@ async function driveGithubLogin(session, code, opts = {}) {
 
 const num = (n) => Number(n ?? 0).toLocaleString('en-US');
 
+/**
+ * Does this command invocation ask for machine-readable output?
+ *
+ * `\b--json\b` never matches: `-` is not a word character, so there is no word
+ * boundary before it. Match the flag as a real token instead, which also keeps
+ * `x--json` from counting.
+ */
+function wantsJson(invocation) {
+  const raw = typeof invocation === 'string' ? invocation : String(invocation?.rawInput ?? '');
+  return /(^|\s)--json(\s|$)/.test(raw);
+}
+
 // --------------------------------------------------------------- store access
 
 function loadStore() {
@@ -1098,7 +1111,7 @@ async function addAccountWithBrowser(ctx, invocation, browser) {
   return { kind: 'success', text: lines.join('\n') };
 }
 
-async function handleStatus() {
+async function handleStatus(invocation) {
   const store = loadStore();
   if (!store) {
     return { kind: 'error', text: `Kein Store unter ${STORE_PATH}` };
@@ -1106,6 +1119,42 @@ async function handleStatus() {
   const accounts = store.accounts || [];
   if (accounts.length === 0) {
     return { kind: 'success', text: 'Noch kein Account. /freepi-add legt einen an.' };
+  }
+
+  // Machine-readable form for scripts and for an agent that wants raw numbers.
+  if (wantsJson(invocation)) {
+    let live = null;
+    try {
+      const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(2000) });
+      if (res.ok) live = await res.json();
+    } catch {
+      /* proxy down: the store still answers everything that is persisted */
+    }
+    return {
+      kind: 'success',
+      text: JSON.stringify({
+        storePath: STORE_PATH,
+        pinned: readSelection(),
+        activeAccountId: store.activeAccountId,
+        totals: store.totals || {},
+        accounts: accounts.map((a) => ({
+          id: a.id,
+          handle: a.handle,
+          email: a.email,
+          state: stateOf(a),
+          disabled: Boolean(a.disabled),
+          tokenBad: Boolean(a.tokenBad),
+          tokenExpiresAt: a.tokenExpiresAt || null,
+          remaining: a.usage?.remainingCreditsToday ?? null,
+          allowance: a.usage?.allowanceCredits ?? null,
+          premiumCredits: a.usage?.premiumCredits ?? null,
+          refillAt: a.usage?.refillAt ?? null,
+          usageMeasuredAt: a.usage?.fetchedAt ?? null,
+          lastError: a.lastError || null,
+        })),
+        proxy: live ? live.queue || null : null,
+      }, null, 2),
+    };
   }
 
   const lines = [];
@@ -1148,7 +1197,8 @@ async function handleStatus() {
   return { kind: 'success', text: lines.join('\n') };
 }
 
-async function handleUsage() {
+async function handleUsage(invocation) {
+  const wantJson = wantsJson(invocation);
   try {
     const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) {
@@ -1157,12 +1207,30 @@ async function handleUsage() {
     const u = await res.json();
     const q = u.queue || {};
     const selected = (u.accounts || []).find(a => a.id === u.activeAccountId);
+
+    // Hours, not credits: free-pi meters in hours and every model costs a
+    // multiple of the base rate, so credits alone hide the real remaining time.
+    let budget = null;
+    try {
+      const bres = await fetch(PROXY_BUDGET, { signal: AbortSignal.timeout(2000) });
+      if (bres.ok) budget = await bres.json();
+    } catch {
+      /* older proxy without /budget - the rest of the output still works */
+    }
+
+    if (wantJson) {
+      return { kind: 'success', text: JSON.stringify({ queue: q, activeAccountId: u.activeAccountId, selected, totals: u.totals, budget }, null, 2) };
+    }
+
+    const hours = budget && typeof budget.hoursLeft === 'number' ? `${budget.hoursLeft.toFixed(2)} h` : '?';
+    const hoursAll = budget && typeof budget.hoursAllowance === 'number' ? `${budget.hoursAllowance.toFixed(2)} h` : '?';
     return {
       kind: 'success',
       text: [
         `Lanes (gleichzeitig moeglich): ${q.lanes ?? '?'}`,
         `gerade aktiv:                   ${q.inFlight ?? 0}`,
         `in der Warteschlange:           ${q.waiting ?? 0}`,
+        `Stunden-Budget:                 ${hours} von ${hoursAll} (Modell ${budget?.model ?? '?'}, ${budget?.modelMultiplier ?? 1}x Rate)`,
         ...(selected ? [`Daily allowance: ${num(selected.remaining)} / ${num(selected.allowance)} credits`,
           `Premium balance: ${selected.premiumCredits == null ? 'not reported' : num(selected.premiumCredits)} credits`,
           `Premium breakdown: purchased ${selected.premiumBoughtCredits == null ? '?' : num(selected.premiumBoughtCredits)}, gifted ${selected.premiumGiftedCredits == null ? '?' : num(selected.premiumGiftedCredits)}`,
@@ -1384,13 +1452,13 @@ function apply(ctx) {
       yield ctx.commands.register({
         name: 'freepi-status',
         description: 'Show free-pi account budgets, refill times and proxy lanes',
-        handler: () => track(handleStatus()),
+        handler: (invocation) => track(handleStatus(invocation)),
       });
 
       yield ctx.commands.register({
         name: 'freepi-usage',
-        description: 'Show live proxy load: lanes, in-flight requests, queue depth',
-        handler: () => track(handleUsage()),
+        description: 'Show live proxy load: lanes, in-flight requests, queue depth (/freepi-usage --json)',
+        handler: (invocation) => track(handleUsage(invocation)),
       });
       yield ctx.commands.register({
         name: 'freepi-remove',

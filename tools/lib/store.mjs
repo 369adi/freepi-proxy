@@ -11,6 +11,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { decodeJwt } from './freepi-api.mjs';
 
 export const STORE_VERSION = 1;
@@ -63,9 +64,16 @@ export async function loadStore(file = STORE_PATH) {
 
 export async function saveStore(store, file = STORE_PATH) {
   await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
-  await fs.rename(tmp, file);
+  // A unique temp name keeps two saves in the same process from clobbering each
+  // other: with a shared name one rename can fail or publish the other payload.
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
+    await fs.rename(tmp, file);
+  } catch (err) {
+    try { await fs.unlink(tmp); } catch { /* already gone */ }
+    throw err;
+  }
   return file;
 }
 

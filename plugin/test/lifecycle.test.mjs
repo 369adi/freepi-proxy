@@ -9,6 +9,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const SECRET = 'SI_SECRET_TOKEN_NEVER_SHOWN';
+// lib/index.js resolves its store path once at module load, so the fixture for
+// the first loadPlugin() call also receives the child processes `node --test`
+// spawns for this file.
+const FIRST_FIXTURE = fixture();
+let fixtureUsed = false;
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freepi-lifecycle-'));
@@ -46,6 +51,10 @@ function fixture() {
 }
 
 async function loadPlugin(f) {
+  if (!f && !fixtureUsed) {
+    f = FIRST_FIXTURE;
+    fixtureUsed = true;
+  }
   process.env.FREEPI_ACCOUNTS_PATH = f.storePath;
   // Port 9 (discard) is never a proxy, so /freepi-doctor finds it unreachable
   // instead of hitting whatever happens to listen on the default port.
@@ -164,4 +173,33 @@ test('/freepi-doctor flags a pinned account', async () => {
   const pinned = await call(commands, 'freepi-doctor');
   assert.match(pinned.text, /gepinnt auf acc-2/);
   assert.match(pinned.text, /\/freepi-auto/);
+});
+
+test('/freepi-status --json emits parseable data without credentials', async () => {
+  const f = fixture();
+  fs.writeFileSync(f.selectionPath, JSON.stringify({ accountId: 'acc-2' }));
+  const commands = await loadPlugin(f);
+
+  const result = await call(commands, 'freepi-status', '--json');
+  assert.equal(result.kind, 'success');
+  assert.doesNotMatch(result.text, /SI_SECRET/, 'credentials never appear in JSON either');
+
+  const data = JSON.parse(result.text);
+  assert.equal(data.pinned, 'acc-2');
+  assert.equal(data.activeAccountId, 'acc-1');
+  assert.equal(data.accounts.length, 2);
+  assert.deepEqual(data.accounts.map((a) => a.id), ['acc-1', 'acc-2']);
+  assert.equal(data.accounts[0].remaining, 100);
+  assert.equal(data.accounts[0].allowance, 100);
+  assert.equal(typeof data.accounts[0].state, 'string');
+  // No proxy listens on the test port: the field exists but stays empty.
+  assert.equal(data.proxy, null);
+});
+
+test('/freepi-usage --json tolerates an unreachable proxy by erroring cleanly', async () => {
+  const f = fixture();
+  const commands = await loadPlugin(f);
+  const result = await call(commands, 'freepi-usage', '--json');
+  assert.equal(result.kind, 'error');
+  assert.match(result.text, /nicht erreichbar/);
 });

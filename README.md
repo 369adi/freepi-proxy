@@ -307,7 +307,11 @@ curl http://127.0.0.1:4000/usage     # -> "queue": { inFlight, waiting, lanes }
 So: a harness running 3 subagents in parallel wants 3 accounts. Everything above
 that queues and still completes.
 
-`npm test` runs the rotation-policy unit tests (`node --test`).
+`npm test` runs every unit test through `node --test`: the rotation policy
+(`tools\test-policy.test.mjs`), the hour-budget arithmetic
+(`tools\test-budget.test.mjs`), the store and sponsor/usage paths, and the DSH
+plugin lifecycle. `tools\lib\budget.mjs` holds the pure credit -> hour maths
+behind `GET /budget`.
 
 ### Running out of budget
 

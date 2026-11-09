@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// free-pi proxy — OpenAI-compatible local gateway with multi-account rotation.
+// free-pi proxy ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â OpenAI-compatible local gateway with multi-account rotation.
 //
 // One local endpoint, many free-pi accounts: the rotator measures each account's
 // live budget via GET /me, keeps using the active one until it gets low, then
 // switches to another existing account. A brand-new GitHub account is only
 // needed when *every* known account is out of budget and no daily refill is
-// imminent — see tools/lib/policy.mjs for that decision.
+// imminent ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â see tools/lib/policy.mjs for that decision.
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs/promises';
@@ -20,6 +20,7 @@ import { loadStore, saveStore, findAccount, markExhausted, markInvalid, STORE_PA
 import { decide, describe, stateOf, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
+import { budgetSummary, modelMultiplier } from './tools/lib/budget.mjs';
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
 const FREEPI_VERSION = '0.6.15';   // keep in sync with upstream minimum
@@ -44,6 +45,11 @@ const MAX_QUEUE = Number(process.env.FREEPI_MAX_QUEUE ?? 64);
 const claimWaiters = [];
 
 function enqueueClaim(attemptClaim) {
+  // Cancelled waiters must not consume queue slots: pruning here keeps a long
+  // outage from reporting 64 waiting requests when nobody is waiting anymore.
+  for (let i = claimWaiters.length - 1; i >= 0; i--) {
+    if (claimWaiters[i].cancelled) claimWaiters.splice(i, 1);
+  }
   if (claimWaiters.length >= MAX_QUEUE) return { accepted: false };
   const waiter = { attemptClaim, cancelled: false };
   claimWaiters.push(waiter);
@@ -52,7 +58,12 @@ function enqueueClaim(attemptClaim) {
   return {
     accepted: true,
     position,
-    cancel: () => { waiter.cancelled = true; },
+    cancel: () => {
+      waiter.cancelled = true;
+      // Drop it right away - a stuck lane must not keep a dead waiter counted.
+      const at = claimWaiters.indexOf(waiter);
+      if (at !== -1) claimWaiters.splice(at, 1);
+    },
   };
 }
 
@@ -70,6 +81,45 @@ function pumpClaims() {
 
 function queueDepth() {
   return { inFlight: laneBusy.size, waiting: claimWaiters.length, lanes: laneCount() };
+}
+
+// Models free-pi can serve text-only. Everything else is assumed to accept
+// images, which keeps clients that gate attachments on /v1/models working.
+const TEXT_ONLY_MODEL = /(^|[-_ ])(oss|solar|mimo|laguna|kimi|gemma|deepseek|glm|abliterated|heretic)([-_ ]|$)/i;
+
+function supportsVision(id) {
+  return !TEXT_ONLY_MODEL.test(String(id || ''));
+}
+
+/**
+ * Hour budget for the whole account pool, at the multiplier of one model.
+ * Without an explicit model, the cheapest one wins: that is what an unattended
+ * agent harness burns, and it makes the number comparable over time.
+ */
+function budgetSnapshot(catalog, wantedModel) {
+  const models = (Array.isArray(catalog) && catalog.length ? catalog : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }])
+    .filter(m => !m.unavailable);
+  const priced = models.map(m => ({ id: m.id, name: m.name, multiplier: modelMultiplier(m) }));
+  const cheapest = priced.slice().sort((a, b) => a.multiplier - b.multiplier)[0] || { id: 'unknown', multiplier: 1 };
+  const selected = wantedModel
+    ? (priced.find(m => m.id === String(wantedModel)) || { id: String(wantedModel), multiplier: modelMultiplier({ name: String(wantedModel) }) })
+    : cheapest;
+  const snapshot = usageSnapshot();
+  const summary = budgetSummary(snapshot.accounts, selected.multiplier);
+  return {
+    model: selected.id,
+    modelMultiplier: summary.modelMultiplier,
+    creditsPerHour: summary.creditsPerHour,
+    cheapestModel: cheapest.id,
+    accounts: summary.accounts,
+    usableAccounts: summary.usableAccounts,
+    totalAccounts: summary.totalAccounts,
+    creditsLeft: summary.creditsLeft,
+    creditsAllowance: summary.creditsAllowance,
+    hoursLeft: summary.hoursLeft,
+    hoursAllowance: summary.hoursAllowance,
+    nextAction: snapshot.nextAction,
+  };
 }
 
 let STORE = null;
@@ -126,14 +176,24 @@ async function doSyncStore() {
     return STORE;
   }
   if (mtime && mtime !== STORE_MTIME) {
-    // Keep the freshest in-memory usage for accounts we already track.
+    // Keep the freshest in-memory usage for accounts we already track. Both
+    // sides stamp `usage.fetchedAt`; comparing any other field silently keeps
+    // the stale disk copy and un-exhausts accounts we just marked.
     const live = new Map();
     for (const a of STORE.accounts || []) live.set(a.id, a);
     for (const a of store.accounts || []) {
       const old = live.get(a.id);
-      if (old && old.usage && (!a.usage || (a.usage.measuredAt || '') < (old.usage.measuredAt || ''))) {
+      if (!old || !old.usage) continue;
+      const oldAt = Date.parse(old.usage.fetchedAt || '') || 0;
+      const newAt = Date.parse(a.usage?.fetchedAt || '') || 0;
+      if (oldAt > newAt) {
         a.usage = old.usage;
         a.day = old.day;
+      }
+      // A spend flag set in memory is never older than the disk copy.
+      if (old.tokenBad && !a.tokenBad) {
+        a.tokenBad = old.tokenBad;
+        if (old.lastError) a.lastError = old.lastError;
       }
     }
     const fresh = (store.accounts || []).filter((a) => !live.has(a.id));
@@ -175,9 +235,30 @@ async function doSyncStore() {
 
 // ---------------------------------------------------------------- account glue
 
-async function persist() {
-  if (!STORE) return;
-  try { await saveStore(STORE); } catch (err) { console.error('[proxy] store save failed: ' + err.message); }
+let PERSIST_CHAIN = Promise.resolve();
+
+/**
+ * Every write goes through one chain. saveStore() takes the same temp file
+ * name per process, so two overlapping saves can lose an update or make the
+ * rename fail - and a lost update means the proxy forgets spent credits.
+ */
+function persist() {
+  if (!STORE) return Promise.resolve();
+  PERSIST_CHAIN = PERSIST_CHAIN.then(async () => {
+    if (!STORE) return;
+    try {
+      await saveStore(STORE);
+    } catch (err) {
+      // One retry: a transient rename/lock on Windows should not lose a save.
+      try {
+        await new Promise((r) => setTimeout(r, 50));
+        await saveStore(STORE);
+      } catch (again) {
+        console.error('[proxy] store save failed: ' + again.message);
+      }
+    }
+  });
+  return PERSIST_CHAIN;
 }
 
 function activeAccount() {
@@ -210,7 +291,7 @@ async function chooseAccount() {
       STORE.activeAccountId = target.id;
       target.lastUsedAt = new Date().toISOString();
       await persist();
-      console.log(`[rotator] switch -> ${target.id} (${target.handle || target.email || '?'}) — ${decision.reason}`);
+      console.log(`[rotator] switch -> ${target.id} (${target.handle || target.email || '?'}) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${decision.reason}`);
       return target;
     }
   }
@@ -224,7 +305,7 @@ async function chooseAccount() {
   }
 
   if (decision.action === 'wait') {
-    console.warn(`[rotator] all accounts exhausted; next refill ${decision.until} — requests will fail until then`);
+    console.warn(`[rotator] all accounts exhausted; next refill ${decision.until} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â requests will fail until then`);
     const fallback = activeAccount();
     return fallback; // let upstream answer with the real quota error
   }
@@ -239,13 +320,18 @@ async function chooseAccount() {
   return activeAccount();
 }
 
-/** Candidate accounts to retry with, best first, excluding the failed one. */
-function retryCandidates(excludeId) {
+/**
+ * Candidate accounts to retry with, best first. `exclude` is an id or a set of
+ * ids that already failed for this request: bouncing back to one of them burns
+ * upstream requests without any chance of progress.
+ */
+function retryCandidates(exclude) {
   if (!STORE) return [];
   if (MANUAL_ACCOUNT_ID) return [];
+  const skip = exclude instanceof Set ? exclude : new Set([exclude].filter(Boolean));
   const now = Date.now();
   return STORE.accounts
-    .filter(a => !a.disabled && a.id !== excludeId && !a.tokenBad && a.token && !laneBusy.has(a.id))
+    .filter(a => !a.disabled && !skip.has(a.id) && !a.tokenBad && a.token && !laneBusy.has(a.id))
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
     .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
     .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
@@ -300,14 +386,34 @@ function claimAccount() {
   const account = free[0];
   laneBusy.add(account.id);
   account.lastUsedAt = new Date().toISOString();
+  return { account, release: makeRelease(account) };
+}
+
+/**
+ * Release handle for one lane. Idempotent: several code paths (upstream end,
+ * downstream close, transport error, retry) may race to free the same lane.
+ */
+function makeRelease(account) {
   let released = false;
-  const release = () => {
+  return () => {
     if (released) return;
     released = true;
     laneBusy.delete(account.id);
     setImmediate(pumpClaims);
   };
-  return { account, release };
+}
+
+/**
+ * Claim a specific account's lane (used when the rotator picked an account
+ * before a lane existed). Returns null if that lane is already busy.
+ */
+function claimFor(id) {
+  const account = usableAccounts().find(a => a.id === id) || null;
+  if (!account) return null;
+  if (laneBusy.has(account.id)) return null;
+  laneBusy.add(account.id);
+  account.lastUsedAt = new Date().toISOString();
+  return { account, release: makeRelease(account) };
 }
 
 function laneCount() {
@@ -319,7 +425,7 @@ async function promote(account, reason) {
   STORE.activeAccountId = account.id;
   account.lastUsedAt = new Date().toISOString();
   await persist();
-  console.log(`[rotator] retry on ${account.id} (${account.handle || account.email || '?'}) — ${reason}`);
+  console.log(`[rotator] retry on ${account.id} (${account.handle || account.email || '?'}) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${reason}`);
 }
 
 // ---------------------------------------------------------------- upstream I/O
@@ -426,6 +532,36 @@ function adsRequiredBody() {
   }));
 }
 
+/**
+ * Wrap a raw upstream error payload in the OpenAI error envelope. Clients
+ * render `error.message`; a bare upstream body is silently swallowed.
+ */
+function upstreamErrorBody(raw, fallbackMessage) {
+  let message = fallbackMessage;
+  let type = 'upstream_error';
+  const text = raw && raw.length ? raw.toString() : '';
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      const err = parsed && parsed.error;
+      if (typeof err === 'string' && err) {
+        message = err;
+      } else if (err && typeof err === 'object') {
+        if (err.message) message = String(err.message);
+        if (err.type) type = String(err.type);
+      } else if (typeof parsed.message === 'string' && parsed.message) {
+        message = parsed.message;
+      } else if (typeof parsed.detail === 'string' && parsed.detail) {
+        message = parsed.detail;
+      }
+    } catch {
+      // Not JSON (a proxy or gateway page). Keep the status text only.
+      if (/^[\x20-\x7e\s]{0,300}$/.test(text)) message = text.trim().slice(0, 300) || message;
+    }
+  }
+  return Buffer.from(JSON.stringify({ error: { message, type } }));
+}
+
 async function runAdLoop() {
   const tick = async () => {
     const account = activeAccount();
@@ -457,7 +593,7 @@ async function runUsageLoop() {
         if (target) {
           STORE.activeAccountId = target.id;
           await persist();
-          console.log(`[rotator] proactive switch -> ${target.id} — ${d.reason}`);
+          console.log(`[rotator] proactive switch -> ${target.id} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ${d.reason}`);
         }
       } else if (d.action === 'mint') {
         console.warn(`[rotator] budget exhausted everywhere; new account would be ${d.email}`);
@@ -499,8 +635,12 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
 
       const withAccount = async () => {
         if (!account) {
+          // No lane was claimed (nothing usable at claim time). The fallback
+          // still has to hold a lane, otherwise this request could run beside
+          // another one on the same account and trigger a "concurrent" reject.
           const fallback = await chooseAccount();
-          if (fallback) { account = fallback; releaseLane = () => {}; }
+          const reclaimed = fallback ? claimFor(fallback.id) : null;
+          if (reclaimed) { account = reclaimed.account; releaseLane = reclaimed.release; }
         }
         if (!account || !account.token) {
           releaseLane();
@@ -542,10 +682,23 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     }
 
     function run(account, releaseLane) {
+    // The lane is claimed once for the whole client request. A retry only swaps
+    // the *account*, never the lane: releasing it here would let a queued
+    // request claim the same account and collide with our own retry.
+    let laneReleased = false;
+    const releaseLaneOnce = () => {
+      if (laneReleased) return;
+      laneReleased = true;
+      releaseLane();
+    };
+
     let retries = 0;
-    const send = (token, release) => {
-      let done = false;
-      const finish = () => { if (!done) { done = true; release(); } };
+    const tried = new Set();      // accounts that already failed this request
+    const MAX_RETRIES = 4;        // concurrent races tolerated on one account
+    const MAX_SWAPS = 3;          // account switches for one client request
+    let swaps = 0;
+
+    const send = (token) => {
       const upReq = https.request({
         hostname: 'api.freepi.ai',
         port: 443,
@@ -563,11 +716,28 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           inReq.headers['x-request-id'] ? { 'x-request-id': inReq.headers['x-request-id'] } : {},
         ),
       }, upRes => {
+        if (QUOTA_STATUS.has(upRes.statusCode) && inRes.headersSent) {
+          // The upstream refused us after we had already committed a 200 to the
+          // client (it happens on streamed responses). Nothing can be salvaged,
+          // so make sure the account is retired and the client sees a real
+          // error instead of a silently truncated body.
+          const errChunks = [];
+          upRes.on('data', d => errChunks.push(d));
+          upRes.on('end', () => {
+            markExhausted(account, `upstream ${upRes.statusCode}`);
+            account.usage = account.usage || {};
+            account.usage.remainingCreditsToday = 0;
+            persist().catch(() => {});
+            console.warn(`[rotator] ${account.id} returned ${upRes.statusCode} mid-stream - aborting response`);
+            inRes.destroy(new Error('upstream quota exhausted mid-stream (' + upRes.statusCode + ')'));
+            releaseLaneOnce();
+          });
+          return;
+        }
         if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
           upRes.on('end', () => {
-            finish();
             const raw = Buffer.concat(errChunks);
             // "concurrent" means *we* sent two requests at once, not that the
             // account is out of credits - never mark it exhausted for that.
@@ -575,13 +745,13 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             try { code = JSON.parse(raw.toString()).code || ''; } catch { /* ignore */ }
             if (code === 'concurrent' || raw.toString().includes('one request at a time')) {
               // Another client raced us on this account (e.g. the pi TUI). The
-              // lane is already released by finish(), so retry on it directly.
+              // lane stays ours, so retry on it after a short backoff.
               console.warn('[proxy] upstream said concurrent - retrying after backoff');
               retries++;
-              if (retries > 4) { relay(429, raw); return; }
+              if (retries > MAX_RETRIES) { releaseLaneOnce(); relay(429, raw); return; }
               setTimeout(() => {
-                if (inRes.destroyed) { releaseLane(); return; }
-                send(account.token, releaseLane);
+                if (inRes.destroyed) { releaseLaneOnce(); return; }
+                send(account.token);
               }, 400 * retries);
               return;
             }
@@ -592,21 +762,23 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (upRes.statusCode === 401 && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => { finish(); onUnauthorized(Buffer.concat(errChunks)); });
+          upRes.on('end', () => { onUnauthorized(Buffer.concat(errChunks)); });
           return;
         }
         if (upRes.statusCode === 403 && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
           upRes.on('end', () => {
-            finish();
             const raw = Buffer.concat(errChunks);
+            releaseLaneOnce();
             if (raw.toString().includes('ads_required')) {
               openSponsorPanel();
               relay(403, adsRequiredBody());
               return;
             }
-            relay(403, raw);
+            // Never hand a raw upstream payload to the client: an OpenAI client
+            // expects {error:{message,type}} and otherwise shows nothing useful.
+            relay(403, upstreamErrorBody(raw, 'upstream refused the request (403)'));
           });
           return;
         }
@@ -618,31 +790,32 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
         inRes.writeHead(upRes.statusCode, h);
         upRes.pipe(inRes);
-        upRes.on('end', finish);
-        upRes.on('error', finish);
-        inRes.on('close', finish);
+        upRes.on('end', releaseLaneOnce);
+        upRes.on('error', releaseLaneOnce);
       });
       upReq.on('error', err => {
-        finish();
         console.error('[proxy] upstream error: ' + err.message);
-        if (inRes.destroyed) return;
+        if (inRes.destroyed) { releaseLaneOnce(); return; }
         // The upstream transport failing says nothing about the account, so try
         // a different lane instead of handing the client a 502 straight away.
         if (!inRes.headersSent && retries < 2) {
           retries++;
-          const next = retryCandidates(account.id)[0];
+          tried.add(account.id);
+          const next = retryCandidates(tried)[0];
           if (next) {
             console.warn(`[proxy] ${account.id} unreachable (${err.message}) - retrying on ${next.id}`);
-            setTimeout(() => { if (!inRes.destroyed) send(next.token, releaseLane); }, 300 * retries);
+            account = next;
+            setTimeout(() => { if (!inRes.destroyed) send(next.token); }, 300 * retries);
             return;
           }
         }
         if (!inRes.headersSent) {
+          releaseLaneOnce();
           inRes.writeHead(502, { 'content-type': 'application/json' });
           inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
-        } else { inRes.destroy(err); }
+        } else { inRes.destroy(err); releaseLaneOnce(); }
       });
-      bindRequestLifecycle(upReq, inRes, finish);
+      bindRequestLifecycle(upReq, inRes, releaseLaneOnce);
       upReq.write(body);
       upReq.end();
     };
@@ -653,12 +826,21 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       inRes.end(buf);
     };
 
+    /**
+     * Switch this request to another account while keeping its lane. Accounts
+     * that already failed for this request are never retried: bouncing A->B->A
+     * burns upstream requests without any chance of progress.
+     */
     const tryNext = async (reason) => {
-      if (attempt >= 3) return false;
-      const next = retryCandidates(account.id)[0];
+      if (swaps >= MAX_SWAPS) return false;
+      tried.add(account.id);
+      const next = retryCandidates(tried)[0];
       if (!next) return false;
+      swaps++;
       await promote(next, reason);
-      proxyCompletionsReplay(body, inReq, inRes, attempt + 1, next);
+      account = next;
+      retries = 0;   // a fresh account deserves a fresh "concurrent" budget
+      send(next.token);
       return true;
     };
 
@@ -667,100 +849,29 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       account.usage = account.usage || {};
       account.usage.remainingCreditsToday = 0;
       await persist();
-      console.log(`[rotator] ${account.id} returned ${status} (budget spent) — rotating`);
+      console.log(`[rotator] ${account.id} returned ${status} (budget spent) - rotating`);
       if (await tryNext('budget spent (' + status + ')')) return;
+      releaseLaneOnce();
       relay(status, buf);
     };
 
     const onUnauthorized = async (buf) => {
       markInvalid(account, 'token rejected (401)');
       await persist();
-      console.log(`[rotator] ${account.id} token rejected — rotating`);
+      console.log(`[rotator] ${account.id} token rejected - rotating`);
       if (await tryNext('token rejected')) return;
+      releaseLaneOnce();
       relay(401, buf);
     };
 
     // The lane is already claimed and free-pi allows one request per account,
-    // so go straight upstream. releaseLane fires when the response ends.
+    // so go straight upstream. releaseLaneOnce fires when the response ends.
     if (inRes.destroyed) { releaseLane(); return; }
-    send(account.token, releaseLane);
+    send(account.token);
     }
   });
 }
 
-/**
- * Replay an already-buffered request body against a specific account
- * (used for the retry path so the client body is not consumed twice).
- */
-function proxyCompletionsReplay(body, inReq, inRes, attempt, account) {
-  const upReq = https.request({
-    hostname: 'api.freepi.ai',
-    port: 443,
-    path: '/v1/chat/completions',
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'content-length': body.length,
-      'authorization': 'Bearer ' + account.token,
-      'x-session-id': SESSION_ID,
-      'x-client-version': FREEPI_VERSION,
-      accept: inReq.headers['accept'] || 'application/json',
-    },
-  }, upRes => {
-    if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
-      const errChunks = [];
-      upRes.on('data', d => errChunks.push(d));
-      upRes.on('end', async () => {
-        markExhausted(account, `upstream ${upRes.statusCode}`);
-        account.usage = account.usage || {};
-        account.usage.remainingCreditsToday = 0;
-        await persist();
-        const next = retryCandidates(account.id)[0];
-        if (next && attempt < 3) {
-          await promote(next, 'budget spent');
-          proxyCompletionsReplay(body, inReq, inRes, attempt + 1, next);
-          return;
-        }
-        inRes.writeHead(upRes.statusCode, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-        inRes.end(Buffer.concat(errChunks));
-      });
-      return;
-    }
-    if (upRes.statusCode === 403 && !inRes.headersSent) {
-      const errChunks = [];
-      upRes.on('data', d => errChunks.push(d));
-      upRes.on('end', () => {
-        const raw = Buffer.concat(errChunks);
-        if (raw.toString().includes('ads_required')) {
-          openSponsorPanel();
-          inRes.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-          inRes.end(adsRequiredBody());
-          return;
-        }
-        inRes.writeHead(403, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-        inRes.end(raw);
-      });
-      return;
-    }
-    const h = {
-      'access-control-allow-origin': '*',
-      'content-type': upRes.headers['content-type'] || 'application/json',
-    };
-    if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
-    if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
-    inRes.writeHead(upRes.statusCode, h);
-    upRes.pipe(inRes);
-  });
-  upReq.on('error', err => {
-    console.error('[proxy] upstream error: ' + err.message);
-    if (!inRes.headersSent) {
-      inRes.writeHead(502, { 'content-type': 'application/json' });
-      inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
-    }
-  });
-  upReq.write(body);
-  upReq.end();
-}
 
 // ---------------------------------------------------------------- local server
 
@@ -781,7 +892,7 @@ function startServer(models, sponsorHtml) {
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
 
-  const sponsorPanel = createSponsorPanel({ currentAccount: async () => { await syncStore(); return activeAccount(); }, sessionId: SESSION_ID, usage: usageSnapshot, html: sponsorHtml });
+  const sponsorPanel = createSponsorPanel({ currentAccount: async () => { await syncStore(); return activeAccount(); }, sessionId: SESSION_ID, usage: usageSnapshot, html: sponsorHtml, port: PORT });
   const server = http.createServer(async function(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1:' + PORT);
     if (url.pathname.startsWith('/sponsor')) { await sponsorPanel(req, res, url); return; }
@@ -791,13 +902,43 @@ function startServer(models, sponsorHtml) {
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
+      const body = JSON.stringify({
         object: 'list',
         data: catalog.map(function(m) {
-          return { id: m.id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'free-pi', display_name: m.name };
+          const out = { id: m.id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'free-pi', display_name: m.name };
+          // free-pi doesn't itself say whether a chat model can be prompted with
+          // an image. Default to "yes" so a client that gates attachments on this
+          // flag behaves exactly as it did before the flag existed.
+          out.capabilities = { vision: supportsVision(m.id) };
+          if (m.unavailable) out.unavailable = true;
+          return out;
         }),
-      }));
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(body);
+      return;
+    }
+
+    // Hour budget per account: how many hours of *this* model are still left.
+    // free-pi meters in hours (1 h = 5 bucks) and every model costs a multiple
+    // of the base rate, so the same 15000 credits are only 4.2 hours on a 2.0x
+    // model. ?model=<id> selects the multiplier (default: the cheapest model).
+    if (req.method === 'GET' && url.pathname === '/budget') {
+      syncStore()
+        .catch(() => null)
+        .then(function () {
+          if (res.destroyed || res.writableEnded) return;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(budgetSnapshot(catalog, url.searchParams.get('model')), null, 2));
+        })
+        .catch(function (err) {
+          // Read-only diagnostics must never take the proxy down: without this
+          // an exception inside the snapshot is an unhandled rejection.
+          console.error('[/budget] ' + err.message);
+          if (res.destroyed || res.writableEnded) return;
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'budget snapshot failed', type: 'proxy_error' } }));
+        });
       return;
     }
 
@@ -806,6 +947,7 @@ function startServer(models, sponsorHtml) {
       syncStore()
         .catch(() => null)
         .then(function () {
+          if (res.destroyed || res.writableEnded) return;
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify(usageSnapshot(), null, 2));
         });

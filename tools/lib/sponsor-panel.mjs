@@ -1,20 +1,25 @@
 import crypto from 'node:crypto';
 import { request } from './freepi-api.mjs';
 
-export function createSponsorPanel({ currentAccount, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now }) {
+export function createSponsorPanel({ currentAccount, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now, port = 4000 }) {
   const cookie = crypto.randomBytes(24).toString('hex');
   const pending = new Map();
   const acknowledged = new Set();
   let latest = null;
   let fetching = null;
   let lastDisplay = null;
+  // The panel is only reachable from this machine, on the proxy's own port.
+  // localhost and 127.0.0.1 are the same origin as far as the user is
+  // concerned, so both are accepted (and both appear in the allowlist).
+  const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+  const allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
   const json = (res, status, body) => {
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify(body));
   };
   const authorized = req => {
     const origin = req.headers.origin;
-    return (!origin || origin === 'http://127.0.0.1:4000') &&
+    return (!origin || allowedOrigins.has(origin)) &&
       (req.headers.cookie || '').split(';').some(item => item.trim() === 'freepi_sponsor=' + cookie);
   };
   const safeUrl = value => {
@@ -22,8 +27,23 @@ export function createSponsorPanel({ currentAccount, sessionId, usage, html, api
   };
   async function route(req, res, url) {
     if (!url.pathname.startsWith('/sponsor')) return false;
-    if (!['127.0.0.1:4000', 'localhost:4000'].includes(req.headers.host)) {
+    if (!allowedHosts.has(req.headers.host)) {
       json(res, 403, { error: 'Open this panel from the local proxy address.' }); return true;
+    }
+    // CORS preflight for the panel's own fetch() calls: answer before the
+    // cookie check, because a preflight never carries credentials.
+    if (req.method === 'OPTIONS') {
+      const origin = req.headers.origin;
+      if (origin && !allowedOrigins.has(origin)) { json(res, 403, { error: 'Origin not allowed.' }); return true; }
+      res.writeHead(204, {
+        'access-control-allow-origin': origin || `http://127.0.0.1:${port}`,
+        'access-control-allow-methods': 'GET, POST',
+        'access-control-allow-headers': 'content-type',
+        'access-control-allow-credentials': 'true',
+        'access-control-max-age': '600',
+        vary: 'Origin',
+      });
+      res.end(); return true;
     }
     if (req.method === 'GET' && url.pathname === '/sponsor') {
       res.writeHead(200, {
