@@ -827,6 +827,37 @@ function sponsorProfileDir(id) {
 }
 
 /**
+ * Desktop slot for one account. The allowance of an account is only renewed
+ * while its card is the visible document, and a window is only visible when it
+ * is neither minimised nor fully covered. A browser opens every app window at
+ * the same spot, so without a distinct slot per account only the topmost one
+ * ever counts and the others stay paused.
+ *
+ * Only acc-<n> folders are slots: a browser profile holds dozens of internal
+ * folders and one of them may sit in this directory, which would push the slots
+ * far right. Unknown ids go after the known ones instead of onto slot zero.
+ */
+function sponsorSlots() {
+  const root = path.join(os.homedir(), '.free-pi', 'sponsor-window');
+  let names = [];
+  try {
+    names = fsSync.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^acc-\d+$/.test(entry.name))
+      .map((entry) => entry.name);
+  } catch { names = []; }
+  names.sort((a, b) => Number(a.slice(4)) - Number(b.slice(4)));
+  return names;
+}
+
+function sponsorSlotFor(id) {
+  const names = sponsorSlots();
+  let index = names.indexOf(safeAccountId(id));
+  if (index < 0) index = names.length;
+  const offset = index * 44;
+  return { x: 30 + offset, y: 30 + offset };
+}
+
+/**
  * Open the sponsor window of one account in its own browser profile. Returns
  * true when a process was started, false when nothing was opened. Never throws:
  * this runs in the request path, where a browser problem must not become a 500.
@@ -861,6 +892,7 @@ function openSponsorPanel(account) {
     // component promos all open their own page and then the sponsor card is no
     // longer the visible document, which pauses the allowance for that account.
     fsSync.writeFileSync(path.join(profile, 'First Run'), '', { flag: 'w' });
+    const slot = sponsorSlotFor(key);
     const child = spawn(exe, [
       '--app=' + url,
       '--user-data-dir=' + profile,
@@ -873,6 +905,9 @@ function openSponsorPanel(account) {
       // The card plus the usage grid needs roughly 700px of height; a window
       // smaller than the card would keep the display confirmation paused.
       '--window-size=760,820',
+      // Own place on the desktop, so this window is not covered by the previous
+      // account's window and can confirm its display.
+      '--window-position=' + slot.x + ',' + slot.y,
     ], { detached: true, stdio: 'ignore' });
     child.on('error', (err) => {
       console.error('[sponsor] could not start the sponsor window: ' + err.message);

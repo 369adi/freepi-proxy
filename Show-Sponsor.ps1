@@ -16,8 +16,11 @@ try {
     $list = @()
 }
 if (-not $list -or $list.Count -eq 0) {
-    # Older proxy without /sponsor/accounts: fall back to the active account.
-    $list = @([pscustomobject]@{ id = 'active'; url = ($proxyBase + '/sponsor') })
+    # No account list means the proxy cannot say which accounts exist. Opening a
+    # single window under a made-up 'active' profile would create a profile that
+    # belongs to no account, so say so instead of inventing one.
+    Write-Host 'The proxy did not report any accounts. Nothing to open.'
+    exit 1
 }
 
 $sponsorBrowser = @(
@@ -27,6 +30,16 @@ $sponsorBrowser = @(
     'C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe'
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $sponsorBrowser) { throw 'Install Edge or Chrome, or open ' + $proxyBase + '/sponsor in your browser.' }
+
+# One desktop slot per account, same rule the guardian uses: a window that is
+# covered by the previous account's window never counts as visible.
+$slotIds = @()
+if (Test-Path $sponsorRoot) {
+    $slotIds = @(Get-ChildItem -Path $sponsorRoot -Directory |
+        Where-Object { $_.Name -match '^acc-[0-9]+$' } |
+        Select-Object -ExpandProperty Name)
+}
+$slotIds = @($slotIds | Sort-Object { [int]($_ -replace '^acc-', '') })
 
 $opened = 0
 foreach ($account in $list) {
@@ -39,18 +52,23 @@ foreach ($account in $list) {
         Where-Object { $_.Name -in @('msedge.exe', 'chrome.exe', 'brave.exe') -and $_.CommandLine -like ('*' + $profile + '*') -and $_.CommandLine -like '*--app=*' }
     if ($running) { continue }
 
+    $index = [array]::IndexOf($slotIds, $safeId)
+    if ($index -lt 0) { $index = $slotIds.Count }
+    $offset = $index * 44
+
     New-Item -ItemType Directory -Path $profile -Force | Out-Null
     try { Set-Content -LiteralPath (Join-Path $profile 'First Run') -Value '' -Force } catch { }
     Start-Process -FilePath $sponsorBrowser -ArgumentList @(
         '--app=' + $address,
-        '--user-data-dir="' + $profile + '"',
+        '--user-data-dir=' + $profile,
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-sync',
         '--disable-features=EdgeSyncConfirmation,MsEdgeFirstRunExperience,EdgePromoPopup',
         '--no-service-autorun',
         '--disable-component-update',
-        '--window-size=760,820'
+        '--window-size=760,820',
+        ('--window-position=' + (30 + $offset) + ',' + (30 + $offset))
     ) -WindowStyle Normal
     $opened++
     Write-Host ('sponsor window opened for ' + $account.id + ($(if ($account.handle) { ' (@' + $account.handle + ')' } else { '' })))
