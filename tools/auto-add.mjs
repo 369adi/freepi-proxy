@@ -41,6 +41,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { rememberPassword, rekeySecret, SECRETS_PATH } from './lib/secrets.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -177,6 +178,7 @@ function printStatus() {
   if (!state.accounts.length) {
     console.log('No auto-add runs yet (' + STATE_PATH + ').');
     console.log('store: ' + ((store && store.accounts && store.accounts.length) || 0) + ' account(s), next number ' + ((store && store.nextAccountNumber) || 1));
+    console.log('passwords: ' + SECRETS_PATH + ' (read with tools\\freepi-passwords.mjs)');
     return;
   }
   const by = {};
@@ -195,6 +197,9 @@ function printStatus() {
         flag,
     );
   }
+  console.log('');
+  console.log('passwords are in ' + SECRETS_PATH);
+  console.log('read them with: node tools\\freepi-passwords.mjs');
 }
 
 // ---------------------------------------------------------------- CDP
@@ -699,6 +704,25 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
     const password = makePassword();
     let username = makeUsername(email);
 
+    // Save the password before it is used anywhere. If the run dies mid-signup
+    // the account may still exist on GitHub, and this file is then the only way
+    // back in. Keyed by email for now; re-keyed to the account id once stored.
+    //
+    // A failure here is not cosmetic: the account would be unrecoverable, so the
+    // run stops instead of continuing with a password that exists only in memory.
+    try {
+      await rememberPassword(email, { email, password, note: 'github sign-up, auto-add' });
+    } catch (err) {
+      return {
+        ok: false,
+        stage: 'secrets',
+        needsHuman: true,
+        error: 'could not save the password to ~/.free-pi/proxy/secrets.json: ' + err.message,
+        email,
+        password,
+      };
+    }
+
     // The sign-up profile starts blank so each account is genuinely separate.
     const launched = await launchBrowser(port, profileDir, 'https://github.com/signup');
     child = launched.child;
@@ -796,6 +820,8 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
           needsHuman: true,
           error: 'DataDome CAPTCHA on the sign-up POST - needs a human click',
           email,
+          // The password is already in ~/.free-pi/proxy/secrets.json, but echo it
+          // so a human solving the captcha in this very window can finish by hand.
           password,
         };
       }
@@ -919,9 +945,23 @@ async function addOne({ email, port, profileDir, keepOpen, waitMin, log }) {
       storeMod.recordUsage(store, acc, me);
     }
     await storeMod.saveStore(store);
-    log('written to store as ' + store.accounts[store.accounts.length - 1].id);
+    const stored = store.accounts[store.accounts.length - 1];
+    log('written to store as ' + stored.id);
 
-    return { ok: true, token, handle, email };
+    // Move the password from the email key to the account id, so a later lookup
+    // by either still works and the file reads like the store does.
+    const rekeyed = await rekeySecret(email, stored.id).catch(err => {
+      log('WARNING could not re-key the saved password: ' + err.message);
+      return null;
+    });
+    if (rekeyed && rekeyed.conflict) {
+      // Another password already owned that id. Nothing was lost - the sign-up
+      // password stays reachable under its email - but say so instead of
+      // pretending the file is tidy.
+      log('WARNING a different password already used the key ' + stored.id + '; the new one stays under ' + email);
+    }
+
+    return { ok: true, token, handle, email, accountId: stored.id };
   } catch (err) {
     return { ok: false, stage: 'login', error: err && err.message ? err.message : String(err) };
   } finally {

@@ -486,6 +486,25 @@ The mailbox side is fully automatic: `tools\lib\webmail.mjs` reuses a logged-in
 Chrome profile (`~/.free-pi/mail-profile`) and scrapes the verification link
 from the STRATO webmail DOM, so no IMAP password is needed.
 
+#### Where the generated passwords go
+
+Every account gets a random password. It is written to
+`~/.free-pi/proxy/secrets.json` **before** the sign-up form is submitted, so a
+run that dies halfway still leaves you a way back into an account that may
+already exist on GitHub. The file is keyed by account id (re-keyed from the
+email once the account is stored) and is deliberately separate from
+`accounts.json`, which the running proxy rewrites on every usage poll.
+
+```powershell
+node tools\freepi-passwords.mjs                  # list account, handle, email
+node tools\freepi-passwords.mjs acc-3            # show one password
+node tools\freepi-passwords.mjs gh-4@arisya.de   # look up by email
+```
+
+The list never prints passwords; you have to name the account. On Windows the
+file inherits the profile directory's ACL — `chmod 0600` is only meaningful on
+POSIX, so treat it like an SSH key rather than a vault.
+
 ---
 
 ## No model remapping
