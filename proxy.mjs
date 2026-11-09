@@ -245,7 +245,7 @@ function retryCandidates(excludeId) {
   if (MANUAL_ACCOUNT_ID) return [];
   const now = Date.now();
   return STORE.accounts
-    .filter(a => !a.disabled && a.id !== excludeId && !a.tokenBad && a.token)
+    .filter(a => !a.disabled && a.id !== excludeId && !a.tokenBad && a.token && !laneBusy.has(a.id))
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
     .filter(x => x.state === STATE.READY || x.state === STATE.LOW)
     .sort((x, y) => (y.account.usage?.remainingCreditsToday ?? 0) - (x.account.usage?.remainingCreditsToday ?? 0))
@@ -626,6 +626,17 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         finish();
         console.error('[proxy] upstream error: ' + err.message);
         if (inRes.destroyed) return;
+        // The upstream transport failing says nothing about the account, so try
+        // a different lane instead of handing the client a 502 straight away.
+        if (!inRes.headersSent && retries < 2) {
+          retries++;
+          const next = retryCandidates(account.id)[0];
+          if (next) {
+            console.warn(`[proxy] ${account.id} unreachable (${err.message}) - retrying on ${next.id}`);
+            setTimeout(() => { if (!inRes.destroyed) send(next.token, releaseLane); }, 300 * retries);
+            return;
+          }
+        }
         if (!inRes.headersSent) {
           inRes.writeHead(502, { 'content-type': 'application/json' });
           inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
