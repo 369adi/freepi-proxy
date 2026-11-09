@@ -53,14 +53,29 @@ test('a displayed ad cannot confirm an impression for a different account', asyn
 });
 test('browser visibility gate rejects a hidden, clipped or off-screen sponsor', () => {
   const html = fs.readFileSync(new URL('./sponsor.html', import.meta.url), 'utf8');
-  const gate = html.match(/function visible\(\)\{[^\n]+\}/)[0];
+  const gate = html.match(/function visible\(\)\{[\s\S]*?\n\}/)[0];
   let rect = { width: 600, height: 150, top: 30, bottom: 180 };
-  const context = { document: { visibilityState: 'visible' }, ratio: 1, innerHeight: 600, card: { getBoundingClientRect: () => rect } };
+  const context = { document: { visibilityState: 'visible' }, ratio: 1, innerHeight: 600, window: { scrollY: 0 }, card: { getBoundingClientRect: () => rect } };
   vm.createContext(context); vm.runInContext(gate, context);
   assert.equal(context.visible(), true);
   context.document.visibilityState = 'hidden'; assert.equal(context.visible(), false);
-  context.document.visibilityState = 'visible'; rect.bottom = 700; assert.equal(context.visible(), false);
-  rect.bottom = 180; context.ratio = .4; assert.equal(context.visible(), false);
+  context.document.visibilityState = 'visible';
+  // A card taller than the window is accepted only while it starts at the top;
+  // a card pushed below the fold or scrolled away must never confirm anything.
+  rect = { width: 600, height: 900, top: 0, bottom: 900 }; context.window.scrollY = 0;
+  assert.equal(context.visible(), true);
+  rect = { width: 600, height: 900, top: -700, bottom: 200 }; context.window.scrollY = 700;
+  assert.equal(context.visible(), false);
+  rect = { width: 600, height: 150, top: 620, bottom: 770 }; context.window.scrollY = 0;
+  assert.equal(context.visible(), false);
+  // Too small to be readable, or almost entirely cut off, is not a display.
+  rect = { width: 150, height: 400, top: 10, bottom: 410 };
+  assert.equal(context.visible(), false);
+  rect = { width: 600, height: 400, top: 500, bottom: 900 };
+  assert.equal(context.visible(), false);
+  // The intersection ratio no longer gates on its own; geometry does.
+  rect = { width: 600, height: 150, top: 30, bottom: 180 }; context.ratio = .4;
+  assert.equal(context.visible(), true);
 });
 test('premium balances and consumption are tracked separately without double counting components', () => {
   const store = emptyStore(), account = { id: 'example', history: [] }, now = Date.now();

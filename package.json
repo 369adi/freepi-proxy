@@ -14,7 +14,7 @@
     "status": "node tools/freepi-accounts.mjs status",
     "plan": "node tools/freepi-accounts.mjs plan",
     "refresh": "node tools/freepi-accounts.mjs refresh",
-    "test": "node --test tools/test-policy.test.mjs tools/test-budget.test.mjs tools/test-store.test.mjs tools/test-sponsor-usage.test.mjs tools/test-request-lifecycle.test.mjs plugin/test/manual-selection.test.mjs plugin/test/lifecycle.test.mjs plugin/test/history.test.mjs tools/test-sponsor-accounts.test.mjs tools/test-signup-redirect.test.mjs tools/test-catalog-refresh.test.mjs tools/test-store-bom.test.mjs tools/test-visible-allowance.test.mjs && node tools/test-login-stall.mjs && node tools/test-login-passive.mjs"
+    "test": "node --test tools/test-policy.test.mjs tools/test-budget.test.mjs tools/test-store.test.mjs tools/test-sponsor-usage.test.mjs tools/test-request-lifecycle.test.mjs plugin/test/manual-selection.test.mjs plugin/test/lifecycle.test.mjs plugin/test/history.test.mjs tools/test-sponsor-accounts.test.mjs tools/test-signup-redirect.test.mjs tools/test-catalog-refresh.test.mjs tools/test-store-bom.test.mjs tools/test-visible-allowance.test.mjs tools/test-sponsor-visibility.test.mjs && node tools/test-login-stall.mjs && node tools/test-login-passive.mjs"
   },
   "bin": {
     "freepi-proxy": "proxy.mjs"

@@ -15,7 +15,20 @@ const card=document.querySelector('#ad'),state=document.querySelector('#state');
 const accountId=new URLSearchParams(location.search).get('account');
 const q=accountId?'?account='+encodeURIComponent(accountId):'';
 new IntersectionObserver(entries=>{ratio=entries[0].intersectionRatio;},{threshold:[0,1]}).observe(card);
-function visible(){const r=card.getBoundingClientRect();return document.visibilityState==='visible'&&ratio>=.999&&r.width>200&&r.height>70&&r.top>=0&&r.bottom<=innerHeight;}
+// A sponsor display only counts when the card is genuinely on screen. Two shapes
+// qualify: the whole card fits into the window, or the card is taller than the
+// window and is scrolled to the top so the reader sees it from its first pixel.
+// The second case exists because a small window never fits the card, and blocking
+// on that would pause the allowance of every account on a small screen.
+function visible(){
+  if(document.visibilityState!=='visible')return false;
+  const r=card.getBoundingClientRect();
+  if(r.width<=200||r.height<=70)return false;
+  const shown=Math.min(r.bottom,innerHeight)-Math.max(r.top,0);
+  const fits=r.top>=0&&r.bottom<=innerHeight;
+  const fillsTop=window.scrollY<=8&&shown>=innerHeight*0.9;
+  return (fits||fillsTop)&&shown>=Math.min(r.height,innerHeight)*0.9;
+}
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US'):'Not reported';
 function usage(data){const account=(data?.accounts||[]).find(a=>a.id===data.activeAccountId);if(!account)return;const fields=[['Daily allowance',fmt(account.remaining)+' / '+fmt(account.allowance)],['Premium credits',fmt(account.premiumCredits)],['Purchased premium',fmt(account.premiumBoughtCredits)],['Gifted premium',fmt(account.premiumGiftedCredits)]];const root=document.querySelector('#usage');root.replaceChildren();for(const [label,value] of fields){const box=document.createElement('div');box.className='metric';const title=document.createElement('span'),number=document.createElement('strong');title.textContent=label;number.textContent=value;box.append(title,number);root.append(box);}}
 async function load(){if(busy||document.visibilityState!=='visible')return;busy=true;try{const r=await fetch('/sponsor/ad'+q,{cache:'no-store',signal:AbortSignal.timeout(25000)}),data=await r.json();if(!r.ok)throw Error(data.error||'Sponsor unavailable');current=data;sent=false;visibleSince=0;lastFetch=Date.now();document.querySelector('#account').textContent=data.account||'';document.querySelector('#headline').textContent=data.noAd?'No sponsor available right now':data.creative.headline;document.querySelector('#body').textContent=data.creative?.body||'';const link=document.querySelector('#link');link.removeAttribute('href');link.textContent='';if(data.url){link.href=data.url;link.textContent=data.creative.cta+' ↗';}usage(data.usage);state.textContent=data.noAd?'No display confirmation sent.':'Sponsor loaded. Waiting for a visible display…';}catch(error){state.textContent=error.message;lastFetch=Date.now()-45000;}finally{busy=false;}}

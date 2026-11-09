@@ -9,6 +9,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
@@ -37,6 +38,11 @@ const SESSION_ID = crypto.randomUUID();
 //   2. a FIFO queue, so extra requests wait instead of failing.
 const MAX_QUEUE = Number(process.env.FREEPI_MAX_QUEUE ?? 64);
 
+// Opening a sponsor window when free-pi asks for one. On by default, because
+// without a visible ad the account stays locked; FREEPI_AUTO_SPONSOR=0 turns it
+// off completely (no window, no log line).
+const AUTO_SPONSOR = process.env.FREEPI_AUTO_SPONSOR !== '0';
+
 /**
  * Queue a request that found no free account lane. The callback is retried
  * every time a lane frees up. Unlike enqueue() this does not reserve an
@@ -44,16 +50,25 @@ const MAX_QUEUE = Number(process.env.FREEPI_MAX_QUEUE ?? 64);
  */
 const claimWaiters = [];
 
-function enqueueClaim(attemptClaim) {
+function enqueueClaim(attemptClaim, extra = {}) {
   // Cancelled waiters must not consume queue slots: pruning here keeps a long
   // outage from reporting 64 waiting requests when nobody is waiting anymore.
   for (let i = claimWaiters.length - 1; i >= 0; i--) {
     if (claimWaiters[i].cancelled) claimWaiters.splice(i, 1);
   }
   if (claimWaiters.length >= MAX_QUEUE) return { accepted: false };
-  const waiter = { attemptClaim, cancelled: false };
+  // extra.pinnedId marks a waiter that wants one specific account lane: it is
+  // only handed out once that lane is free, never a random free lane.
+  const waiter = { attemptClaim, cancelled: false, ...extra };
   claimWaiters.push(waiter);
-  const position = claimWaiters.length;
+  const position = claimWaiters.indexOf(waiter) + 1;
+  // A waiter that only wants one specific account (pinned) must not be STARVED
+  // behind pinned waiters for a lane it cannot use: drop it into its own group
+  // ahead of them. Unpinned waiters keep plain FIFO among themselves.
+  if (!extra.pinnedId) {
+    const at = claimWaiters.findIndex(w => w.pinnedId);
+    if (at !== -1) { claimWaiters.pop(); claimWaiters.splice(at, 0, waiter); }
+  }
   if (position > 0) console.log('[queue] waiting for a free account lane, position ' + position);
   return {
     accepted: true,
@@ -72,9 +87,25 @@ function pumpClaims() {
   for (let i = 0; i < claimWaiters.length; i++) {
     const waiter = claimWaiters[i];
     if (waiter.cancelled) { claimWaiters.splice(i, 1); i--; continue; }
-    if (!usableAccounts().some(a => !laneBusy.has(a.id))) return; // no lane free
+    let claimed = false;
+    if (waiter.pinnedId) {
+      // A pinned waiter only competes for its own lane. Handing it a different
+      // one would silently break the x-freepi-account guarantee.
+      if (laneBusy.has(waiter.pinnedId)) continue;
+    } else if (!usableAccounts().some(a => !laneBusy.has(a.id))) return; // no lane free
     claimWaiters.splice(i, 1);
-    try { waiter.attemptClaim(); } catch (e) { console.error('[queue] ' + e.message); }
+    try { claimed = waiter.attemptClaim() === true; } catch (e) { console.error('[queue] ' + e.message); }
+    // attemptClaim can fail even though a lane looked free: a parallel claimFor
+    // or another waiter took it in between. Dropping the waiter here used to
+    // lose it for good - it was gone from the queue and hung until the client
+    // timed out. Put it back (at the front, it was first) so the next release
+    // pumps it again.
+    if (!claimed && !waiter.cancelled) {
+      claimWaiters.splice(i, 0, waiter);
+      // Back at the same index: never re-run an attempt that keeps failing in
+      // this pass, the next release() starts a fresh one.
+      continue;
+    }
     i = -1; // re-check from the start: the claim may have taken the last lane
   }
 }
@@ -469,6 +500,15 @@ function inAdCooldown(id, now = Date.now()) {
 // several subagents needs real parallelism. So each account is a lane: a request
 // claims a free account, runs on it, and frees it again. With N accounts we get
 // N truly concurrent requests; a request only queues when every lane is busy.
+//
+// `laneBusy` is a Set of account ids on purpose, and that is NOT a container
+// choice to revisit: free-pi's limit is exactly one in-flight request per
+// account. Raising it (e.g. to a Map with a counter > 1) makes the upstream
+// answer the second request with `concurrent` (429) or `concurrent_session`
+// (409) - the requests then fail instead of running in parallel. Extra
+// parallelism must come from more accounts, never from more slots per account.
+
+const CONCURRENCY_PER_ACCOUNT = 1;
 
 const laneBusy = new Set();   // account ids currently serving a request
 
@@ -547,6 +587,74 @@ function claimFor(id) {
 
 function laneCount() {
   return usableAccounts().length;
+}
+
+// ------------------------------------------------- pinned account (per request)
+//
+// A caller may reserve one account for a request with the header
+// `x-freepi-account: <id|handle>`. Unlike the global MANUAL_ACCOUNT_ID (which
+// narrows the pool for every request) this pin applies to a single request and
+// is honoured without ever falling back to another account: the caller chose
+// that account, a silent swap would send the work to the wrong quota.
+const PIN_HEADER = 'x-freepi-account';
+const PIN_WAIT_TIMEOUT_MS = Math.max(0, Number(process.env.FREEPI_PIN_WAIT_MS ?? 120000));
+
+/** 409 for a pin we cannot honour: unusable account, or lane still busy. */
+function sendPinnedError(status, id, account, code) {
+  const label = (account && (account.handle || account.id)) || id;
+  const why = pinnedUnusableReason(account);
+  const headers = { 'content-type': 'application/json', 'access-control-allow-origin': '*' };
+  let message;
+  if (code === 'account_busy') {
+    const retryAfter = Math.max(1, Math.ceil(PIN_WAIT_TIMEOUT_MS / 1000));
+    headers['retry-after'] = String(retryAfter);
+    message = 'account \'' + label + '\' is busy (one request per account) and no lane '
+      + 'freed up within ' + retryAfter + 's. Retry after ' + retryAfter + 's.';
+  } else {
+    message = 'account \'' + label + '\' cannot be used right now: '
+      + (why || 'state ' + (account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing')) + '.';
+  }
+  const payload = {
+    error: {
+      message,
+      type: 'invalid_request_error',
+      param: PIN_HEADER,
+      code,
+      ...(code === 'account_busy' ? { retry_after: Math.ceil(PIN_WAIT_TIMEOUT_MS / 1000) } : {}),
+      account: id,
+      state: account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing',
+    },
+  };
+  headers['content-length'] = Buffer.byteLength(JSON.stringify(payload));
+  return { status, headers, body: JSON.stringify(payload) };
+}
+
+/** Account id for a pin value: exact id or handle, both case-insensitive. */
+function resolvePinnedAccountId(raw) {
+  const want = String(raw ?? '').trim().toLowerCase();
+  if (!want || !STORE) return null;
+  const accounts = STORE.accounts || [];
+  const byId = accounts.find(a => String(a.id || '').toLowerCase() === want);
+  if (byId) return byId.id;
+  const byHandle = accounts.find(a => String(a.handle || '').toLowerCase() === want);
+  return byHandle ? byHandle.id : null;
+}
+
+/** True when the header name is the pin header (it must never go upstream). */
+function isPinHeader(name) {
+  return String(name || '').toLowerCase() === PIN_HEADER;
+}
+
+/** Why a pinned account cannot serve right now, or null when it can. */
+function pinnedUnusableReason(account, now = Date.now()) {
+  if (!account) return 'missing';
+  if (!account.token) return 'no credential';
+  if (account.disabled) return 'disabled';
+  if (account.tokenBad) return 'token rejected (' + (account.lastError || '401') + ')';
+  const state = stateOf(account, now, STORE ? STORE.settings : {});
+  if (!USABLE.has(state)) return 'state ' + state;
+  if (inAdCooldown(account.id, now)) return 'waiting for a sponsor ad';
+  return null;
 }
 
 async function promote(account, reason) {
@@ -663,46 +771,137 @@ function renderAd(ad) {
 // passing a bare 403 to the client.
 const SPONSOR_URL = 'http://127.0.0.1:' + PORT + '/sponsor';
 const SPONSOR_NUDGE_MS = 5 * 60 * 1000;
-const sponsorNudgedAt = new Map();   // account id -> last time we opened its panel
+// One app window per account at most per cooldown window. In memory on purpose:
+// after a proxy restart a fresh attempt is fine, the browser window survives.
+const SPONSOR_WINDOW_COOLDOWN_MS = 600_000;
+const sponsorNudgedAt = new Map();   // account id -> last successful window open
+
+// At most this many sponsor windows are started per pass. With many accounts
+// every request path could hit ads_required at once and spawn a window each,
+// which would flood the desktop and the memory. The rest are simply tried on
+// their next blocked request, so nothing is lost.
+const SPONSOR_MAX_OPEN_PER_PASS = 2;
+let sponsorOpenBudgetAt = 0;
+let sponsorOpenBudgetLeft = SPONSOR_MAX_OPEN_PER_PASS;
+
+function takeSponsorOpenSlot(now) {
+  if (now - sponsorOpenBudgetAt >= 60_000) {
+    sponsorOpenBudgetAt = now;
+    sponsorOpenBudgetLeft = SPONSOR_MAX_OPEN_PER_PASS;
+  }
+  if (sponsorOpenBudgetLeft <= 0) return false;
+  sponsorOpenBudgetLeft -= 1;
+  return true;
+}
 
 /** Window URL for one account; every account needs its own. */
 function sponsorUrlFor(account) {
   return account?.id ? SPONSOR_URL + '?account=' + encodeURIComponent(account.id) : SPONSOR_URL;
 }
 
+// Chrome/Edge app windows with a dedicated profile, so sponsorship of several
+// accounts never mixes with the user's own browser session. Same pattern as
+// Show-Sponsor.ps1: one profile directory per account.
+const SPONSOR_BROWSERS = [
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+];
+
+let sponsorBrowserPath;   // undefined = not looked up yet, null = none found
+let sponsorBrowserWarned = false;
+
+function findSponsorBrowser() {
+  if (sponsorBrowserPath !== undefined) return sponsorBrowserPath;
+  sponsorBrowserPath = SPONSOR_BROWSERS.find(p => fsSync.existsSync(p)) || null;
+  return sponsorBrowserPath;
+}
+
+function safeAccountId(id) {
+  return String(id || 'active').replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+function sponsorProfileDir(id) {
+  return path.join(os.homedir(), '.free-pi', 'sponsor-window', safeAccountId(id));
+}
+
+/**
+ * Open the sponsor window of one account in its own browser profile. Returns
+ * true when a process was started, false when nothing was opened. Never throws:
+ * this runs in the request path, where a browser problem must not become a 500.
+ */
 function openSponsorPanel(account) {
+  if (!AUTO_SPONSOR) return false;
+  // Must match safeAccountId's own fallback ('active'), otherwise the same
+  // account ends up with two profiles: proxy.mjs used '-', Show-Sponsor.ps1
+  // uses 'active' - two windows, separate logins, both fighting over the ad.
+  const key = safeAccountId(account?.id);
   const now = Date.now();
-  const key = account?.id || '-';
   // Per account: a blocked account needs its own window even when another one
   // was opened a moment ago.
-  if (now - (sponsorNudgedAt.get(key) || 0) < SPONSOR_NUDGE_MS) return false;
-  sponsorNudgedAt.set(key, now);
+  if (now - (sponsorNudgedAt.get(key) || 0) < SPONSOR_WINDOW_COOLDOWN_MS) return false;
+  // Throttle across accounts as well, so a burst of blocked accounts does not
+  // open a whole screenful of windows within the same second.
+  if (!takeSponsorOpenSlot(now)) return false;
+  const exe = findSponsorBrowser();
+  if (!exe) {
+    if (!sponsorBrowserWarned) {
+      sponsorBrowserWarned = true;
+      console.error('[sponsor] no Edge/Chrome/Brave found - open ' + SPONSOR_URL + ' manually or set FREEPI_AUTO_SPONSOR=0');
+    }
+    return false;
+  }
   const url = sponsorUrlFor(account);
-  console.log('[sponsor] free-pi asked for a sponsor view - opening ' + url);
+  const profile = sponsorProfileDir(key);
   try {
-    // `start` needs an empty title argument; the URL is ours, not user input.
-    const child = spawn('cmd', ['/c', 'start', '', url], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
+    fsSync.mkdirSync(profile, { recursive: true });
+    const child = spawn(exe, [
+      '--app=' + url,
+      '--user-data-dir=' + profile,
+      '--no-first-run',
+      '--no-default-browser-check',
+      // The card plus the usage grid needs roughly 700px of height; a window
+      // smaller than the card would keep the display confirmation paused.
+      '--window-size=760,820',
+    ], { detached: true, stdio: 'ignore' });
+    child.on('error', (err) => {
+      console.error('[sponsor] could not start the sponsor window: ' + err.message);
     });
-    child.on('error', () => {});
     child.unref();
   } catch (err) {
     console.error('[sponsor] could not open a browser: ' + err.message);
+    return false;
   }
+  // Stamp only after a successful start, so a failed attempt does not lock the
+  // account out of a retry for the whole cooldown window.
+  sponsorNudgedAt.set(key, now);
+  console.log('[sponsor] free-pi asked for a sponsor view - opening ' + url + ' (profile ' + profile + ')');
   return true;
 }
 
-/** Turn an upstream ads_required body into an actionable error for the client. */
-function adsRequiredBody() {
+/** ISO timestamp of the last sponsor window we opened for this account. */
+function sponsorWindowAt(id) {
+  const at = sponsorNudgedAt.get(id);
+  return at ? new Date(at).toISOString() : null;
+}
+
+/**
+ * Turn an upstream ads_required body into an actionable error for the client.
+ * `opened` says whether a window was really started - the message must not
+ * claim one when FREEPI_AUTO_SPONSOR=0 or no browser was found.
+ */
+function adsRequiredBody(opened) {
   return Buffer.from(JSON.stringify({
     error: {
       message:
-        'free-pi requires a sponsor view for this account. ' + SPONSOR_URL +
-        ' was opened - keep the card visible for a moment, then retry.',
+        'free-pi requires a sponsor view for this account. ' +
+        (opened
+          ? SPONSOR_URL + ' was opened - keep the card visible for a moment, then retry.'
+          : 'Open ' + SPONSOR_URL + ' in a browser, keep the card visible for a moment, then retry.'),
       type: 'ads_required',
       sponsor_url: SPONSOR_URL,
+      sponsor_window_opened: opened === true,
     },
   }));
 }
@@ -858,14 +1057,60 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       return;
     }
 
+    // Optional per-request account pin: x-freepi-account: <id|handle>, matched
+    // case-insensitively. Resolved BEFORE a lane is claimed so a bad pin cannot
+    // steal a lane from a legitimate request. The header is read here and never
+    // forwarded upstream (see the whitelist in send()).
+    const pinRaw = inReq.headers[PIN_HEADER];
+    let pinnedAccountId = null;
+    if (typeof pinRaw === 'string' && pinRaw.trim()) {
+      pinnedAccountId = resolvePinnedAccountId(pinRaw);
+      if (!pinnedAccountId) {
+        inRes.writeHead(404, { 'content-type': 'application/json' });
+        inRes.end(JSON.stringify({
+          error: {
+            message: 'account \'' + pinRaw.trim() + '\' not found',
+            type: 'invalid_request_error',
+            param: PIN_HEADER,
+            code: 'account_not_found',
+          },
+        }));
+        return;
+      }
+      const pinnedAccount = STORE ? findAccount(STORE, pinnedAccountId) : null;
+      const why = pinnedUnusableReason(pinnedAccount);
+      if (why) {
+        const pinned = sendPinnedError(409, pinnedAccountId, pinnedAccount, 'account_unusable');
+        inRes.writeHead(pinned.status, pinned.headers);
+        inRes.end(pinned.body);
+        return;
+      }
+    }
+
     // Take a free account lane if one exists; otherwise wait in the queue and
     // claim a lane as soon as another request frees it.
+    //
+    // `pin` holds the account id a caller forced with x-freepi-account. It is a
+    // local variable of exactly this request: every claim below uses claimFor(pin)
+    // and every retry path is told about it, so the pin survives the whole
+    // request and is never widened to "any account".
+    const pin = pinnedAccountId;
     const start = (claimed) => {
       let account = claimed ? claimed.account : null;
       let releaseLane = claimed ? claimed.release : () => {};
 
       const withAccount = async () => {
-        if (!account) {
+        if (!account && pin) {
+          // A pinned request never falls back: the account may have become
+          // unusable while it waited, and running on another lane would silently
+          // break the reservation.
+          const pinned = STORE ? findAccount(STORE, pin) : null;
+          releaseLane();
+          if (pinnedUnusableReason(pinned)) { relayPinnedError(pin, pinned, 'account_unusable'); return; }
+          const reclaimed = claimFor(pin);
+          if (reclaimed) { account = reclaimed.account; releaseLane = reclaimed.release; }
+        }
+        if (!account && !pin) {
           // No lane was claimed (nothing usable at claim time). The fallback
           // still has to hold a lane, otherwise this request could run beside
           // another one on the same account and trigger a "concurrent" reject.
@@ -875,6 +1120,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         }
         if (!account || !account.token) {
           releaseLane();
+          if (pin) { relayPinnedError(pin, STORE ? findAccount(STORE, pin) : null, 'account_unusable'); return; }
           inRes.writeHead(503, { 'content-type': 'application/json' });
           inRes.end(JSON.stringify({
             error: {
@@ -890,14 +1136,17 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     };
 
     const tryClaim = () => {
-      const claimed = claimAccount();
+      // Pinned: only that lane is acceptable. claimAccount() must not be asked -
+      // it would hand out any free lane and void the reservation.
+      const claimed = pin ? claimFor(pin) : claimAccount();
       if (claimed) { start(claimed); return true; }
       return false;
     };
 
     if (!tryClaim()) {
       // Every lane busy: queue, and claim a lane when one frees up.
-      const slot = enqueueClaim(() => { tryClaim(); });
+      let pinTimer = null;
+      const slot = enqueueClaim(() => { tryClaim(); }, pin ? { pinnedId: pin } : {});
       if (!slot.accepted) {
         inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
         inRes.end(JSON.stringify({
@@ -908,7 +1157,23 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         }));
         return;
       }
-      inRes.on('close', () => { if (!inRes.writableEnded) slot.cancel?.(); });
+      if (pin) {
+        // The caller picked this account on purpose, so waiting beats a 409 in a
+        // retry loop - but not forever. When the lane is still occupied after
+        // the timeout the answer is an explicit, retryable 409.
+        pinTimer = setTimeout(() => {
+          if (inRes.writableEnded || inRes.destroyed) return;
+          slot.cancel?.();
+          const bodyPin = sendPinnedError(409, pin, STORE ? findAccount(STORE, pin) : null, 'account_busy');
+          inRes.writeHead(409, bodyPin.headers);
+          inRes.end(bodyPin.body);
+        }, PIN_WAIT_TIMEOUT_MS);
+        pinTimer.unref?.();
+      }
+      inRes.on('close', () => {
+        if (pinTimer) clearTimeout(pinTimer);
+        if (!inRes.writableEnded) slot.cancel?.();
+      });
       return;
     }
 
@@ -929,23 +1194,28 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     const MAX_SWAPS = 3;          // account switches for one client request
     let swaps = 0;
 
+    // Upstream headers are an explicit whitelist, never a copy of inReq.headers.
+    // That is what keeps x-freepi-account (and every other client header) local:
+    // there is no spread of inReq.headers here, and isPinHeader() below is a
+    // second guard in case someone adds one later.
+    const upstreamHeaders = {
+      'content-type': 'application/json',
+      'content-length': body.length,
+      'x-session-id': SESSION_ID,
+      'x-client-version': FREEPI_VERSION,
+    };
+    for (const [name, value] of Object.entries(inReq.headers)) {
+      if (isPinHeader(name)) continue;
+      if (name === 'accept' || name === 'x-request-id') upstreamHeaders[name] = value;
+    }
+
     const send = (token) => {
       const upReq = https.request({
         hostname: 'api.freepi.ai',
         port: 443,
         path: '/v1/chat/completions',
         method: 'POST',
-        headers: Object.assign(
-          {
-            'content-type': 'application/json',
-            'content-length': body.length,
-            'authorization': 'Bearer ' + token,
-            'x-session-id': SESSION_ID,
-            'x-client-version': FREEPI_VERSION,
-          },
-          inReq.headers['accept']        ? { accept: inReq.headers['accept'] } : {},
-          inReq.headers['x-request-id'] ? { 'x-request-id': inReq.headers['x-request-id'] } : {},
-        ),
+        headers: { ...upstreamHeaders, authorization: 'Bearer ' + token },
       }, upRes => {
         if (QUOTA_STATUS.has(upRes.statusCode) && inRes.headersSent) {
           // The upstream refused us after we had already committed a 200 to the
@@ -1024,8 +1294,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
               // so the next requests go to a working account instead of
               // repeating the same 403 on every call.
               markAdsRequired(account.id);
-              openSponsorPanel(account);
-              relay(403, adsRequiredBody());
+              // A browser problem must never turn this 403 into a 500: the
+              // account stays parked either way, the window is only a courtesy.
+              let opened = false;
+              try { opened = openSponsorPanel(account) === true; } catch (e) { console.error('[sponsor] ' + e.message); }
+              relay(403, adsRequiredBody(opened));
               return;
             }
             // Never hand a raw upstream payload to the client: an OpenAI client
@@ -1061,7 +1334,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (!inRes.headersSent && retries < 2) {
           retries++;
           tried.add(account.id);
-          const next = retryCandidates(tried)[0];
+          const next = pin ? null : retryCandidates(tried)[0];
           if (next) {
             console.warn(`[proxy] ${account.id} unreachable (${err.message}) - retrying on ${next.id}`);
             account = next;
@@ -1089,12 +1362,27 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       inRes.end(buf);
     };
 
+    /** Same as relay(), for a pin error built by sendPinnedError(). */
+    const relayPinnedError = (id, acc, code) => {
+      const err = sendPinnedError(409, id, acc, code);
+      if (inRes.headersSent) { inRes.end(); return; }
+      inRes.writeHead(err.status, err.headers);
+      inRes.end(err.body);
+    };
+
     /**
      * Switch this request to another account while keeping its lane. Accounts
      * that already failed for this request are never retried: bouncing A->B->A
      * burns upstream requests without any chance of progress.
      */
     const tryNext = async (reason) => {
+      // A pinned request retries on its own account or not at all. Swapping in
+      // another account would hand the caller's work to a quota it did not
+      // choose, so the pin wins over the swap budget in every case.
+      if (pin) {
+        console.warn('[proxy] ' + pin + ' pinned by x-freepi-account - not switching (' + reason + ')');
+        return false;
+      }
       if (swaps >= MAX_SWAPS) return false;
       tried.add(account.id);
       const next = retryCandidates(tried)[0];
@@ -1164,11 +1452,18 @@ function usageSnapshot() {
     nextAction: MANUAL_ACCOUNT_ID ? { action: 'manual', accountId: MANUAL_ACCOUNT_ID } : STORE ? decide(STORE, now, STORE.settings) : null,
     totals: STORE ? STORE.totals : null,
     queue: queueDepth(),
+    // The upstream limit every caller has to plan around: free-pi serves one
+    // request per account, so N accounts allow N parallel requests, never more.
+    concurrencyPerAccount: CONCURRENCY_PER_ACCOUNT,
     accounts: (STORE ? STORE.accounts : []).map(a => ({
       ...describe(a, now, STORE.settings),
       // true while free-pi wants a sponsor view for this account; the window at
       // /sponsor?account=<id> clears it once the ad was really displayed.
       adsRequired: inAdCooldown(a.id, now),
+      // ISO time of the last sponsor window this proxy opened for the account,
+      // null when none was opened yet. Informational only: the window must stay
+      // visible for free-pi to record the impression itself.
+      sponsorWindowAt: sponsorWindowAt(a.id),
       // free-pi advertises a set of "Free Unlimited" models, but it only stops
       // billing for them while the upstream reports a visible allowance. If
       // that flag is false the same models silently draw down the daily
@@ -1181,6 +1476,11 @@ function usageSnapshot() {
       // looks healthy while one account quietly does all the work.
       lastUsedAt: a.lastUsedAt || null,
       busy: laneBusy.has(a.id),
+      // True when `x-freepi-account: <id>` would be accepted right now - the
+      // exact condition claimFor() uses (usable state, token, free lane, no ad
+      // cooldown). A caller can plan its pin from this instead of probing.
+      selectable: USABLE.has(stateOf(a, now, STORE ? STORE.settings : {}))
+        && !!a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now),
     })),
     // The hour picture the dollar-like credit numbers hide. free-pi meters in
     // hours (1 h = 5000 credits) and each model costs a multiple of the base
@@ -1303,6 +1603,23 @@ function startServer(models, sponsorHtml) {
     // Let browser clients read which lane served a request (see send()).
     res.setHeader('access-control-expose-headers', 'x-free-pi-account, x-free-pi-handle');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    // Cheap liveness probe for the supervisor. Must answer from memory only:
+    // no account, no lane, no upstream. A busy proxy is a healthy proxy, so
+    // this endpoint stays instant even while every lane is taken - otherwise
+    // the supervisor kills the proxy in the middle of a running request.
+    if (req.method === 'GET' && url.pathname === '/health') {
+      const body = JSON.stringify({
+        status: 'ok',
+        uptimeSeconds: Math.floor(process.uptime()),
+        inFlight: queueDepth().inFlight,
+        waiting: queueDepth().waiting,
+        accounts: STORE ? STORE.accounts.length : 0,
+      });
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(body);
+      return;
+    }
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       const body = JSON.stringify({
