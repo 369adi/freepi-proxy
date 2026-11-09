@@ -403,6 +403,26 @@ curl http://127.0.0.1:4000/usage     # -> "queue": { inFlight, waiting, lanes }
 So: a harness running 3 subagents in parallel wants 3 accounts. Everything above
 that queues and still completes.
 
+### The other concurrency limit: parallel *sessions*
+
+Separate from `concurrent`, free-pi also caps how many CLI sessions one signed-in
+account may have open at once (4). Crashed or abandoned runs keep their slot until
+it expires, and the upstream rejection arrives as HTTP **409**:
+
+```
+409 {"code":"concurrent_session","retry_after_seconds":1800,...}
+```
+
+This is **not** a credit problem and the account is still healthy. The proxy:
+
+* reports it as `429` with the reason spelled out (a bare 409 told you nothing)
+* **never** marks the account exhausted for it — doing so would silently retire a
+  working account and cost you a whole day of credits
+* `retry_after_seconds` in the error says when a slot frees up
+
+The upstream text suggests running `/close-other-session`, which only exists in
+the official CLI; here, waiting or switching account is what helps.
+
 `npm test` runs every unit test through `node --test`: the rotation policy
 (`tools\test-policy.test.mjs`), the hour-budget arithmetic
 (`tools\test-budget.test.mjs`), the store and sponsor/usage paths, the
