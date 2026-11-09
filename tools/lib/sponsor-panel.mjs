@@ -1,5 +1,31 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { request } from './freepi-api.mjs';
+
+/**
+ * The cookie that proves a request comes from a local sponsor window. It has to
+ * survive a restart: the windows stay open while the proxy is down, and a fresh
+ * random value per start would lock out every one of them - they keep running,
+ * so nothing reopens them, and no account ever confirms a display again.
+ *
+ * A random value is generated once and then reused. Only a local process can
+ * read the file, and the value grants nothing beyond the sponsor routes.
+ */
+function loadCookie() {
+  const file = path.join(os.homedir(), '.free-pi', 'proxy', 'sponsor-cookie');
+  try {
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    if (/^[0-9a-f]{48}$/.test(raw)) return raw;
+  } catch { /* first run */ }
+  const fresh = crypto.randomBytes(24).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, fresh + '\n', { mode: 0o600 });
+  } catch { /* an unwritable home still works, it just loses the cookie */ }
+  return fresh;
+}
 
 /**
  * Sponsor panel: one visible window per account.
@@ -20,7 +46,7 @@ import { request } from './freepi-api.mjs';
  * account-aware so several windows can be open at the same time.
  */
 export function createSponsorPanel({ currentAccount, accounts, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now, port = 4000, onDisplayed = null }) {
-  const cookie = crypto.randomBytes(24).toString('hex');
+  const cookie = loadCookie();
   const pending = new Map();
   const acknowledged = new Set();
   // Per account, not global: two open windows must not overwrite each other's

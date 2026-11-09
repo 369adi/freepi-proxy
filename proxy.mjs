@@ -1032,12 +1032,42 @@ function upstreamErrorBody(raw, fallbackMessage) {
   return Buffer.from(JSON.stringify({ error: { message, type } }));
 }
 
+/**
+ * Keep a display available for every account that owns a window, not just the
+ * active one. free-pi pauses an account whose card is never shown, so an account
+ * that sits idle for a while comes back blocked and its first request is
+ * refused with ads_required. Refreshing all of them means each window always
+ * has a card ready and the account never drifts into that state.
+ *
+ * The active account still goes first so the account most likely to serve the
+ * next request is the freshest one.
+ */
 async function runAdLoop() {
+  let cursor = 0;
   const tick = async () => {
-    const account = activeAccount();
-    if (!account || !account.token) return;
-    const a = await fetchAd(account.token);
-    if (a && a.status === 200) renderAd(a);
+    if (!STORE) return;
+    const withToken = STORE.accounts.filter((a) => !a.disabled && a.token);
+    if (!withToken.length) return;
+
+    const active = activeAccount();
+    const order = [];
+    if (active && active.token && !active.disabled) order.push(active);
+    for (const a of withToken) if (!order.includes(a)) order.push(a);
+
+    // One card per pass, taken round-robin, so a slow upstream cannot stretch a
+    // single pass over every account and leave the last one stale.
+    for (let attempt = 0; attempt < order.length; attempt++) {
+      const account = order[(cursor + attempt) % order.length];
+      try {
+        const a = await fetchAd(account.token);
+        if (a && a.status === 200) {
+          cursor = (cursor + attempt + 1) % order.length;
+          renderAd(a);
+          return;
+        }
+      } catch { /* try the next account next round */ }
+    }
+    cursor = (cursor + 1) % order.length;
   };
   await tick();
   setInterval(tick, AD_INTERVAL_MS);
