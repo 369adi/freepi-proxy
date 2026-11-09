@@ -181,8 +181,46 @@ function Get-SponsorWindowHandle([string]$SafeId) {
 # folders (Crashpad, ShaderCache, Default, ...) and one of them may end up in
 # this directory, so listing it raw would push the slots far to the right and
 # stack the windows again.
-function Get-SponsorSlotIds() {
-    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
+# A window that is merely open proves nothing. The page holds a cookie that is
+# only valid for the run that handed it out, and the panel records the last
+# display per account. After a proxy restart an old window therefore sits there
+# looking healthy while it can no longer confirm anything, and free-pi treats the
+# account as idle until it does. This asks the panel which accounts have gone
+# quiet, so the guardian can reopen exactly those windows and leave the rest
+# alone.
+#
+# The panel guards its account list with its own cookie, so the request has to
+# come from the same session the window would use - fetching /sponsor first and
+# keeping the cookies gives that.
+$script:QuietAfterSeconds = 900
+
+function Get-QuietSponsorAccounts([int]$QuietSeconds) {
+    $quiet = @()
+    try {
+        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        [void](Invoke-WebRequest -Uri ($proxyBase + '/sponsor') -WebSession $session -UseBasicParsing -TimeoutSec 8)
+        $payload = Invoke-RestMethod -Uri ($proxyBase + '/sponsor/accounts') -WebSession $session -TimeoutSec 8
+    } catch {
+        return $quiet
+    }
+    $now = [DateTime]::UtcNow
+    foreach ($a in @($payload.accounts)) {
+        if (-not $a.id) { continue }
+        $last = $a.lastDisplay
+        if (-not $last) {
+            # Never confirmed in this run at all.
+            $quiet += $a.id
+            continue
+        }
+        $at = [DateTime]::MinValue
+        $parsed = [DateTime]::TryParse([string]$last.at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$at)
+        if (-not $parsed) { continue }
+        if (($now - $at.ToUniversalTime()).TotalSeconds -ge $QuietSeconds) { $quiet += $a.id }
+    }
+    return $quiet
+}
+
+function Get-SponsorSlotIds() {    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
     $ids = @()
     if (Test-Path $root) {
         $ids = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
@@ -199,11 +237,11 @@ function Get-SlotFor([string]$SafeId) {
     return @{ X = 30 + ($index * 44); Y = 30 + ($index * 44) }
 }
 
-function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) {
+function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows, [switch]$Force) {
     $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
     $profile = Join-Path $root $SafeId
 
-    if ($OpenWindows.ContainsKey($SafeId)) {
+    if ($OpenWindows.ContainsKey($SafeId) -and -not $Force) {
         # Already running: never stack a second window, just make sure the
         # existing one is not minimised, otherwise free-pi pauses the account.
         $procId = [int]$OpenWindows[$SafeId]
@@ -307,11 +345,23 @@ while ($true) {
                     Write-Guardian 'No browser found for the sponsor windows.'
                 } else {
                     $openWindows = Get-OpenSponsorWindows
+                    $quiet = @(Get-QuietSponsorAccounts $script:QuietAfterSeconds)
                     foreach ($account in $lastAccounts) {
                         if (-not $account.id) { continue }
                         $safeId = ($account.id -replace '[^A-Za-z0-9_-]', '_')
                         $url = if ($account.url) { $account.url } else { $proxyBase + '/sponsor' }
-                        Show-SponsorFor -SafeId $safeId -Url $url -Browser $browser -OpenWindows $openWindows
+                        $needsFresh = $quiet -contains $account.id
+                        if ($needsFresh -and $openWindows.ContainsKey($safeId)) {
+                            # The window is open but has stopped confirming, which
+                            # after a restart is the normal state of every window
+                            # that was opened before it. Replacing it is the only
+                            # way back: the page needs a cookie from this run.
+                            $oldId = [int]$openWindows[$safeId]
+                            & "$env:WINDIR\System32\taskkill.exe" /F /PID $oldId 2>&1 | Out-Null
+                            Write-Guardian ('Sponsor window for ' + $safeId + ' stopped confirming; replaced it.')
+                            Start-Sleep -Milliseconds 700
+                        }
+                        Show-SponsorFor -SafeId $safeId -Url $url -Browser $browser -OpenWindows $openWindows -Force:$needsFresh
                     }
                 }
             }
