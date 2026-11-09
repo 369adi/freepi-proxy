@@ -94,30 +94,46 @@ function Get-SponsorBrowser {
 # only credits the account while the card is really visible.
 function Get-OpenSponsorWindows {
     $map = @{}
-    foreach ($proc in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    foreach ($proc in (Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue)) {
         if (-not $proc.CommandLine) { continue }
-        if ($proc.CommandLine -notmatch 'sponsor-window') { continue }
         if ($proc.CommandLine -notmatch '--app=') { continue }
-        if ($proc.CommandLine -match 'sponsor-window\\([A-Za-z0-9_-]+)') {
-            $map[$matches[1]] = $proc.ProcessId
+        # Renderer and helper processes never own a window, and matching their
+        # command line would map an account to a process that cannot be moved.
+        if ($proc.CommandLine -match '--type=') { continue }
+        if ($proc.CommandLine -match 'sponsor-window\\+(acc-[0-9]+)') {
+            # Keep the process with a real window for accounts that have several.
+            if (-not $map.ContainsKey($matches[1])) {
+                $map[$matches[1]] = [int]$proc.ProcessId
+            }
         }
     }
     return $map
 }
 
-function Test-Minimized([int]$Hwnd) {
-    try {
-        Add-Type -Namespace GuardianWin -Name Api -MemberDefinition @'
+# Declared once at load time. Calling Add-Type inside a hot function repeats the
+# compilation on every call and the error is swallowed, which is how a broken
+# interop binding stayed invisible while every window operation silently failed.
+try {
+    Add-Type -Namespace GuardianWin -Name Api -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
-'@ -ErrorAction SilentlyContinue
-        return [GuardianWin.Api]::IsIconic([IntPtr]$Hwnd)
-    } catch { return $false }
+'@
+    $script:WindowApiOk = $true
+} catch {
+    $script:WindowApiOk = $false
+    Write-Guardian ('Window control unavailable: ' + $_.Exception.Message)
+}
+
+function Test-Minimized([int]$Hwnd) {
+    if (-not $script:WindowApiOk) { return $false }
+    try { return [GuardianWin.Api]::IsIconic([IntPtr]$Hwnd) } catch { return $false }
 }
 
 function Restore-Window([int]$Hwnd) {
+    if ($Hwnd -le 0) { return $false }
+    if (-not $script:WindowApiOk) { return $false }
     try {
         [GuardianWin.Api]::ShowWindow([IntPtr]$Hwnd, 9) | Out-Null   # SW_RESTORE
         return $true
@@ -132,27 +148,55 @@ function Get-MainWindowHandle([int]$ProcessId) {
 
 function Move-WindowTo([int]$Hwnd, [int]$X, [int]$Y) {
     if ($Hwnd -le 0) { return $false }
+    if (-not $script:WindowApiOk) { return $false }
     try {
         [GuardianWin.Api]::MoveWindow([IntPtr]$Hwnd, $X, $Y, 760, 820, $true) | Out-Null
         return $true
     } catch { return $false }
 }
 
+# Finds the window that belongs to one profile folder. The profile path is the
+# only dependable link between an account and its window: the process that
+# Start-Process returns is not always the one that owns the window. The path is
+# matched with its trailing separator so acc-1 never also matches acc-10.
+function Get-SponsorWindowHandle([string]$SafeId) {
+    $needle = '\sponsor-window\' + $SafeId + '\'
+    foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue)) {
+        if (-not $p.CommandLine) { continue }
+        if ($p.CommandLine -notmatch [regex]::Escape($needle)) { continue }
+        if ($p.CommandLine -notmatch '--app=') { continue }
+        if ($p.CommandLine -match '--type=') { continue }
+        $hwnd = Get-MainWindowHandle ([int]$p.ProcessId)
+        if ($hwnd -gt 0) { return $hwnd }
+    }
+    return 0
+}
+
 # Every sponsor window has to sit somewhere, and if they all start at the same
 # spot only the topmost one is on screen while the others are covered. Covered
 # means Chromium reports the page as hidden and the display never confirms, so
 # each account gets its own slot in a cascade.
+#
+# Only account folders count. A browser profile holds dozens of internal
+# folders (Crashpad, ShaderCache, Default, ...) and one of them may end up in
+# this directory, so listing it raw would push the slots far to the right and
+# stack the windows again.
+function Get-SponsorSlotIds() {
+    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
+    $ids = @()
+    if (Test-Path $root) {
+        $ids = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^acc-[0-9]+$' } |
+            Select-Object -ExpandProperty Name)
+    }
+    return @($ids | Sort-Object { [int]($_ -replace '^acc-', '') })
+}
+
 function Get-SlotFor([string]$SafeId) {
     $ids = @(Get-SponsorSlotIds)
     $index = [array]::IndexOf($ids, $SafeId)
-    if ($index -lt 0) { $index = 0 }
+    if ($index -lt 0) { $index = $ids.Count }
     return @{ X = 30 + ($index * 44); Y = 30 + ($index * 44) }
-}
-
-function Get-SponsorSlotIds() {
-    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
-    if (-not (Test-Path $root)) { return @('acc-1') }
-    return @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name | Sort-Object)
 }
 
 function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) {
@@ -180,7 +224,7 @@ function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) 
     # tab and the sponsor card stops being the visible document.
     try { Set-Content -LiteralPath (Join-Path $profile 'First Run') -Value '' -Force } catch { }
     try {
-        $started = Start-Process -FilePath $Browser -ArgumentList @(
+        Start-Process -FilePath $Browser -ArgumentList @(
             ('--app=' + $Url),
             ('--user-data-dir=' + $profile),
             '--no-first-run',
@@ -190,16 +234,22 @@ function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows) 
             '--no-service-autorun',
             '--disable-component-update',
             '--window-size=760,820'
-        ) -PassThru
+        ) | Out-Null
         # Give the window its own place on the desktop. Edge starts every app
         # window at the same coordinates, so without this every account after
         # the first is covered by the previous one and never confirms a display.
+        #
+        # The window is looked up by its profile path rather than through the
+        # process Start-Process returned: when a browser for that profile is
+        # already running the new window belongs to the existing process, so the
+        # returned id would point at the wrong window and we would move someone
+        # else's.
         $slot = Get-SlotFor $SafeId
-        for ($attempt = 0; $attempt -lt 8; $attempt++) {
-            Start-Sleep -Milliseconds 400
-            $proc = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
-            if ($proc -and $proc.MainWindowHandle -ne 0) {
-                if (Move-WindowTo ([int]$proc.MainWindowHandle) $slot.X $slot.Y) {
+        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $hwnd = Get-SponsorWindowHandle $SafeId
+            if ($hwnd -gt 0) {
+                if (Move-WindowTo $hwnd $slot.X $slot.Y) {
                     Write-Guardian ('Placed the sponsor window for ' + $SafeId + ' at ' + $slot.X + ',' + $slot.Y + '.')
                 }
                 break
