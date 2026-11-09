@@ -585,6 +585,43 @@ async function fetchCatalogFor(token) {
   } catch { return {}; }
 }
 
+/**
+ * Keep the known-model set in step with free-pi.
+ *
+ * It is read once at startup, which means a model free-pi launches later would
+ * be rejected with 404 (and a misleading "does not exist") until the proxy is
+ * restarted. Refreshing in the background fixes that without making any request
+ * wait on a catalog fetch.
+ *
+ * Failures are ignored on purpose: a dropped refresh must not shrink the set and
+ * start rejecting ids that worked a second ago. Only a non-empty answer is
+ * applied, and the previous set is kept otherwise.
+ */
+let catalogRefreshTimer = null;
+function startCatalogRefresh(getToken, intervalMs) {
+  if (catalogRefreshTimer) return;
+  const every = intervalMs || 30 * 60 * 1000;
+  catalogRefreshTimer = setInterval(async function () {
+    try {
+      const token = typeof getToken === 'function' ? getToken() : null;
+      const fresh = await fetchCatalogFor(token);
+      const list = fresh && (Array.isArray(fresh.models) ? fresh.models : (Array.isArray(fresh.data) ? fresh.data : null));
+      if (!list || !list.length) return;
+      const next = new Set();
+      for (const m of list) {
+        if (m && m.id) next.add(String(m.id));
+      }
+      if (!next.size) return;
+      let added = 0;
+      for (const id of next) if (!KNOWN_MODELS.has(id)) added += 1;
+      if (added) console.log('[proxy] model catalog refreshed, ' + added + ' new id(s) now accepted');
+      KNOWN_MODELS.clear();
+      for (const id of next) KNOWN_MODELS.add(id);
+    } catch { /* keep the old set */ }
+  }, every);
+  if (catalogRefreshTimer.unref) catalogRefreshTimer.unref();
+}
+
 async function fetchAd(token) {
   try {
     return await httpsGet(`${FREEPI_BASE}/ads/next?slot=banner`, {
@@ -1422,6 +1459,11 @@ async function main() {
 
   const sponsorHtml = await fs.readFile(new URL('./tools/sponsor.html', import.meta.url), 'utf8');
   startServer(models, sponsorHtml);
+  // Pick up models free-pi launches later instead of 404ing them until a restart.
+  startCatalogRefresh(function () {
+    const a = activeAccount();
+    return a ? a.token : null;
+  }, 30 * 60 * 1000);
   runUsageLoop().catch(function() {});
   console.log('[sponsor] Open http://127.0.0.1:' + PORT + '/sponsor and keep the sponsor card visible.');
 }

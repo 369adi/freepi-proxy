@@ -539,37 +539,58 @@ an account lane. An unknown ID gets the same answer OpenAI gives:
 ```
 
 HTTP status is `404`, and no account slot is consumed. `GET /v1/models` lists
-every accepted ID, in both the raw (`deepseek-v4-flash`) and the slashed
-(`deepseek/deepseek-v4-flash`) spelling.
+every accepted ID. The catalog uses bare IDs only (`deepseek-v4-flash`), with no
+vendor prefix — a slashed spelling such as `deepseek/deepseek-v4-flash` is not a
+valid ID and is rejected with the same `404`.
 
 If catalog discovery failed at startup the check is skipped rather than
-guessing — an offline start must not reject work that would otherwise succeed.
+guessing — an offline start must not reject work that would otherwise succeed —
+and the proxy prints a warning saying that IDs are not being validated, so a
+disabled check is never silent. The catalog is re-read every 30 minutes, so a
+model free-pi launches later starts working without a restart, and a dropped
+refresh keeps the previous list instead of rejecting IDs that worked a moment
+ago.
 
 A *known* ID that free-pi refuses (for example `409` when a model needs
 credits) is passed through unchanged, because that is an upstream condition,
 not a typo.
 
-### Use the exact id, and expect a canonical name back
+### The `model` field in a response is a label, not an echo
 
-Two catalog facts worth knowing, both measured against the live API:
+This one surprises people, so it is worth being precise about it.
 
-**The catalog has no vendor prefixes.** Every id is bare — `particle`,
-`deepseek-v4-flash`, `glm-5.3-flash`. Writing `deepseek/deepseek-v4-flash` is
-not a valid id and the upstream rejects it. Earlier versions of this README
-showed the slashed form; that was wrong. Use `GET /v1/models` as the source of
-truth.
+**Every** catalog id comes back with a different `model` string, because
+free-pi returns its own internal pipeline name and the proxy pipes the upstream
+body through untouched. Measured examples:
 
-**free-pi answers with a canonical model name, not the id you sent.** Ask for
-`deepseek-v4-flash` and a successful response can carry
-`"model": "deepseek-ai/deepseek-v41-flash-1017"`; ask for `particle` and you may
-get `"model": "particle-ai/particle-1"`. The proxy forwards the upstream body
-verbatim, so you will see that name in the response.
+| you request | the response says |
+| --- | --- |
+| `particle` | `particle-ai/particle-1` |
+| `glm-5.3-flash` | `glm5.3flash` |
+| `deepseek-v4-flash` | `deepseek-ai/deepseek-v41-flash-1017` |
+| `deepseek-v4.1-flash` | `deepseek-ai/deepseek-v41-flash-1017` |
+| `solar-pro-4` | `upstage/solar-pro4` |
 
-This is a label, not an error — but do not build logic that compares the
-requested id to `response.model` for equality. If you need to know which model
-served a request, keep the id you sent or read the `x-free-pi-account` response
-header for the account. The id you send is the one that gets routed; the name
-that comes back is free-pi's own canonical spelling of it.
+Some of that is plain normalisation (`glm5.3flash`), some adds a vendor prefix.
+The practical consequences:
+
+- **Never assert `response.model == requested_model`.** Loggers, eval harnesses
+  and strict SDK checks that do will fail. Keep the id you sent, or read the
+  `x-free-pi-account` response header to learn which account served it.
+- **Some catalog ids share one backend.** `deepseek-v4-flash` and
+  `deepseek-v4.1-flash` both answer as `deepseek-ai/deepseek-v41-flash-1017`,
+  with byte-identical output for the same prompt. Pick an id for the intent you
+  want; do not expect two ids to mean two separate models.
+- The proxy does **not** rewrite this field. What you see is free-pi's own
+  answer, which is the honest thing to pass on — a rewrite would hide that the
+  catalog and the backend do not line up one-to-one.
+
+### Why local validation matters
+
+Asked **directly**, without this proxy, free-pi answers HTTP 200 to an id that
+does not exist at all — `definitely-not-a-real-model-xyz` included — and serves
+it with the default model. There is no error to notice. That is precisely why
+the proxy rejects unknown ids itself instead of forwarding them.
 
 ---
 
