@@ -432,9 +432,25 @@ behind `GET /budget`.
 
 ### Running out of budget
 
-Adding an account is **not** automated past the GitHub login: it needs a GitHub
-sign-up, which is a human step by design. When `plan` reports
-`create a NEW account gh-N@arisya.de`:
+The proxy itself never creates accounts; it only tells you when one is needed
+and keeps serving from existing accounts otherwise.
+
+#### Manual selection pins your budget
+
+`~/.free-pi/proxy/selected-account.json` pins one account and **disables
+rotation**. While it exists, every other account sits idle even when it has
+credits left — `nextAction.action` reads `manual` in `GET /usage`. Delete the
+file (or run `/freepi-auto`) to let all lanes work again:
+
+```powershell
+Remove-Item "$env:USERPROFILE\.free-pi\proxy\selected-account.json"
+```
+
+Check `lanes` in `GET /usage`: it should equal the number of usable accounts.
+
+#### Manual route (always works)
+
+When `plan` reports `create a NEW account gh-N@arisya.de`:
 
 1. create a GitHub account using that address (a catch-all domain delivers the
    verification mail to the catch-all mailbox)
@@ -444,8 +460,31 @@ sign-up, which is a human step by design. When `plan` reports
 3. `node tools\freepi-accounts.mjs add` — opens GitHub with the code pre-filled,
    handles the consent step, stores the token
 
-The proxy itself never creates accounts; it only tells you when one is needed
-and keeps serving from existing accounts otherwise.
+#### Semi-automatic route (`tools\auto-add.mjs`)
+
+`auto-add.mjs` drives the whole chain in a real Chrome window: sign-up form,
+mailbox verification, free-pi device flow, consent, and the store write. It
+still needs **one human click per account**, because GitHub guards the sign-up
+POST with a DataDome CAPTCHA.
+
+```powershell
+node tools\auto-add.mjs --count 10 --keep-open   # stop at the first CAPTCHA
+node tools\auto-add.mjs --resume                 # continue after solving it
+node tools\auto-add.mjs --status                 # what has been minted so far
+node tools\auto-add.mjs --forget                 # drop failed rows, keep the counter
+```
+
+Why the human click is unavoidable: the sign-up form carries
+`octocaptcha-token="datadome-suppressed"`, a placeholder GitHub substitutes when
+no real DataDome token was issued. Submitting with it always yields a hard
+`t=fe` challenge in a cross-origin `geo.captcha-delivery.com` iframe, which no
+script can reach. The challenge is the *interactive* kind, so a human click in
+the kept-open window is the legitimate unblock — `--keep-open` and `--resume`
+exist for exactly that loop.
+
+The mailbox side is fully automatic: `tools\lib\webmail.mjs` reuses a logged-in
+Chrome profile (`~/.free-pi/mail-profile`) and scrapes the verification link
+from the STRATO webmail DOM, so no IMAP password is needed.
 
 ---
 

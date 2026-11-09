@@ -16,3 +16,7 @@ Thumbs.db
 # per-account store lives outside the repo, but never let it slip in
 accounts.json
 *.tmp
+
+# Scratch output from probe runs – never part of the product
+out/
+tools/_*.mjs
