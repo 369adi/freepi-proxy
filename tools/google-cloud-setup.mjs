@@ -823,7 +823,7 @@ export async function ensureCloudBillingAndDeploy({
  */
 export async function runGoogleCloudSetup({
   accountSelector = null,
-  deploy = true,
+  deploy = false,
   reauth = false,
   onLog = console.log,
 } = {}) {
@@ -926,13 +926,15 @@ export async function runGoogleCloudSetup({
   // Step 3: Enable Google Drive API & Workspace folder (always free, no billing required)
   const driveRes = await setupGoogleDriveWorkspace(projRes.projectId, onLog);
 
-  // Step 4: Billing & Cloud Run deployment (if requested)
-  const cloudRes = await ensureCloudBillingAndDeploy({
-    accountObj: chosen,
-    projectId: projRes.projectId,
-    deploy,
-    onLog,
-  });
+  // Step 4: Billing & Cloud Run deployment (only when explicitly requested with --deploy)
+  const cloudRes = deploy
+    ? await ensureCloudBillingAndDeploy({
+        accountObj: chosen,
+        projectId: projRes.projectId,
+        deploy,
+        onLog,
+      })
+    : { billingEnabled: false, message: null };
 
   return {
     ok: true,
@@ -985,11 +987,11 @@ export function formatCloudStatusAndAccounts() {
   }
 
   lines.push('');
-  lines.push('So richtest du Google Drive + Google Cloud automatisch ein:');
+  lines.push('So richtest du Google Drive (Cloud-Kontext & Handy-Uebergabe) ein:');
   lines.push('  /freepi-cloud 1          (nimmt Account Nr. 1 und richtet alles automatisch ein)');
   lines.push('  /freepi-cloud 2          (nimmt Account Nr. 2)');
   lines.push('  /freepi-cloud new        (neuen Google-Account im Browser anmelden)');
-  lines.push('  /freepi-cloud 1 --drive  (richtet nur Google Drive Cloud-Kontext ohne Cloud Run ein)');
+  lines.push('Das Setup laeuft in einem eigenen Fenster, damit du jeden Schritt siehst.');
 
   return lines.join('\n');
 }
@@ -1000,7 +1002,7 @@ async function main() {
   const args = process.argv.slice(2);
   const wantsJson = args.includes('--json');
   const wantsList = args.includes('--list');
-  const driveOnly = args.includes('--drive') || args.includes('--no-deploy');
+  const wantsDeploy = args.includes('--deploy');
   const reauth = args.includes('--reauth');
 
   let accountArg = null;
@@ -1049,7 +1051,7 @@ async function main() {
   const logger = wantsJson ? (msg) => logs.push(msg) : console.log;
   const result = await runGoogleCloudSetup({
     accountSelector: accountArg,
-    deploy: !driveOnly,
+    deploy: wantsDeploy,
     reauth,
     onLog: logger,
   });

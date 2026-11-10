@@ -1681,6 +1681,40 @@ async function handleDoctor() {
   return { kind: bad.length ? 'error' : 'success', text: lines.join('\n') };
 }
 
+/**
+ * /freepi-cloud: listing is quick and answered inline. The actual setup can wait
+ * minutes for a browser sign-in, so it runs in its own visible console window
+ * instead of blocking the harness with no feedback. Uses `node` from PATH, not
+ * process.execPath: inside the desktop app that is the app binary, not Node.
+ */
+async function runCloudCommand(setupMjs, parts) {
+  const { spawn, spawnSync } = await import('node:child_process');
+  const listOnly = !parts.length || parts[0] === '--list' || parts[0] === 'status';
+  if (listOnly) {
+    const res = spawnSync('node', [setupMjs, '--list'], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+    return {
+      kind: res.status === 0 ? 'success' : 'error',
+      text: (res.stdout || res.stderr || 'Keine Rueckmeldung vom Google-Setup.').trim(),
+    };
+  }
+  try {
+    if (process.platform === 'win32') {
+      const cmdFile = path.join(path.dirname(path.dirname(setupMjs)), 'Google-Cloud-Setup.cmd');
+      spawn('cmd.exe', ['/c', 'start', 'Google Setup', cmdFile, ...parts], {
+        detached: true, stdio: 'ignore', windowsHide: false,
+      }).unref();
+    } else {
+      spawn('node', [setupMjs, ...parts], { detached: true, stdio: 'ignore' }).unref();
+    }
+  } catch (error) {
+    return { kind: 'error', text: 'Setup konnte nicht gestartet werden: ' + error.message };
+  }
+  return {
+    kind: 'success',
+    text: 'Google-Setup laeuft jetzt in einem eigenen Fenster. Falls eine Anmeldung noetig ist, oeffnet sich dein Browser. Danach zeigt /freepi-cloud den neuen Stand.',
+  };
+}
+
 function apply(ctx) {
   const active = new Set();
 
@@ -1745,20 +1779,11 @@ function apply(ctx) {
         name: 'freepi-cloud',
         description: 'Set up Google Cloud & Google Drive with any browser account (/freepi-cloud <num|email>)',
         handler: async (invocation) => {
+          const { fileURLToPath } = await import('node:url');
           const input = String(invocation?.rawInput || '').trim();
-          const setupMjs = path.resolve(__dirname, '..', '..', 'tools', 'google-cloud-setup.mjs');
-          const { spawnSync } = await import('node:child_process');
-          const args = [setupMjs];
-          if (input) {
-            args.push(...input.split(/\s+/));
-          } else {
-            args.push('--list');
-          }
-          const res = spawnSync(process.execPath, args, { encoding: 'utf8' });
-          return {
-            kind: res.status === 0 ? 'success' : 'error',
-            text: (res.stdout || res.stderr || 'Keine Rueckmeldung vom Google-Cloud-Setup.').trim(),
-          };
+          const parts = input ? input.split(/\s+/) : [];
+          const setupMjs = fileURLToPath(new URL('../../tools/google-cloud-setup.mjs', import.meta.url));
+          return runCloudCommand(setupMjs, parts);
         },
       });
 
