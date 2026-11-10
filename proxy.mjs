@@ -1164,31 +1164,24 @@ function upstreamErrorBody(raw, fallbackMessage) {
  * next request is the freshest one.
  */
 async function runAdLoop() {
-  let cursor = 0;
   const tick = async () => {
     if (!STORE) return;
-    const withToken = STORE.accounts.filter((a) => !a.disabled && a.token);
+    const withToken = STORE.accounts.filter((a) => !a.disabled && !a.tokenBad && a.token);
     if (!withToken.length) return;
 
     const active = activeAccount();
     const order = [];
-    if (active && active.token && !active.disabled) order.push(active);
+    if (active && active.token && !active.disabled && !active.tokenBad) order.push(active);
     for (const a of withToken) if (!order.includes(a)) order.push(a);
 
-    // One card per pass, taken round-robin, so a slow upstream cannot stretch a
-    // single pass over every account and leave the last one stale.
-    for (let attempt = 0; attempt < order.length; attempt++) {
-      const account = order[(cursor + attempt) % order.length];
+    for (const account of order) {
       try {
         const direct = await confirmAdDirect(account.token, sessionIdFor(account), 'banner');
         if (direct && direct.confirmed) {
           clearAdsRequired(account.id);
-          cursor = (cursor + attempt + 1) % order.length;
-          return;
         }
-      } catch { /* try the next account next round */ }
+      } catch { /* continue with next account */ }
     }
-    cursor = (cursor + 1) % order.length;
   };
   await tick();
   setInterval(tick, AD_INTERVAL_MS);
@@ -2006,6 +1999,9 @@ function startServer(models, sponsorHtml) {
   KNOWN_MODELS.clear();
   updateFreeModels(catalog);
   if (discovered) {
+    for (const m of DEFAULT_CATALOG) {
+      if (m && m.id) KNOWN_MODELS.add(String(m.id));
+    }
     for (const m of catalog) {
       if (m && m.id) KNOWN_MODELS.add(String(m.id));
     }
