@@ -15,7 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import {getClientVersion,requiredVersion,upgradeClient} from 'file:///C:/Users/liket/Documents/freepi-proxy/tools/lib/client-runtime.mjs';
+import {getClientVersion,requiredVersion,upgradeClient} from '../../tools/lib/client-runtime.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

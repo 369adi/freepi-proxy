@@ -9,7 +9,7 @@
 //   POST /auth/token              -> {status:"pending"} | {token} | 403 consent_required
 //   GET  /ads/next?slot=banner    -> sponsor banner
 
-import {getClientVersion,requiredVersion,upgradeClient} from './client-runtime.mjs';
+import {getClientVersion,requiredVersion,upgradeClient,syncClientVersionFromCatalog} from './client-runtime.mjs';
 export const BASE = process.env.FREEPI_API_BASE || 'https://api.freepi.ai';
 export const VERSION = getClientVersion();
 export const CONSENT_VERSION = '4';
@@ -61,8 +61,11 @@ export async function request(pathname, { method = 'GET', token, body, headers =
 export const getMe = token => request('/me', { token });
 
 /** Model catalog (also carries the minimum supported client version). */
-export const getCatalog = token =>
-  request('/client-version?cli_version=' + encodeURIComponent(getClientVersion()), token ? { token } : {});
+export const getCatalog = async token => {
+  const res = await request('/client-version?cli_version=' + encodeURIComponent(getClientVersion()), token ? { token } : {});
+  syncClientVersionFromCatalog(res);
+  return res;
+};
 
 /** Start the headless GitHub device flow. */
 export const deviceStart = () => request('/auth/github/device', { method: 'POST', body: {} });
@@ -86,8 +89,48 @@ export const devicePoll = (sessionId, { timezone, locale } = {}) =>
   });
 
 /** Sponsor banner for the active account. */
-export const getAds = (token, sessionId) =>
-  request('/ads/next?slot=banner', { token, headers: { 'x-session-id': sessionId } });
+export const getAds = (token, sessionId, slot = 'banner') =>
+  request('/ads/next?slot=' + encodeURIComponent(slot), { token, headers: { 'x-session-id': sessionId } });
+
+/**
+ * Direct sponsor confirmation from official free-pi-cli (vendor/free-pi-cli/src/vendor/pi-ads/api.ts):
+ * 1. GET /ads/next?slot=banner (or inline)
+ * 2. If Gravity imp_url on https://*.trygravity.(ai|com), fire GET imp_url
+ * 3. POST /ads/impression with { ad_id, click_token, imp_fired }
+ */
+export async function confirmAdDirect(token, sessionId, slot = 'banner') {
+  if (!token || !sessionId) return { confirmed: false };
+  const ad = await getAds(token, sessionId, slot);
+  if (!ad || typeof ad !== 'object' || !ad.ad_id || !ad.click_token) {
+    return { confirmed: false, ad: ad || null };
+  }
+  let impFired = false;
+  if (ad.source === 'gravity' && typeof ad.imp_url === 'string' && ad.imp_url) {
+    try {
+      const parsed = new URL(ad.imp_url);
+      if (parsed.protocol === 'https:' && /^([a-z0-9-]+\.)?trygravity\.(ai|com)$/i.test(parsed.hostname)) {
+        const impRes = await fetch(ad.imp_url, {
+          method: 'GET',
+          redirect: 'error',
+          signal: AbortSignal.timeout(3000),
+        });
+        impFired = impRes.ok;
+      }
+    } catch { /* ignore imp_url errors */ }
+  }
+  await request('/ads/impression', {
+    method: 'POST',
+    token,
+    headers: { 'x-session-id': sessionId },
+    body: {
+      ad_id: ad.ad_id,
+      click_token: ad.click_token,
+      ...(impFired ? { imp_fired: true } : {}),
+    },
+    timeoutMs: 5000,
+  });
+  return { confirmed: true, ad, impFired };
+}
 
 /** /me/consent for an already authenticated account. */
 export const submitUserConsent = (token, consentVersion = CONSENT_VERSION) =>

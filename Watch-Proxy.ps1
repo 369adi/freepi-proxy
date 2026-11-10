@@ -10,8 +10,21 @@ $proxyChild = $null
 $sponsorNextCheck = [DateTime]::MinValue
 
 function Show-ProxySponsor {
-    # Headless mode: no sponsor browser windows. The node watchdog and the
-    # headless sponsor daemon confirm impressions over HTTP instead.
+    # Headless mode: no sponsor browser windows. Ensure the headless sponsor
+    # daemon (tools/headless-sponsor.mjs) is running over HTTP instead.
+    try {
+        $running = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'headless-sponsor\.mjs' -and $_.CommandLine -notmatch '--once' })
+        if ($running.Count -eq 0) {
+            $script = Join-Path $proxyDirectory 'tools\headless-sponsor.mjs'
+            if (Test-Path -LiteralPath $script) {
+                $outLog = Join-Path $proxyLogs 'headless-sponsor.stdout.log'
+                $errLog = Join-Path $proxyLogs 'headless-sponsor.stderr.log'
+                Start-Process -FilePath $proxyNode -ArgumentList @($script, '--interval', '45000') -WorkingDirectory $proxyDirectory -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog | Out-Null
+                Write-ProxyEvent 'Started headless sponsor daemon (tools/headless-sponsor.mjs).'
+            }
+        }
+    } catch { }
 }
 
 function Write-ProxyEvent([string]$Message) {

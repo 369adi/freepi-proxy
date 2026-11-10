@@ -41,7 +41,7 @@ import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, isMeteredDespiteFreeTier, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, sortForPick, USABLE, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
-import { getCatalog } from './tools/lib/freepi-api.mjs';
+import { getCatalog, confirmAdDirect } from './tools/lib/freepi-api.mjs';
 import {getClientVersion,requiredVersion,upgradeClient,runtimeStatus} from './tools/lib/client-runtime.mjs';
 import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR, creditsToHours } from './tools/lib/budget.mjs';
 
@@ -592,6 +592,11 @@ function clearAdsRequired(id) {
 async function recoverSponsor(account,downstream) {
   markAdsRequired(account.id);
   const displayed=waitForSponsorDisplay(account.id,{events:sponsorEvents,downstream,isBlocked:inAdCooldown});
+  if (!AUTO_SPONSOR && account && account.token) {
+    confirmAdDirect(account.token, sessionIdFor(account), 'banner')
+      .then(r => { if (r && r.confirmed) clearAdsRequired(account.id); })
+      .catch(() => {});
+  }
   try{openSponsorPanel(account);}catch(error){console.error('[sponsor] '+error.message);}
   return displayed;
 }
@@ -1150,6 +1155,12 @@ async function runAdLoop() {
     for (let attempt = 0; attempt < order.length; attempt++) {
       const account = order[(cursor + attempt) % order.length];
       try {
+        const direct = await confirmAdDirect(account.token, sessionIdFor(account), 'banner');
+        if (direct && direct.confirmed) {
+          clearAdsRequired(account.id);
+          cursor = (cursor + attempt + 1) % order.length;
+          return;
+        }
         const a = await fetchAd(account);
         if (a && a.status === 200) {
           cursor = (cursor + attempt + 1) % order.length;
@@ -1226,7 +1237,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
   const chunks = [];
   inReq.on('data', c => chunks.push(c));
   inReq.on('end', async () => {
-    const body = Buffer.concat(chunks);
+    let body = Buffer.concat(chunks);
     if(runtimeStatus().restartPending){inRes.writeHead(503,{'content-type':'application/json','retry-after':'15'});inRes.end(JSON.stringify({error:{code:'upgrade_required',message:'Official CLI updated; restarting proxy and restoring active sessions.'}}));return;}
     const routingSession = typeof inReq.headers['x-freepi-session'] === 'string' ? inReq.headers['x-freepi-session'].slice(0,200) : undefined;
     const routingWorker = typeof inReq.headers['x-freepi-worker'] === 'string' ? inReq.headers['x-freepi-worker'].slice(0,200) : undefined;
@@ -1253,6 +1264,13 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     try {
       const parsed = JSON.parse(body);
       if (parsed && typeof parsed.model === 'string') wantedModel = parsed.model.trim();
+      if (routingWorker && (!wantedModel || wantedModel === 'particle')) {
+        wantedModel = 'deepseek-v4.1-flash';
+        if (parsed && typeof parsed === 'object') {
+          parsed.model = wantedModel;
+          body = Buffer.from(JSON.stringify(parsed));
+        }
+      }
       if (wantedModel) console.log('[proxy] -> ' + JSON.stringify(wantedModel));
     } catch {}
     if (wantedModel && KNOWN_MODELS.size && !KNOWN_MODELS.has(wantedModel)) {
@@ -1623,6 +1641,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
                 if(inRes.destroyed){releaseLaneOnce();return;}
                 if(displayed){send(account.token);return;}
               }
+              if (await tryNext('ads required')) return;
               releaseLaneOnce();
               // A browser problem must never turn this 403 into a 500: the
               // account stays parked either way, the window is only a courtesy.
@@ -1939,10 +1958,26 @@ function historyLimit(url) {
   return Math.min(n, 365);
 }
 
+const DEFAULT_CATALOG = [
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash · Free Unlimited' },
+  { id: 'particle', name: 'Particle · Free Unlimited' },
+  { id: 'glm-5.3-flash', name: 'GLM-5.3 Flash · Free Unlimited' },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash · Free Unlimited' },
+  { id: 'glm-5.1', name: 'GLM-5.1 · 1.2x' },
+  { id: 'kimi-k2.5', name: 'Kimi K2.5 · 0.6x' },
+  { id: 'kimi-k2.6', name: 'Kimi K2.6 · 1.2x' },
+  { id: 'minimax-m2.7', name: 'MiniMax M2.7 · 0.3x' },
+  { id: 'deepseek-v3.2', name: 'DeepSeek V3.2 · 0.3x' },
+  { id: 'qwen3.5', name: 'Qwen3.5 · 0.4x' },
+  { id: 'qwen3.6-plus', name: 'Qwen3.6 Plus · 0.5x' },
+  { id: 'gemma-4', name: 'Gemma 4 · 0.2x' },
+  { id: 'gpt-oss-120b', name: 'GPT-OSS 120B · 0.2x' },
+  { id: 'nemotron-3-super', name: 'Nemotron 3 Super · 0.2x' },
+];
+
 function startServer(models, sponsorHtml) {
-  catalog = (Array.isArray(models) && models.length)
-    ? models
-    : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
+  const discovered = Array.isArray(models) && models.length > 0;
+  catalog = discovered ? models : DEFAULT_CATALOG;
 
   // Teach the completions handler which ids are real.
   //
@@ -1952,8 +1987,10 @@ function startServer(models, sponsorHtml) {
   // here would only hide the real reason behind a clear local error.
   KNOWN_MODELS.clear();
   updateFreeModels(catalog);
-  for (const m of catalog) {
-    if (m && m.id) KNOWN_MODELS.add(String(m.id));
+  if (discovered) {
+    for (const m of catalog) {
+      if (m && m.id) KNOWN_MODELS.add(String(m.id));
+    }
   }
   if (!KNOWN_MODELS.size) {
     // Validation is skipped when the set is empty, which would silently restore
@@ -2002,6 +2039,9 @@ function startServer(models, sponsorHtml) {
         else if(data.action==='touch') sessionRouter.touch(data.sessionId);
         else if(data.action==='notice') sessionRouter.notice(data.sessionId,data.message,data.retryAt);
         else if(data.action==='reserve'||data.action==='cowork') {
+          if (data.action === 'cowork' && (!data.model || data.model === 'particle')) {
+            data.model = 'deepseek-v4.1-flash';
+          }
           // Only hand out accounts that can actually serve the request. The
           // router used to accept every credentialed account, so a session that
           // landed on an exhausted one was pinned there and failed with 409
@@ -2194,8 +2234,20 @@ async function main() {
   }
 
   const active = activeAccount();
-  const data = await fetchCatalogFor(active ? active.token : null);
-  const models = Array.isArray(data.models) && data.models.length ? data.models : null;
+  const tokenCandidates = [];
+  if (active && active.token) tokenCandidates.push(active.token);
+  for (const a of STORE.accounts || []) {
+    if (a && a.token && !a.disabled && !tokenCandidates.includes(a.token)) tokenCandidates.push(a.token);
+  }
+  let data = {};
+  let models = null;
+  for (const tok of (tokenCandidates.length ? tokenCandidates : [null])) {
+    data = await fetchCatalogFor(tok);
+    if (Array.isArray(data.models) && data.models.length) {
+      models = data.models;
+      break;
+    }
+  }
   if (data.notice) console.log('[free-pi] ' + data.notice);
   // free-pi publishes no modality metadata, so VISION_KNOWN stays empty and
   // supportsVision() falls back to the family lists above.
@@ -2208,10 +2260,11 @@ async function main() {
   startServer(models, sponsorHtml);
   // Pick up models free-pi launches later instead of 404ing them until a restart.
   startCatalogRefresh(function () {
-    const a = activeAccount();
+    const a = activeAccount() || (STORE && STORE.accounts && STORE.accounts.find(x => x && x.token && !x.disabled));
     return a ? a.token : null;
   }, 30 * 60 * 1000);
   runUsageLoop().catch(function() {});
+  runAdLoop().catch(function() {});
   console.log('[sponsor] Open http://127.0.0.1:' + PORT + '/sponsor and keep the sponsor card visible.');
 }
 

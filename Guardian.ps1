@@ -85,6 +85,19 @@ function Start-LimitWatcherIfMissing {
     Write-Guardian 'Started automatic API continuation for output token limits.'
 }
 
+function Start-HeadlessSponsorIfMissing {
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'headless-sponsor\.mjs' -and $_.CommandLine -notmatch '--once' })
+    if ($running.Count -gt 0) { return }
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    $script = Join-Path $proxyDirectory 'tools\headless-sponsor.mjs'
+    if (-not (Test-Path -LiteralPath $script)) { return }
+    $outLog = Join-Path $guardianLogs 'headless-sponsor.stdout.log'
+    $errLog = Join-Path $guardianLogs 'headless-sponsor.stderr.log'
+    Start-Process -FilePath $node -ArgumentList @($script, '--interval', '45000') -WorkingDirectory $proxyDirectory -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    Write-Guardian 'Started headless sponsor daemon (tools/headless-sponsor.mjs).'
+}
+
 function Start-HarnessWatcher {
     $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $watch = Join-Path $proxyDirectory 'Watch-Harness.ps1'
@@ -292,6 +305,7 @@ while ($true) {
         $watchdogPids = Get-WatchdogPids
         if ((Get-HarnessWatcherPids).Count -eq 0) { Start-HarnessWatcher }
         Start-LimitWatcherIfMissing
+        Start-HeadlessSponsorIfMissing
 
         if (-not $alive) {
             Write-Guardian 'Proxy is not answering; starting the supervisor to bring it back.'
