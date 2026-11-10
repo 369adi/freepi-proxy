@@ -1742,6 +1742,27 @@ function apply(ctx) {
       });
 
       yield ctx.commands.register({
+        name: 'freepi-cloud',
+        description: 'Set up Google Cloud & Google Drive with any browser account (/freepi-cloud <num|email>)',
+        handler: async (invocation) => {
+          const input = String(invocation?.rawInput || '').trim();
+          const setupMjs = path.resolve(__dirname, '..', '..', 'tools', 'google-cloud-setup.mjs');
+          const { spawnSync } = await import('node:child_process');
+          const args = [setupMjs];
+          if (input) {
+            args.push(...input.split(/\s+/));
+          } else {
+            args.push('--list');
+          }
+          const res = spawnSync(process.execPath, args, { encoding: 'utf8' });
+          return {
+            kind: res.status === 0 ? 'success' : 'error',
+            text: (res.stdout || res.stderr || 'Keine Rueckmeldung vom Google-Cloud-Setup.').trim(),
+          };
+        },
+      });
+
+      yield ctx.commands.register({
         name: 'freepi-auto',
         description: 'Undo a pinned account so the proxy rotates by remaining budget again',
         handler: () => track(handleAuto()),

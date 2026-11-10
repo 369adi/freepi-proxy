@@ -12,6 +12,7 @@
     "accounts": "node tools/freepi-accounts.mjs",
     "add": "node tools/freepi-accounts.mjs add",
     "status": "node tools/freepi-accounts.mjs status",
+    "cloud": "node tools/google-cloud-setup.mjs",
     "plan": "node tools/freepi-accounts.mjs plan",
     "refresh": "node tools/freepi-accounts.mjs refresh",
     "verify": "node tools/verify-free.mjs",
