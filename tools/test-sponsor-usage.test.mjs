@@ -55,7 +55,7 @@ test('browser visibility gate rejects a hidden, clipped or off-screen sponsor', 
   const html = fs.readFileSync(new URL('./sponsor.html', import.meta.url), 'utf8');
   const gate = html.match(/function visible\(\)\{[\s\S]*?\n\}/)[0];
   let rect = { width: 600, height: 150, top: 30, bottom: 180 };
-  const context = { document: { visibilityState: 'visible' }, ratio: 1, innerHeight: 600, window: { scrollY: 0 }, card: { getBoundingClientRect: () => rect } };
+  const context = { document: { visibilityState: 'visible' }, ratio: 1, innerHeight: 600, window: { scrollY: 0 }, card: { getBoundingClientRect: () => rect }, duplicateWindow: false };
   vm.createContext(context); vm.runInContext(gate, context);
   assert.equal(context.visible(), true);
   context.document.visibilityState = 'hidden'; assert.equal(context.visible(), false);

@@ -84,6 +84,21 @@ test('every account is listed with its own window URL', async t => {
   assert.doesNotMatch(JSON.stringify(data), /TOKEN_ONE|TOKEN_TWO/);
 });
 
+test('duplicate pages close only their own account and stale windows become reopenable', async t => {
+  const f=await fixture(t);
+  assert.equal((await f.request('/sponsor/window?account=acc-1',{id:'first',register:true})).data.close,false);
+  await f.request('/sponsor/window?account=acc-2',{id:'other',register:true});
+  await f.request('/sponsor/window?account=acc-1',{id:'second',register:true});
+  assert.equal((await f.request('/sponsor/window?account=acc-1',{id:'first'})).data.close,true);
+  assert.equal((await f.request('/sponsor/window?account=acc-2',{id:'other'})).data.close,false);
+  const live=(await f.request('/sponsor/windows')).data;
+  assert.equal(live.accounts['acc-1'],true);
+  assert.equal(live.duplicates,1);
+  // Stale windows only drop out after the panel's window heartbeat TTL (90 s).
+  f.advance(90_001);
+  assert.deepEqual((await f.request('/sponsor/windows')).data.accounts,{});
+});
+
 test('each account receives its own ad and nonce', async t => {
   const f = await fixture(t);
   const one = await f.request('/sponsor/ad?account=acc-1');

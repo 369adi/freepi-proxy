@@ -10,12 +10,8 @@ $proxyChild = $null
 $sponsorNextCheck = [DateTime]::MinValue
 
 function Show-ProxySponsor {
-    if ([DateTime]::UtcNow -ge $script:sponsorNextCheck) {
-        $script:sponsorNextCheck = [DateTime]::UtcNow.AddSeconds(30)
-        try {
-            & (Join-Path $proxyDirectory 'Show-Sponsor.ps1')
-        } catch { Write-ProxyEvent ('Open http://127.0.0.1:4000/sponsor to display ads. ' + $_.Exception.Message) }
-    }
+    # Headless mode: no sponsor browser windows. The node watchdog and the
+    # headless sponsor daemon confirm impressions over HTTP instead.
 }
 
 function Write-ProxyEvent([string]$Message) {

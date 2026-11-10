@@ -208,6 +208,41 @@ Confirmation stays honest and unchanged: an impression is forwarded only after
 the complete card was visible for at least one second, with the cookie and a
 single-use nonce, and each ad is acknowledged once.
 
+### Headless mode (no windows)
+
+Headless is the default: the proxy opens no browser window at all unless
+`FREEPI_AUTO_SPONSOR=1` is set explicitly. Instead the daemon
+`tools/headless-sponsor.mjs` confirms the impressions over plain HTTP against
+the same local panel — one ad is fetched per account, and after the same
+minimum display time each single-use nonce is acknowledged with
+`visible:true`:
+
+```powershell
+npm run headless -- --once             # one pass over all accounts, then exit
+npm run headless                       # loop mode: one pass every 60 s
+npm run headless -- --accounts acc-2   # only specific accounts
+npm run headless -- --dry-run          # fetch ads, never confirm anything
+npm run headless -- --verify           # exit 1 while any account is ads-blocked
+```
+
+Options and environment variables:
+
+- `--delay <ms>` — wait between the ad fetch and the confirmation (default
+  1600, minimum 1500 — the same rule the page enforces).
+- `--interval <ms>` — loop period in loop mode (default 60000).
+- `--base <url>` — override the panel base URL (used by the tests).
+- `--direct` — advanced: talk to upstream directly instead of the local panel.
+- `FREEPI_PROXY_PORT`, `FREEPI_COOKIE_FILE`, `FREEPI_AD_STATE_FILE`,
+  `FREEPI_ACCOUNTS_PATH`.
+
+The daemon still goes through the same local panel with the same rules (panel
+cookie, no foreign Origin, 1500 ms minimum age, 120 s nonce TTL, one
+acknowledgement per ad and account), and upstream free-pi still decides
+whether an impression is accepted — "open windows alone suffice" stays true,
+in headless mode they are simply never opened. The watchdog
+(`tools/watchdog.mjs`) starts the daemon alongside the proxy automatically,
+restarts it on failure and logs to `~/.free-pi/proxy/sponsor-headless.log`.
+
 ---
 
 ## Optional: NotionTool MCP server
@@ -435,41 +470,16 @@ behind `GET /budget`.
 The proxy itself never creates accounts; it only tells you when one is needed
 and keeps serving from existing accounts otherwise.
 
-#### "Free Unlimited" models are only free while the allowance is visible
+#### Free Unlimited and allowance visibility
 
-free-pi labels four model ids as *Free Unlimited*: `particle`,
-`deepseek-v4.1-flash`, `glm-5.3-flash` and `deepseek-v4-flash`. That label is
-**conditional**, and the condition is not a property of the model — it is a
-per-account flag the upstream reports as `visible_allowance`, which
-`GET /usage` surfaces as `meteredDespiteFreeTier`:
+The Free-Pi catalog labels some models Free Unlimited. Previous local notes report
+unchanged credits for three Particle calls on one account with `visible_allowance`
+true and decreases on other accounts where it was false. These observations do not
+establish the meaning of the flag or prove which requests caused every decrease.
 
-| account state | a "Free Unlimited" request | effect on the daily allowance |
-| --- | --- | --- |
-| `visibleAllowance: true` | served | **none** — the counter does not move |
-| `visibleAllowance: false` | served | **billed like any other model** |
-
-Measured, not assumed. Three consecutive `particle` calls through an account
-with `visibleAllowance: true` left `remainingCreditsToday` at exactly `6861`.
-Two other accounts on the same proxy ended a day at `5744` and `6000` credits
-consumed while **every single logged request was a free-unlimited id** — no paid
-model appears anywhere in the logs. Same models, opposite billing, and the only
-difference was the flag.
-
-The practical consequence is nasty because it is silent: an account can burn its
-whole daily allowance on models the documentation calls free, while the request
-log looks completely innocent. Two of the three accounts here did exactly that.
-So:
-
-- do not conclude "it was free, therefore something else drained the credits" —
-  check `meteredDespiteFreeTier` in `GET /usage` before trusting the label
-- an account with `meteredDespiteFreeTier: true` should be treated as a **paid**
-  account for budgeting purposes, even on a free-unlimited model id
-- the flag is reported by the upstream on every measurement; the proxy records
-  it but cannot change it, so a request that draws down the allowance is
-  reported in `/usage` rather than blocked
-
-Opening a sponsor window clears a pause (`403 ads_required`), and it does **not**
-return credits. It is not a way to undo a drain that already happened.
+The credit guard is disabled at the user's request. The proxy records sampled
+balances and request account/model/status in `~/.free-pi/proxy/credit-usage.jsonl`;
+these snapshots do not attribute each balance change to an individual request.
 
 #### Manual selection pins your budget
 
@@ -649,3 +659,26 @@ Open `proxy.mjs` and update the `FREEPI_VERSION` constant to the latest
 free-pi offers free inference because ads pay for it.  This proxy calls
 `/ads/next` every 30 seconds and prints the ad content to its terminal.
 Do **not** suppress or skip this — it's what makes the free tier sustainable.
+
+## Restarting DeepSeek Harness without abandoning work
+
+Use `node tools/restart-dsh.mjs --delay 5` from this directory. Do not replace
+it with `taskkill /T`, a bare process kill, or a browser URL. The independent
+helper captures active session/turn identities, restarts the actual desktop
+executable, waits for its new API, then submits one idempotent continuation for
+each still-interrupted turn. Finished, user-cancelled and already-advanced turns
+are skipped. The model request itself is interrupted; continuation starts a new
+turn in the same persisted conversation. Unknown tool outcomes must be checked
+before any side effect is repeated. See `logs/dsh-restart.log` and the matching
+`logs/restart-handoff-<helper-pid>.json` for verified launch and acceptance status.
+
+## CLI version upgrades
+
+The reported client version comes from the official `free-pi-cli` installed in
+`runtime/freepi-cli`, rather than a hard-coded version. On HTTP 426 with
+`upgrade_required`, the proxy installs `free-pi-cli@latest` using npm, checks the
+installed version against the server minimum, and invokes the restart helper
+with `--refresh-proxy`. A shared update lock and restart cooldown prevent
+parallel requests from starting duplicate installers. Active chats use the
+restart continuation described above. Check `/health` (`clientRuntime`) and
+`logs/client-update.log` for the installed version and update result.

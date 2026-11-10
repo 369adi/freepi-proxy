@@ -13,6 +13,21 @@ function setup(timeout = 1000) {
   return { upstream, downstream, releases: () => releases };
 }
 
+test('SSE keepalives without actual model content cannot occupy a lane forever', async () => {
+  const {upstream,downstream,releases}=setup(20),response=new EventEmitter();
+  response.headers={'content-type':'text/event-stream'};upstream.emit('response',response);
+  const timer=setInterval(()=>response.emit('data',Buffer.from(': keepalive\n\ndata: {"choices":[{"delta":{"role":"assistant"}}]}\n\n')),3);
+  try{await new Promise(resolve=>setTimeout(resolve,45));assert.equal(upstream.destroyed,true);assert.equal(downstream.destroyed,true);assert.equal(releases(),1);}
+  finally{clearInterval(timer);}
+});
+test('real reasoning and tool output keep a live model stream running', async () => {
+  const {upstream,releases}=setup(25),response=new EventEmitter();
+  response.headers={'content-type':'text/event-stream'};upstream.emit('response',response);
+  const timer=setInterval(()=>response.emit('data',Buffer.from('data: {"choices":[{"delta":{"reasoning_content":"working"}}]}\n\n')),4);
+  try{await new Promise(resolve=>setTimeout(resolve,60));assert.equal(upstream.destroyed,undefined);response.emit('end');assert.equal(releases(),1);}
+  finally{clearInterval(timer);}
+});
+
 test('client disconnect before response headers cancels upstream and releases exactly once', () => {
   const { upstream, downstream, releases } = setup();
   downstream.destroy();

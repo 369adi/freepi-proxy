@@ -30,6 +30,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { sessionCookie } from './restart-dsh.mjs';
+import { record } from './alert.mjs';
+import { decodeTranscript, parseEvents, lastTurn } from './read-session.mjs';
 
 const run = promisify(execFile);
 
@@ -218,15 +220,27 @@ function status() {
  * Record the current session and moment, then start the detached loop.
  */
 async function arm() {
+  await stop(true);
   const session = newestSession();
+  // Remember the current port so the loop can tell the new instance apart from
+  // the one that is about to be stopped.
+  const portAtArm = await guiPort().catch(() => undefined);
+  const {captureTurns}=await import('./restart-continuation.mjs');
+  const manifestFile=join(LOG_DIR,'watch-turn.handoff.json');
+  mkdirSync(LOG_DIR,{recursive:true});
+  await captureTurns(portAtArm,manifestFile);
+  const appAtArm=await appProcesses();
   const state = {
     armedAt: Date.now(),
     session: session?.file,
     sessionMtime: session?.mtime,
+    portAtArm,
+    appPids:appAtArm.map(row=>row.pid),
+    manifestFile,
   };
   mkdirSync(LOG_DIR, { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  log(`armed for ${session?.file ?? 'no session yet'}`);
+  log(`armed for ${session?.file ?? 'no session yet'}; port ${portAtArm ?? 'unknown'}`);
 
   const pid = await startLoop();
   log(`loop started (pid ${pid})`);
@@ -256,71 +270,59 @@ async function startLoop() {
  * publish an authenticated continuation URL.
  */
 async function loop() {
-  mkdirSync(LOG_DIR, { recursive: true });
-  writeFileSync(PID_FILE, String(process.pid));
+  mkdirSync(LOG_DIR,{recursive:true});
+  writeFileSync(PID_FILE,String(process.pid));
   log(`loop running (pid ${process.pid})`);
-
-  const state = existsSync(STATE_FILE)
-    ? JSON.parse(readFileSync(STATE_FILE, 'utf8'))
-    : { armedAt: Date.now() };
-  const armedAt = Number(state.armedAt) || Date.now();
-  const sessionAtArm = state.sessionMtime ?? 0;
-  let interrupted = false;
-  let published = false;
-  const deadline = armedAt + 30 * 60 * 1000;
-
-  while (Date.now() < deadline) {
-    const session = newestSession();
-    // An interruption shows up as a transcript that grew past the armed
-    // snapshot and then stopped, while the app is still up.
-    if (session !== undefined && session.mtime > sessionAtArm) {
-      const rows = await appProcesses();
-      const up = rows.length > 0;
-      const idleMs = Date.now() - session.mtime;
-      if (up && idleMs > 20000 && !interrupted) {
-        interrupted = true;
-        log(`turn appears interrupted (session idle ${Math.round(idleMs / 1000)}s)`);
-      }
-    }
-
-    if (!published) {
-      const port = await guiPort();
-      if (port !== undefined) {
-        const cookie = await sessionCookie(port);
-        if (cookie !== undefined) {
-          const url = `http://127.0.0.1:${port}/`;
-          writeFileSync(HANDOFF_FILE, `${new Date().toISOString()} gui at ${url} cookie-ready=yes\n`);
-          log(`gui ready at ${url}; a session cookie can be minted`);
-          published = true;
-          if (existsSync(PID_FILE)) writeFileSync(PID_FILE, String(process.pid));
+  const state=JSON.parse(readFileSync(STATE_FILE,'utf8'));
+  if(!state.manifestFile)throw Error('Re-arm the watcher to capture an exact turn handoff');
+  const {resumeTurns}=await import('./restart-continuation.mjs');
+  const oldPids=new Set(state.appPids||[]);
+  const deadline=Date.now()+30*60*1000;
+  try {
+    while(Date.now()<deadline) {
+      const rows=await appProcesses();
+      const changed=oldPids.size>0 && rows.length>0 && !rows.some(row=>oldPids.has(row.pid));
+      if(changed) {
+        const port=await guiPort();
+        if(port!==undefined) {
+          const entries=await resumeTurns(port,state.manifestFile,{log});
+          if(entries.every(entry=>entry.status!=='pending')) {
+            writeFileSync(HANDOFF_FILE,`${new Date().toISOString()} desktop API at http://127.0.0.1:${port}; continuations checked\n`);
+            log('restart continuation finished');return;
+          }
         }
       }
+      await new Promise(resolve=>setTimeout(resolve,2000));
     }
-
-    await new Promise((done) => { setTimeout(done, 5000); });
+    log('watcher deadline reached; pending handoff retained');
+  } finally {
+    if(existsSync(PID_FILE)&&Number(readFileSync(PID_FILE,'utf8').trim())===process.pid)writeFileSync(PID_FILE,'0');
   }
-
-  log('loop finished');
-  try {
-    if (existsSync(PID_FILE)) writeFileSync(PID_FILE, '0');
-  } catch { /* nothing to clean up */ }
 }
 
 /**
  * Stop a running watcher by pid.
  */
-function stop() {
+async function stop(quiet = false) {
   if (!existsSync(PID_FILE)) {
-    console.log('no watcher pid recorded');
+    if(!quiet)console.log('no watcher pid recorded');
     return;
   }
   const pid = Number(readFileSync(PID_FILE, 'utf8').trim());
   if (pid > 0 && isAlive(pid)) {
+    const {stdout}=await run('powershell.exe',['-NoProfile','-NonInteractive','-Command',
+      `Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' | Select-Object Name,CommandLine | ConvertTo-Json -Compress`],{windowsHide:true,timeout:10000});
+    const owner=JSON.parse(stdout||'null');
+    if(owner?.Name!=='node.exe' || !owner.CommandLine?.includes(fileURLToPath(import.meta.url)) || !owner.CommandLine.includes('--loop')) {
+      if(!quiet)console.log('Recorded PID no longer belongs to this watcher; nothing stopped.');
+      return;
+    }
     process.kill(pid);
     log(`stopped watcher pid ${pid}`);
-    console.log(`stopped watcher pid ${pid}`);
+    writeFileSync(PID_FILE,'0');
+    if(!quiet)console.log(`stopped watcher pid ${pid}`);
   } else {
-    console.log('watcher was not running');
+    if(!quiet)console.log('watcher was not running');
   }
 }
 
@@ -338,7 +340,7 @@ const argv = process.argv.slice(2);
 if (invokedDirectly()) {
   if (argv.includes('--loop')) await loop();
   else if (argv.includes('--status')) status();
-  else if (argv.includes('--stop')) stop();
+  else if (argv.includes('--stop')) await stop();
   else if (argv.includes('--arm')) await arm();
   else {
     console.log('usage: node tools/watch-turn.mjs --arm | --status | --stop');

@@ -16,8 +16,10 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PROXY = path.join(ROOT, 'proxy.mjs');
+const DAEMON = path.join(ROOT, 'tools', 'headless-sponsor.mjs');
 const LOG_DIR = path.join(os.homedir(), '.free-pi', 'proxy');
 const LOG = path.join(LOG_DIR, 'proxy.log');
+const DAEMON_LOG = path.join(LOG_DIR, 'sponsor-headless.log');
 const CRASH_LOG = path.join(LOG_DIR, 'crashes.log');
 const PORT = Number(process.env.FREEPI_PROXY_PORT || 4000);
 
@@ -44,17 +46,30 @@ async function supervise() {
   if (await alive()) note('proxy already listening on :' + PORT + ' - watching it');
 
   let child = null;
+  let daemonChild = null;
   let failures = 0;
+  let shuttingDown = false;
+
+  const spawnOut = (logFile) => {
+    const out = fs.createWriteStream(logFile, { flags: 'a' });
+    out.write('\n===== ' + stamp() + ' start =====\n');
+    return out;
+  };
 
   const startChild = () => {
     if (child) return;
     note('starting proxy (port ' + PORT + '), log -> ' + LOG);
-    const out = fs.createWriteStream(LOG, { flags: 'a' });
-    out.write('\n===== ' + stamp() + ' start =====\n');
+    const out = spawnOut(LOG);
     child = spawn(process.execPath, [PROXY], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, FREEPI_PROXY_PORT: String(PORT) },
+      env: {
+        ...process.env,
+        FREEPI_PROXY_PORT: String(PORT),
+        // Headless sponsor mode: no browser windows. The proxy's openSponsorPanel
+        // returns false and the headless daemon confirms impressions over HTTP.
+        FREEPI_AUTO_SPONSOR: process.env.FREEPI_AUTO_SPONSOR ?? '0',
+      },
     });
     child.stdout.pipe(out);
     child.stderr.pipe(out);
@@ -65,6 +80,27 @@ async function supervise() {
     });
   };
 
+  const startDaemon = () => {
+    if (daemonChild) return;
+    note('starting headless sponsor daemon, log -> ' + DAEMON_LOG);
+    const out = spawnOut(DAEMON_LOG);
+    daemonChild = spawn(process.execPath, [DAEMON], {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, FREEPI_PROXY_PORT: String(PORT) },
+    });
+    daemonChild.stdout.pipe(out);
+    daemonChild.stderr.pipe(out);
+    daemonChild.on('exit', (code, signal) => {
+      note('headless sponsor daemon exited code=' + code + ' signal=' + signal);
+      daemonChild = null;
+      if (shuttingDown) return;
+      if (code === 0) { note('daemon clean exit - not restarting'); process.exit(0); }
+      // Crash loop guard: wait a moment before respawning.
+      setTimeout(startDaemon, 2000);
+    });
+  };
+
   const ensure = async () => {
     if (child) return;
     if (await alive()) return;
@@ -72,6 +108,7 @@ async function supervise() {
   };
 
   await ensure();
+  startDaemon();
 
   setInterval(async () => {
     if (!child) { await ensure(); return; }
@@ -88,8 +125,10 @@ async function supervise() {
   }, 20_000);
 
   process.on('SIGINT', () => {
+    shuttingDown = true;
     note('watchdog stopped (SIGINT)');
     try { child?.kill(); } catch { /* ignore */ }
+    try { daemonChild?.kill(); } catch { /* ignore */ }
     process.exit(0);
   });
 }

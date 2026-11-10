@@ -1,4 +1,4 @@
 @echo off
 powershell.exe -NoProfile -Command "Start-ScheduledTask -TaskName 'FreePi Proxy'; Write-Host 'Proxy managed in the background: http://127.0.0.1:4000/v1'; Write-Host 'Logs: %~dp0logs'"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Show-Sponsor.ps1"
+echo Sponsor windows are disabled (headless mode); impressions are confirmed via tools\headless-sponsor.mjs
 pause

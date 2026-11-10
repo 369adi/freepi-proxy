@@ -49,7 +49,7 @@ export async function refreshAccount(store, account, now = Date.now()) {
       markInvalid(account, 'token rejected (401)');
       return { ok: false, reason: 'unauthorized' };
     }
-    if (err instanceof ApiError && (err.status === 402 || err.status === 429)) {
+    if (err instanceof ApiError && err.status === 402) {
       markExhausted(account, err.message);
       return { ok: false, reason: 'exhausted' };
     }

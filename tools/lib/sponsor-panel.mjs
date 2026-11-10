@@ -28,9 +28,9 @@ function loadCookie() {
 }
 
 /**
- * When each account last confirmed a display. Kept on disk because the guardian
- * uses it to decide which windows to replace: in memory alone every window looks
- * unconfirmed after a restart and the whole pool gets reopened for nothing.
+ * When each account last confirmed a display. Kept on disk for status and
+ * recovery decisions. A stale display timestamp is not evidence that a browser
+ * window is dead; the guardian must never close a live window for this reason.
  *
  * Only timestamps are stored, never an ad, a nonce or a click token - a restored
  * entry says "this account displayed something at that time", which is exactly
@@ -82,8 +82,15 @@ function displayStore() {
  * account-aware so several windows can be open at the same time.
  */
 export function createSponsorPanel({ currentAccount, accounts, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now, port = 4000, onDisplayed = null }) {
+  const sessionFor=account=>typeof sessionId==='function'?sessionId(account):sessionId;
   const cookie = loadCookie();
   const pending = new Map();
+  const windows = new Map();
+  const WINDOW_HEARTBEAT_TTL_MS = 90_000;
+  const liveWindows = () => {
+    for (const [id, window] of windows) if (clock() - window.seen > WINDOW_HEARTBEAT_TTL_MS) windows.delete(id);
+    return [...windows.values()];
+  };
   const acknowledged = new Set();
   // Per account, not global: two open windows must not overwrite each other's
   // ad, or one account would acknowledge another account's creative.
@@ -132,7 +139,7 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
     const cached = latest.get(account.id);
     if (cached && clock() - cached.created <= 60_000) return cached.ad;
     if (!fetching.has(account.id)) {
-      const job = apiRequest('/ads/next?slot=banner', { token: account.token, headers: { 'x-session-id': sessionId } })
+      const job = apiRequest('/ads/next?slot=banner', { token: account.token, headers: { 'x-session-id': sessionFor(account) } })
         .then(ad => { latest.set(account.id, { ad, created: clock() }); return ad; })
         .finally(() => { fetching.delete(account.id); });
       fetching.set(account.id, job);
@@ -170,6 +177,24 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
       res.end(html); return true;
     }
     if (!authorized(req)) { json(res, 403, { error: 'Open the local sponsor window first.' }); return true; }
+    if(req.method==='POST' && url.pathname==='/sponsor/window') {
+      let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>1024)throw Error('Request too large');}
+      const data=JSON.parse(raw),account=await accountFor(url);
+      if(!account || typeof data.id!=='string' || data.id.length>100){json(res,400,{error:'Invalid window'});return true;}
+      if(data.closed){windows.delete(data.id);json(res,200,{ok:true});return true;}
+      const live=liveWindows();
+      let entry=windows.get(data.id);
+      if(!entry){entry={id:data.id,accountId:account.id,seen:clock(),close:false};windows.set(data.id,entry);}
+      entry.seen=clock();
+      // Most recently opened page becomes the single canonical window. An old
+      // page reloading is replaced cleanly rather than treating itself as live.
+      if(data.register)for(const other of live)if(other.accountId===account.id&&other.id!==data.id)other.close=true;
+      json(res,200,{close:entry.close});return true;
+    }
+    if(req.method==='GET' && url.pathname==='/sponsor/windows') {
+      const live=liveWindows();
+      json(res,200,{accounts:Object.fromEntries(live.filter(w=>!w.close).map(w=>[w.accountId,true])),duplicates:live.filter(w=>w.close).length});return true;
+    }
 
     // Which accounts still need a window - the launcher opens one per entry.
     if (req.method === 'GET' && url.pathname === '/sponsor/accounts') {
@@ -230,7 +255,7 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
           try { const response = await pixelFetch(pixel, { signal: AbortSignal.timeout(3000), redirect: 'error' }); pixelSent = response.ok; } catch {}
         }
         await apiRequest('/ads/impression', { method: 'POST', token: account.token,
-          headers: { 'x-session-id': sessionId }, body: { ad_id: record.ad.ad_id, click_token: record.ad.click_token, ...(pixelSent ? { imp_fired: true } : {}) } });
+          headers: { 'x-session-id': sessionFor(account) }, body: { ad_id: record.ad.ad_id, click_token: record.ad.click_token, ...(pixelSent ? { imp_fired: true } : {}) } });
         acknowledged.add(record.ad.click_token);
         if (acknowledged.size > 500) acknowledged.delete(acknowledged.values().next().value);
       }

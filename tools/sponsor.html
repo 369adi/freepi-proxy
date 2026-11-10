@@ -14,6 +14,20 @@ const card=document.querySelector('#ad'),state=document.querySelector('#state');
 // ?account=<id>. Plain /sponsor (no parameter) follows the active account.
 const accountId=new URLSearchParams(location.search).get('account');
 const q=accountId?'?account='+encodeURIComponent(accountId):'';
+if(accountId)document.title='Free-Pi Sponsor - '+accountId;
+const windowId=crypto.randomUUID();
+let duplicateWindow=false;
+async function windowHeartbeat(register=false){
+  if(duplicateWindow)return;
+  try{
+    let r=await fetch('/sponsor/window'+q,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:windowId,register}),signal:AbortSignal.timeout(5000)});
+    if(r.status===403){await fetch('/sponsor'+q);r=await fetch('/sponsor/window'+q,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:windowId,register:true})});}
+    const result=await r.json();
+    if(result.close){duplicateWindow=true;window.close();state.textContent='Duplicate sponsor window — another window for this account is already open. You can close this tab.';}
+  }catch{}
+}
+windowHeartbeat(true);setInterval(()=>windowHeartbeat(),2000);
+addEventListener('pagehide',()=>navigator.sendBeacon('/sponsor/window'+q,JSON.stringify({id:windowId,closed:true})));
 new IntersectionObserver(entries=>{ratio=entries[0].intersectionRatio;},{threshold:[0,1]}).observe(card);
 // A sponsor display only counts when the card is genuinely on screen. Two shapes
 // qualify: the whole card fits into the window, or the card is taller than the
@@ -21,6 +35,7 @@ new IntersectionObserver(entries=>{ratio=entries[0].intersectionRatio;},{thresho
 // The second case exists because a small window never fits the card, and blocking
 // on that would pause the allowance of every account on a small screen.
 function visible(){
+  if(duplicateWindow)return false;
   if(document.visibilityState!=='visible')return false;
   const r=card.getBoundingClientRect();
   if(r.width<=200||r.height<=70)return false;
@@ -30,9 +45,10 @@ function visible(){
   return (fits||fillsTop)&&shown>=Math.min(r.height,innerHeight)*0.9;
 }
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US'):'Not reported';
-function usage(data){const account=(data?.accounts||[]).find(a=>a.id===data.activeAccountId);if(!account)return;const fields=[['Daily allowance',fmt(account.remaining)+' / '+fmt(account.allowance)],['Premium credits',fmt(account.premiumCredits)],['Purchased premium',fmt(account.premiumBoughtCredits)],['Gifted premium',fmt(account.premiumGiftedCredits)]];const root=document.querySelector('#usage');root.replaceChildren();for(const [label,value] of fields){const box=document.createElement('div');box.className='metric';const title=document.createElement('span'),number=document.createElement('strong');title.textContent=label;number.textContent=value;box.append(title,number);root.append(box);}}
-async function load(){if(busy)return;busy=true;try{const r=await fetch('/sponsor/ad'+q,{cache:'no-store',signal:AbortSignal.timeout(25000)}),data=await r.json();if(!r.ok)throw Error(data.error||'Sponsor unavailable');current=data;sent=false;visibleSince=0;lastFetch=Date.now();document.querySelector('#account').textContent=data.account||'';document.querySelector('#headline').textContent=data.noAd?'No sponsor available right now':data.creative.headline;document.querySelector('#body').textContent=data.creative?.body||'';const link=document.querySelector('#link');link.removeAttribute('href');link.textContent='';if(data.url){link.href=data.url;link.textContent=data.creative.cta+' ↗';}usage(data.usage);state.textContent=data.noAd?'No display confirmation sent.':'Sponsor loaded. Waiting for a visible display…';}catch(error){state.textContent=error.message;lastFetch=Date.now()-45000;}finally{busy=false;}}
+function usage(data){const account=(data?.accounts||[]).find(a=>a.id===(accountId||data.activeAccountId));if(!account)return;const fields=[['Daily allowance',fmt(account.remaining)+' / '+fmt(account.allowance)],['Premium credits',fmt(account.premiumCredits)],['Purchased premium',fmt(account.premiumBoughtCredits)],['Gifted premium',fmt(account.premiumGiftedCredits)]];const root=document.querySelector('#usage');root.replaceChildren();for(const [label,value] of fields){const box=document.createElement('div');box.className='metric';const title=document.createElement('span'),number=document.createElement('strong');title.textContent=label;number.textContent=value;box.append(title,number);root.append(box);}}
+async function load(){if(busy)return;busy=true;try{const r=await fetch('/sponsor/ad'+q,{cache:'no-store',signal:AbortSignal.timeout(25000)}),data=await r.json();if(!r.ok)throw Error(data.error||'Sponsor unavailable');current=data;sent=false;visibleSince=0;lastFetch=Date.now();document.querySelector('#account').textContent=(data.accountId?data.accountId+' · ':'')+(data.account||'');document.querySelector('#headline').textContent=data.noAd?'No sponsor available right now':data.creative.headline;document.querySelector('#body').textContent=data.creative?.body||'';const link=document.querySelector('#link');link.removeAttribute('href');link.textContent='';if(data.url){link.href=data.url;link.textContent=data.creative.cta+' ↗';}usage(data.usage);state.textContent=data.noAd?'No display confirmation sent.':'Sponsor loaded. Waiting for a visible display…';}catch(error){state.textContent=error.message;lastFetch=Date.now()-45000;}finally{busy=false;}}
 setInterval(async()=>{if(!visible()){visibleSince=0;state.textContent='Display paused — keep the complete sponsor card visible.';return;}if(!current||Date.now()-lastFetch>60000){load();return;}if(!sent&&current.nonce){if(!visibleSince)visibleSince=Date.now();if(Date.now()-visibleSince>=1500){sent=true;try{const r=await fetch('/sponsor/impression',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({nonce:current.nonce,visible:true}),signal:AbortSignal.timeout(25000)});const data=await r.json();if(!r.ok)throw Error(data.error||'Display confirmation failed');state.textContent='Sponsor displayed · '+new Date().toLocaleTimeString();}catch(error){state.textContent=error.message;lastFetch=0;current=null;}}}},500);
 setInterval(async()=>{if(document.visibilityState!=='visible')return;try{const r=await fetch('/sponsor/status'+q,{signal:AbortSignal.timeout(5000)});const data=await r.json();usage(data.usage);}catch{}},15000);
-document.addEventListener('visibilitychange',()=>{visibleSince=0;if(document.visibilityState==='visible'&&(!current||Date.now()-lastFetch>60000))load();});load();
+document.addEventListener('visibilitychange',()=>{windowHeartbeat();visibleSince=0;if(document.visibilityState==='visible'&&(!current||Date.now()-lastFetch>60000))load();});
+window.addEventListener('focus',()=>windowHeartbeat());load();
 </script></html>

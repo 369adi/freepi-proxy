@@ -9,8 +9,9 @@
 //   POST /auth/token              -> {status:"pending"} | {token} | 403 consent_required
 //   GET  /ads/next?slot=banner    -> sponsor banner
 
+import {getClientVersion,requiredVersion,upgradeClient} from './client-runtime.mjs';
 export const BASE = process.env.FREEPI_API_BASE || 'https://api.freepi.ai';
-export const VERSION = process.env.FREEPI_VERSION || '0.6.15';
+export const VERSION = getClientVersion();
 export const CONSENT_VERSION = '4';
 
 export class ApiError extends Error {
@@ -23,8 +24,8 @@ export class ApiError extends Error {
   }
 }
 
-export async function request(pathname, { method = 'GET', token, body, headers = {}, timeoutMs = 20000 } = {}) {
-  const h = { 'x-client-version': VERSION, accept: 'application/json', ...headers };
+export async function request(pathname, { method = 'GET', token, body, headers = {}, timeoutMs = 20000, upgradeRetried=false } = {}) {
+  const h = { accept: 'application/json', ...headers, 'x-client-version': getClientVersion() };
   if (token) h.authorization = 'Bearer ' + token;
   let payload;
   if (body !== undefined) {
@@ -45,6 +46,10 @@ export async function request(pathname, { method = 'GET', token, body, headers =
   try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON body */ }
 
   if (!res.ok) {
+    if(res.status===426&&(json?.code==='upgrade_required'||json?.error?.code==='upgrade_required')&&!upgradeRetried){
+      await upgradeClient(requiredVersion(json));
+      return request(pathname,{method,token,body,headers,timeoutMs,upgradeRetried:true});
+    }
     const code = json && typeof json.code === 'string' ? json.code : null;
     const msg = (json && typeof json.message === 'string' && json.message) || `HTTP ${res.status}`;
     throw new ApiError(res.status, code, msg, json ?? text);
@@ -57,7 +62,7 @@ export const getMe = token => request('/me', { token });
 
 /** Model catalog (also carries the minimum supported client version). */
 export const getCatalog = token =>
-  request('/client-version?cli_version=' + encodeURIComponent(VERSION), token ? { token } : {});
+  request('/client-version?cli_version=' + encodeURIComponent(getClientVersion()), token ? { token } : {});
 
 /** Start the headless GitHub device flow. */
 export const deviceStart = () => request('/auth/github/device', { method: 'POST', body: {} });

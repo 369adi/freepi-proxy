@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { captureTurns, resumeTurns } from './restart-continuation.mjs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,6 +75,8 @@ function parseArgs(argv) {
       options.open = false;
     } else if (arg === '--dry-run') {
       options.dryRun = true;
+    } else if (arg === '--refresh-proxy') {
+      options.refreshProxy = true;
     }
   }
   return options;
@@ -351,13 +354,9 @@ async function supervise(options) {
   // newest, so the moment the kill cuts a turn off it can wait for the new GUI
   // and publish an authenticated continuation URL. Arming afterwards would be
   // too late: the interruption is what it has to notice.
-  try {
-    await run(process.execPath, [join(HERE, 'watch-turn.mjs'), '--arm'],
-      { timeout: 30000, windowsHide: true });
-    log('turn watcher armed');
-  } catch (error) {
-    log(`could not arm the turn watcher: ${String(error.message ?? error)}`);
-  }
+  const handoffFile=join(LOG_DIR,`restart-handoff-${process.pid}.json`);
+  const handoff=await captureTurns(oldPort,handoffFile);
+  log(`captured ${handoff.entries.length} active turn(s) for continuation; ${handoffFile}`);
 
   // Re-read processes and ports right before the kill. The list captured above
   // is only there to name the old GUI port for the log: across a long delay
@@ -394,6 +393,12 @@ async function supervise(options) {
   const gone = await until(async () => (await appProcesses()).length === 0, 30);
   if (!gone) log('warning: app processes survived the stop; relaunching anyway');
   else log('all app processes are gone');
+  if(options.refreshProxy) {
+    try {
+      await run('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',join(REPO,'Control-Proxy.ps1'),'-Action','restart'],{windowsHide:true,timeout:65000});
+      log('proxy refreshed while Harness clients were stopped');
+    } catch(error) {log('proxy refresh failed; still relaunching desktop: '+error.message);}
+  }
 
   log(`launching ${recipe.exe}`);
   const child = spawn(recipe.exe, recipe.args, {
@@ -401,6 +406,7 @@ async function supervise(options) {
     stdio: 'ignore',
     cwd: dirname(recipe.exe),
   });
+  await new Promise((resolve,reject)=>{child.once('spawn',resolve);child.once('error',reject);});
   child.unref();
   log(`spawned pid ${child.pid ?? 'unknown'}`);
 
@@ -411,8 +417,7 @@ async function supervise(options) {
   }, options.timeout);
 
   if (candidate === false) {
-    log('FATAL: the new instance never appeared');
-    return;
+    throw new Error('The new Harness instance never appeared');
   }
   log(`new instance up: pids ${candidate.map((row) => row.pid).join(', ')}`);
 
@@ -423,7 +428,7 @@ async function supervise(options) {
     // process owns the GUI listener's parent, a utility child may own the
     // socket itself, so every app pid is a candidate.
     const byPid = await guiPort(rows.map((row) => row.pid));
-    if (byPid !== undefined && byPid !== oldPort && await looksLikeGui(byPid)) return byPid;
+    if (byPid !== undefined && await looksLikeGui(byPid)) return byPid;
     // Fallback: the socket cannot be attributed yet. Only a port that is new
     // since before the restart AND answers like the GUI qualifies; anything
     // else (proxy, router, a stray service) keeps its port and is filtered out
@@ -436,46 +441,21 @@ async function supervise(options) {
     return false;
   }, options.timeout);
   if (port === false) {
-    log('FATAL: the new instance opened no listening port');
-    return;
+    throw new Error('The new Harness instance opened no listening port');
   }
   const url = `http://127.0.0.1:${port}`;
   const alive = await until(() => answers(url), 60);
   log(alive ? `gui answers at ${url}` : `warning: ${url} does not answer yet`);
-
-  // Automatic continuation. The GUI authenticates through a cookie bound to
-  // host:port and signed with a secret persisted in ~/.dsh/.credentials.yaml,
-  // so a working session can be minted for whatever port the new instance
-  // picked. Opening the bare URL would only show the 401 page.
-  let authUrl = url;
-  const cookie = await sessionCookie(port);
-  if (cookie === undefined) {
-    log('warning: no browser-session secret found; the URL will ask for a token');
-  } else {
-    authUrl = `${url}/`;
-    log(`session cookie minted for ${url}`);
+  if(!alive)throw new Error('Harness did not become ready');
+  // The desktop launch above opens the actual app. A URL/cookie alone cannot
+  // continue a turn; submit a durable, idempotent prompt to the restored API.
+  for(let attempt=0;attempt<5;attempt++) {
+    const entries=await resumeTurns(port,handoffFile,{log});
+    if(entries.every(entry=>entry.status!=='pending'))break;
+    if(attempt===4)throw new Error('Some interrupted turns remain pending; see '+handoffFile);
+    await new Promise(resolve=>setTimeout(resolve,2000));
   }
-  if (options.open) {
-    log(`opening ${authUrl}`);
-    try {
-      if (cookie === undefined) {
-        await run('cmd.exe', ['/c', 'start', '', authUrl], { timeout: 15000, windowsHide: true });
-      } else {
-        // A private profile keeps this session separate from the user's
-        // everyday browser, so the restart never disturbs existing tabs.
-        const profile = join(homedir(), '.dsh', 'restart-browser');
-        await run('msedge.exe', [
-          `--user-data-dir=${profile}`,
-          '--no-first-run',
-          '--no-default-browser-check',
-          `--app=${authUrl}`,
-        ], { timeout: 15000, windowsHide: true });
-      }
-    } catch (error) {
-      log(`could not open the browser: ${String(error.message ?? error)}`);
-    }
-  }
-  log('--- restart complete ---');
+  log('--- restart complete: desktop app and continuation checked ---');
 }
 
 /**
@@ -589,6 +569,7 @@ if (!invokedDirectly()) {
     const helperArgs = [fileURLToPath(import.meta.url), '--supervise',
       '--delay', String(options.delay), '--timeout', String(options.timeout)];
     if (!options.open) helperArgs.push('--no-open');
+    if (options.refreshProxy) helperArgs.push('--refresh-proxy');
 
     // The helper must not be a descendant of the app. `detached` only gives a
     // child its own console on Windows; it stays in the app's process tree, so

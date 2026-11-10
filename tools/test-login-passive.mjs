@@ -67,7 +67,6 @@ const isSignInPage = new Function('return ' + fnSrc)();
 
 const signInCases = [
   ['https://github.com/login/oauth/authorize?x=1', '', 'github oauth login'],
-  ['https://github.com/login/device', 'Sign in to GitHub', 'device sign-in form'],
   ['https://accounts.google.com/o/oauth2/auth', 'Choose an account', 'google chooser'],
   ['https://github.com/sessions/verified-device', 'two-factor', '2FA prompt'],
   ['https://github.com/login', 'Sign in with Google', 'provider button page'],
@@ -77,6 +76,7 @@ for (const [url, text, label] of signInCases) {
 }
 
 const notSignIn = [
+  ['https://github.com/login/device', 'Sign in to GitHub', 'device code page'],
   ['https://github.com/login/device/success', 'Device connected', 'success page'],
   ['https://freepi.ai/', 'welcome', 'app page'],
 ];

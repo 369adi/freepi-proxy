@@ -15,6 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import {getClientVersion,requiredVersion,upgradeClient} from 'file:///C:/Users/liket/Documents/freepi-proxy/tools/lib/client-runtime.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,7 +25,6 @@ const name = 'command-freepi';
 const inject = ['commands'];
 
 const API_BASE = 'https://api.freepi.ai';
-const CLIENT_VERSION = '0.6.15';
 const CONSENT_VERSION = '4';
 const PROXY_URL = process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000';
 const PROXY_USAGE = PROXY_URL + '/usage';
@@ -498,6 +498,14 @@ const NEVER_CLICK =
 function isSignInPage(url, text) {
   const u = String(url || '');
   const t = String(text || '').toLowerCase();
+  // /login/device is the post-login device flow, not the sign-in form.
+  // Check its exact GitHub route before the general /login matcher; banner
+  // text mentioning two-factor authentication must not stall device entry.
+  try {
+    const page = new URL(u);
+    if (page.protocol === 'https:' && page.hostname === 'github.com' &&
+        /^\/login\/device(?:\/|$)/i.test(page.pathname)) return false;
+  } catch {}
   // A finished device flow must never be mistaken for a sign-in page, even
   // though its URL lives under /login/.
   if (/device\/(success|connected)|\/login\/device\/success/i.test(u)) return false;
@@ -588,7 +596,8 @@ async function driveGithubLogin(session, code, opts = {}) {
     // as <user>">, so the composed label is "Continue Continue as <user>" and
     // an anchored ^continue$ never matches. Match the label anywhere, but only
     // on pages that are unambiguously about this device code.
-    if (!passedPicker && /select_account|signed in as|device activation/i.test(url + ' ' + text)) {
+    if (!passedPicker && !state.inputs.some(i => /^user-code-|^user_code$|^code$/i.test(i.name || '') || i.auto === 'one-time-code') &&
+        /select_account|signed in as|device activation/i.test(url + ' ' + text)) {
       const providerPage = /continue with|sign in with|choose an account|use another account/i.test(text);
       const pickerPattern = providerPage
         ? '/continue as\\s+\\S|weiter als\\s+\\S/i'
@@ -761,9 +770,9 @@ class ApiError extends Error {
   }
 }
 
-async function api(endpoint, { method = 'GET', token, body, signal } = {}) {
+async function api(endpoint, { method = 'GET', token, body, signal, upgradeRetried=false } = {}) {
   const headers = {
-    'x-client-version': CLIENT_VERSION,
+    'x-client-version': getClientVersion(),
     accept: 'application/json',
   };
   if (token) headers.authorization = `Bearer ${token}`;
@@ -792,6 +801,10 @@ async function api(endpoint, { method = 'GET', token, body, signal } = {}) {
   }
 
   if (!res.ok) {
+    if(res.status===426&&(data?.code==='upgrade_required'||data?.error?.code==='upgrade_required')&&!upgradeRetried){
+      await upgradeClient(requiredVersion(data));
+      return api(endpoint,{method,token,body,signal,upgradeRetried:true});
+    }
     const code = data?.code || data?.error?.code || '';
     let message = data?.message || data?.error?.message || text.slice(0, 200);
     // The API reports a missing consent as 403; surface it as its own code.
@@ -1764,4 +1777,4 @@ function apply(ctx) {
   );
 }
 
-export { apply, inject, name };
+export { apply, inject, name, isSignInPage };

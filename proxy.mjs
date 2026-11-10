@@ -12,24 +12,45 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
+import { compareRoutingAccounts } from './tools/lib/routing-order.mjs';
+import { isHourlyCeiling, hourlyReset } from './tools/lib/upstream-errors.mjs';
+import { record as recordAlert } from './tools/alert.mjs';
+import { SessionRouter } from './tools/lib/session-router.mjs';
+import {upstreamSessionId} from './tools/lib/upstream-session.mjs';
+import { EventEmitter } from 'node:events';
+import { waitForSponsorDisplay } from './tools/lib/ad-recovery.mjs';
+const alertLastSent=new Map();
+function failureAlert(kind,account,message) {
+  const key=kind+':'+(account?.id||'-'), now=Date.now();
+  if(now-(alertLastSent.get(key)||0)<60000)return;
+  alertLastSent.set(key,now);
+  recordAlert('error','freepi-proxy',message,{kind,accountId:account?.id||null});
+}
+const sponsorEvents=new EventEmitter();
+sponsorEvents.setMaxListeners(0);
+const workerBindingsFile=path.join(os.homedir(),'.free-pi','proxy','worker-account-bindings.json');
+const sessionRouter = new SessionRouter(Date.now,90000,{
+  load:()=>{try{const value=JSON.parse(fsSync.readFileSync(workerBindingsFile,'utf8').replace(/^\uFEFF/,''));if(!Array.isArray(value)||value.some(row=>!Array.isArray(row)||typeof row[0]!=='string'||typeof row[1]?.accountId!=='string'||typeof row[1]?.sessionId!=='string'))throw Error('Invalid exclusive subagent account bindings');return value;}catch(error){if(error.code==='ENOENT')return [];throw error;}},
+  save:bindings=>{fsSync.mkdirSync(path.dirname(workerBindingsFile),{recursive:true});const tmp=workerBindingsFile+'.tmp';fsSync.writeFileSync(tmp,JSON.stringify(bindings,null,2));fsSync.renameSync(tmp,workerBindingsFile);},
+});
 import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, isMeteredDespiteFreeTier, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, sortForPick, USABLE, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
 import { getCatalog } from './tools/lib/freepi-api.mjs';
+import {getClientVersion,requiredVersion,upgradeClient,runtimeStatus} from './tools/lib/client-runtime.mjs';
 import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR, creditsToHours } from './tools/lib/budget.mjs';
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
-const FREEPI_VERSION = '0.6.15';   // keep in sync with upstream minimum
 const PORT           = Number(process.env.FREEPI_PROXY_PORT ?? 4000);
 const AD_INTERVAL_MS = 30_000;
 const USAGE_POLL_MS  = Number(process.env.FREEPI_USAGE_POLL_MS ?? 60_000);
 const CREDENTIALS_PATH = path.join(os.homedir(), '.free-pi', 'agent', 'credentials.json');
-const SESSION_ID = crypto.randomUUID();
+const sessionIdFor=account=>upstreamSessionId(account,STORE_PATH);
 
 // free-pi allows exactly ONE in-flight request per account ("one request at a
 // time"). Parallel clients - a harness running several subagents - would all but
@@ -38,10 +59,11 @@ const SESSION_ID = crypto.randomUUID();
 //   2. a FIFO queue, so extra requests wait instead of failing.
 const MAX_QUEUE = Number(process.env.FREEPI_MAX_QUEUE ?? 64);
 
-// Opening a sponsor window when free-pi asks for one. On by default, because
-// without a visible ad the account stays locked; FREEPI_AUTO_SPONSOR=0 turns it
-// off completely (no window, no log line).
-const AUTO_SPONSOR = process.env.FREEPI_AUTO_SPONSOR !== '0';
+// Sponsor windows are opt-in: the default is headless (never open a browser
+// window). The headless sponsor daemon (tools/headless-sponsor.mjs) confirms
+// every impression over HTTP instead; FREEPI_AUTO_SPONSOR=1 re-enables the
+// legacy auto-spawn behaviour for setups that want real windows.
+const AUTO_SPONSOR = process.env.FREEPI_AUTO_SPONSOR === '1';
 
 /**
  * Queue a request that found no free account lane. The callback is retried
@@ -92,7 +114,7 @@ function pumpClaims() {
       // A pinned waiter only competes for its own lane. Handing it a different
       // one would silently break the x-freepi-account guarantee.
       if (laneBusy.has(waiter.pinnedId)) continue;
-    } else if (!usableAccounts().some(a => !laneBusy.has(a.id))) return; // no lane free
+    } else if (!usableAccounts(waiter.model).some(a => !laneBusy.has(a.id) && sessionRouter.allowed(a.id, waiter.session, waiter.worker))) continue;
     claimWaiters.splice(i, 1);
     try { claimed = waiter.attemptClaim() === true; } catch (e) { console.error('[queue] ' + e.message); }
     // attemptClaim can fail even though a lane looked free: a parallel claimFor
@@ -147,6 +169,29 @@ function supportsVision(id) {
  * e.g. offline start) - the check is skipped rather than rejecting valid work.
  */
 const KNOWN_MODELS = new Set();
+const DEFAULT_FREE_UNLIMITED_MODELS = ['particle', 'deepseek-v4.1-flash', 'glm-5.3-flash', 'deepseek-v4-flash'];
+const FREE_UNLIMITED_MODELS = new Set(DEFAULT_FREE_UNLIMITED_MODELS);
+let catalog = [];
+function updateFreeModels(models) {
+  const discovered = [];
+  for (const m of models || []) {
+    if (m?.id && !m.unavailable && /free\s+unlimited/i.test(m.name || m.display_name || '')) {
+      discovered.push(String(m.id));
+    }
+  }
+  if (discovered.length) {
+    FREE_UNLIMITED_MODELS.clear();
+    for (const id of discovered) FREE_UNLIMITED_MODELS.add(id);
+  } else if (!FREE_UNLIMITED_MODELS.size) {
+    for (const id of DEFAULT_FREE_UNLIMITED_MODELS) FREE_UNLIMITED_MODELS.add(id);
+  }
+}
+function modelAllowsAccount(account, model, now = Date.now()) {
+  if(!account || !account.token || account.disabled || account.tokenBad)return false;
+  return USABLE.has(stateOf(account, now, STORE?.settings || {})) ||
+    FREE_UNLIMITED_MODELS.has(model) ||
+    (!model && FREE_UNLIMITED_MODELS.size > 0);
+}
 
 /**
  * Closest catalog ids to a mistyped one, for a "did you mean" hint.
@@ -450,21 +495,34 @@ async function chooseAccount() {
 }
 
 /**
+ * Accounts a session-routing reservation may hand out for `model`. This is the
+ * exact eligibility the router uses: credentialed, enabled, token-valid, not in
+ * the ad cooldown (ads_required), and with a usable state for the model. It is
+ * a named function so the router's filter and the unit tests stay in lockstep.
+ */
+function routingCandidates(model, now = Date.now(), includeTemporary = false) {
+  if (!STORE) return [];
+  return STORE.accounts
+    .filter(a => a.token && !a.disabled && !a.tokenBad && !inAdCooldown(a.id, now) && (includeTemporary || !hourlyBlockedNow(a.id, now)) && modelAllowsAccount(a, model, now))
+    .sort(compareRoutingAccounts);
+}
+
+/**
  * Candidate accounts to retry with, best first. `exclude` is an id or a set of
  * ids that already failed for this request: bouncing back to one of them burns
  * upstream requests without any chance of progress.
  */
-function retryCandidates(exclude) {
+function retryCandidates(exclude, model, session, worker) {
   if (!STORE) return [];
   if (MANUAL_ACCOUNT_ID) return [];
   const skip = exclude instanceof Set ? exclude : new Set([exclude].filter(Boolean));
   const now = Date.now();
   return STORE.accounts
-    .filter(a => !a.disabled && !skip.has(a.id) && !a.tokenBad && a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now))
+    .filter(a => !a.disabled && !skip.has(a.id) && !a.tokenBad && a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now) && !hourlyBlockedNow(a.id, now) && sessionRouter.allowed(a.id, session, worker))
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
-    .filter(x => USABLE.has(x.state))
+    .filter(x => modelAllowsAccount(x.account, model, now))
     // Daily allowance first, premium-only accounts last (sortForPick).
-    .sort(sortForPick)
+    .sort(compareRoutingAccounts)
     .map(x => x.account);
 }
 
@@ -476,6 +534,18 @@ function retryCandidates(exclude) {
 // window has shown something (or the cooldown expires, whichever is first).
 
 const AD_COOLDOWN_MS = 10 * 60 * 1000;
+const hourlyBlockFile=path.join(os.homedir(),'.free-pi','proxy','hourly-blocks.json');
+const hourlyBlocked = new Map();
+try {
+  const saved=JSON.parse(fsSync.readFileSync(hourlyBlockFile,'utf8').replace(/^\uFEFF/,''));
+  for(const [id,until] of Object.entries(saved?.accounts||{})) if(typeof id==='string' && Number.isFinite(until) && until>Date.now()) hourlyBlocked.set(id,until);
+} catch (error) { if(error.code!=='ENOENT') console.warn('[proxy] could not restore hourly blocks: '+error.message); }
+function saveHourlyBlocks() {
+  try { fsSync.mkdirSync(path.dirname(hourlyBlockFile),{recursive:true}); const tmp=hourlyBlockFile+'.tmp';fsSync.writeFileSync(tmp,JSON.stringify({version:1,accounts:Object.fromEntries(hourlyBlocked)}));fsSync.renameSync(tmp,hourlyBlockFile); }
+  catch(error) { console.warn('[proxy] could not persist hourly blocks: '+error.message); }
+}
+const upstreamUnavailable = new Map();
+const hourlyBlockedNow = (id, now = Date.now()) => Math.max(hourlyBlocked.get(id) || 0, upstreamUnavailable.get(id) || 0) > now;
 const adBlocked = new Map();   // account id -> when the block was recorded
 
 // Which accounts are currently waiting for a display is worth surviving a
@@ -517,6 +587,13 @@ function markAdsRequired(id) {
 function clearAdsRequired(id) {
   adBlocked.delete(id);
   saveAdState();
+  sponsorEvents.emit('displayed',id);
+}
+async function recoverSponsor(account,downstream) {
+  markAdsRequired(account.id);
+  const displayed=waitForSponsorDisplay(account.id,{events:sponsorEvents,downstream,isBlocked:inAdCooldown});
+  try{openSponsorPanel(account);}catch(error){console.error('[sponsor] '+error.message);}
+  return displayed;
 }
 
 function inAdCooldown(id, now = Date.now()) {
@@ -549,18 +626,18 @@ const laneBusy = new Set();   // account ids currently serving a request
  * before premium-only ones, then most spendable credits, then idlest. A
  * premium-only account still gets a lane, but only after every normal one.
  */
-function usableAccounts() {
+function usableAccounts(model) {
   if (!STORE) return [];
   if (MANUAL_ACCOUNT_ID) {
     const selected = activeAccount();
-    return selected && selected.token && !selected.disabled && !selected.tokenBad ? [selected] : [];
+    return selected && modelAllowsAccount(selected, model) && !inAdCooldown(selected.id) ? [selected] : [];
   }
   const now = Date.now();
   return STORE.accounts
-    .filter(a => !a.disabled && !a.tokenBad && a.token)
+    .filter(a => !a.disabled && !a.tokenBad && a.token && !inAdCooldown(a.id, now) && !hourlyBlockedNow(a.id, now))
     .map(a => ({ account: a, state: stateOf(a, now, STORE.settings) }))
-    .filter(x => USABLE.has(x.state))
-    .sort(sortForPick)
+    .filter(x => modelAllowsAccount(x.account, model, now))
+    .sort(compareRoutingAccounts)
     .map(x => x.account);
 }
 
@@ -569,21 +646,17 @@ function usableAccounts() {
  * every lane is busy. A free lane is preferred over the sticky active account so
  * parallel subagents spread across accounts instead of colliding on one.
  */
-function claimAccount() {
-  const usable = usableAccounts();
+function claimAccount(model, session) {
+  const usable = usableAccounts(model);
   if (!usable.length) {
     // No measured-but-usable account: fall back to the rotator decision path,
     // which may refresh stale data or report a quota problem.
     return null;
   }
-  const free = usable.filter(a => !laneBusy.has(a.id));
+  const free = usable.filter(a => !laneBusy.has(a.id) && sessionRouter.allowed(a.id, session));
   if (!free.length) return null;
-  // Round-robin-ish: least recently used among free lanes keeps wear even.
-  free.sort((a, b) => {
-    const la = a.lastUsedAt ? Date.parse(a.lastUsedAt) : 0;
-    const lb = b.lastUsedAt ? Date.parse(b.lastUsedAt) : 0;
-    return la - lb;
-  });
+  // Balance by measured usage; least recently used breaks ties.
+  free.sort(compareRoutingAccounts);
   const account = free[0];
   laneBusy.add(account.id);
   account.lastUsedAt = new Date().toISOString();
@@ -608,8 +681,11 @@ function makeRelease(account) {
  * Claim a specific account's lane (used when the rotator picked an account
  * before a lane existed). Returns null if that lane is already busy.
  */
-function claimFor(id) {
-  const account = usableAccounts().find(a => a.id === id) || null;
+function claimFor(id, model, session, worker) {
+  if (!sessionRouter.allowed(id, session, worker)) return null;
+  const candidate = STORE?.accounts?.find(a => a.id === id);
+  const account = candidate && candidate.token && !candidate.disabled && !candidate.tokenBad && !inAdCooldown(id) && !hourlyBlockedNow(id) &&
+    modelAllowsAccount(candidate, model) ? candidate : null;
   if (!account) return null;
   if (laneBusy.has(account.id)) return null;
   laneBusy.add(account.id);
@@ -632,9 +708,12 @@ const PIN_HEADER = 'x-freepi-account';
 const PIN_WAIT_TIMEOUT_MS = Math.max(0, Number(process.env.FREEPI_PIN_WAIT_MS ?? 120000));
 
 /** 409 for a pin we cannot honour: unusable account, or lane still busy. */
-function sendPinnedError(status, id, account, code) {
+function sendPinnedError(status, id, account, code, model) {
   const label = (account && (account.handle || account.id)) || id;
-  const why = pinnedUnusableReason(account);
+  const why = pinnedUnusableReason(account, Date.now(), model);
+  const budgetState = account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing';
+  const adsRequired = why === 'waiting for a sponsor ad';
+  if(adsRequired) {status=403;code='ads_required';}
   const headers = { 'content-type': 'application/json', 'access-control-allow-origin': '*' };
   let message;
   if (code === 'account_busy') {
@@ -649,12 +728,13 @@ function sendPinnedError(status, id, account, code) {
   const payload = {
     error: {
       message,
-      type: 'invalid_request_error',
+      type: adsRequired ? 'free_pi_error' : 'invalid_request_error',
       param: PIN_HEADER,
       code,
       ...(code === 'account_busy' ? { retry_after: Math.ceil(PIN_WAIT_TIMEOUT_MS / 1000) } : {}),
       account: id,
-      state: account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing',
+      state: adsRequired ? 'ads_required' : modelAllowsAccount(account, model) ? 'model_available' : budgetState,
+      budgetState,
     },
   };
   headers['content-length'] = Buffer.byteLength(JSON.stringify(payload));
@@ -678,14 +758,15 @@ function isPinHeader(name) {
 }
 
 /** Why a pinned account cannot serve right now, or null when it can. */
-function pinnedUnusableReason(account, now = Date.now()) {
+function pinnedUnusableReason(account, now = Date.now(), model) {
   if (!account) return 'missing';
   if (!account.token) return 'no credential';
   if (account.disabled) return 'disabled';
   if (account.tokenBad) return 'token rejected (' + (account.lastError || '401') + ')';
   const state = stateOf(account, now, STORE ? STORE.settings : {});
-  if (!USABLE.has(state)) return 'state ' + state;
+  if (!modelAllowsAccount(account, model, now)) return 'state ' + state;
   if (inAdCooldown(account.id, now)) return 'waiting for a sponsor ad';
+  if (hourlyBlockedNow(account.id, now)) return 'hourly limit active';
   return null;
 }
 
@@ -752,6 +833,8 @@ function startCatalogRefresh(getToken, intervalMs) {
         if (m && m.id) next.add(String(m.id));
       }
       if (!next.size) return;
+      catalog = list;
+      updateFreeModels(list);
       let added = 0;
       for (const id of next) if (!KNOWN_MODELS.has(id)) added += 1;
       if (added) console.log('[proxy] model catalog refreshed, ' + added + ' new id(s) now accepted');
@@ -762,12 +845,12 @@ function startCatalogRefresh(getToken, intervalMs) {
   if (catalogRefreshTimer.unref) catalogRefreshTimer.unref();
 }
 
-async function fetchAd(token) {
+async function fetchAd(account) {
   try {
     return await httpsGet(`${FREEPI_BASE}/ads/next?slot=banner`, {
-      authorization: `Bearer ${token}`,
-      'x-session-id': SESSION_ID,
-      'x-client-version': FREEPI_VERSION,
+      authorization: `Bearer ${account.token}`,
+      'x-session-id': sessionIdFor(account),
+      'x-client-version': getClientVersion(),
     });
   } catch { return null; }
 }
@@ -896,6 +979,13 @@ function sponsorSlotFor(id) {
  */
 function openSponsorPanel(account) {
   if (!AUTO_SPONSOR) return false;
+  if(process.platform==='win32') {
+    const helper=spawn('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
+      path.join(path.dirname(fileURLToPath(import.meta.url)),'Show-Sponsor.ps1'),
+      ...(account?.id?['-AccountId',account.id]:[])],{detached:true,stdio:'ignore',windowsHide:true});
+    helper.on('error',error=>console.error('[sponsor] launcher: '+error.message));helper.unref();
+    sponsorNudgedAt.set(account?.id||'-',Date.now());return true;
+  }
   // Must match safeAccountId's own fallback ('active'), otherwise the same
   // account ends up with two profiles: proxy.mjs used '-', Show-Sponsor.ps1
   // uses 'active' - two windows, separate logins, both fighting over the ad.
@@ -967,17 +1057,15 @@ function sponsorWindowAt(id) {
  * `opened` says whether a window was really started - the message must not
  * claim one when FREEPI_AUTO_SPONSOR=0 or no browser was found.
  */
-function adsRequiredBody(opened) {
+function adsRequiredBody(opened, account) {
+  const url = SPONSOR_URL + (account?.id ? '?account=' + encodeURIComponent(account.id) : '');
   return Buffer.from(JSON.stringify({
     error: {
-      message:
-        'free-pi requires a sponsor view for this account. ' +
-        (opened
-          ? SPONSOR_URL + ' was opened - keep the card visible for a moment, then retry.'
-          : 'Open ' + SPONSOR_URL + ' in a browser, keep the card visible for a moment, then retry.'),
+      message: 'Free-Pi requires a sponsor view for ' + (account?.id || 'this account') +
+        '. Open its sponsor window and keep the complete card visible until it says Sponsor displayed, then retry. ' + url,
       type: 'ads_required',
-      sponsor_url: SPONSOR_URL,
-      sponsor_window_opened: opened === true,
+      sponsor_url: url,
+      sponsor_window_requested: opened === true,
     },
   }));
 }
@@ -1007,12 +1095,15 @@ function sessionCapBody(account, retryAfterSeconds) {
  * render `error.message`; a bare upstream body is silently swallowed.
  */
 function upstreamErrorBody(raw, fallbackMessage) {
+  let code, retryAfter;
   let message = fallbackMessage;
   let type = 'upstream_error';
   const text = raw && raw.length ? raw.toString() : '';
   if (text) {
     try {
       const parsed = JSON.parse(text);
+      code=parsed?.error?.code||parsed?.code;
+      retryAfter=parsed?.retry_after_seconds||parsed?.error?.retry_after_seconds;
       const err = parsed && parsed.error;
       if (typeof err === 'string' && err) {
         message = err;
@@ -1029,7 +1120,7 @@ function upstreamErrorBody(raw, fallbackMessage) {
       if (/^[\x20-\x7e\s]{0,300}$/.test(text)) message = text.trim().slice(0, 300) || message;
     }
   }
-  return Buffer.from(JSON.stringify({ error: { message, type } }));
+  return Buffer.from(JSON.stringify({ error: { message, type, ...(typeof code==='string'?{code}:{}), ...(typeof retryAfter==='number'?{retry_after_seconds:retryAfter}:{}) } }));
 }
 
 /**
@@ -1059,7 +1150,7 @@ async function runAdLoop() {
     for (let attempt = 0; attempt < order.length; attempt++) {
       const account = order[(cursor + attempt) % order.length];
       try {
-        const a = await fetchAd(account.token);
+        const a = await fetchAd(account);
         if (a && a.status === 200) {
           cursor = (cursor + attempt + 1) % order.length;
           renderAd(a);
@@ -1073,6 +1164,17 @@ async function runAdLoop() {
   setInterval(tick, AD_INTERVAL_MS);
 }
 
+// Local rolling audit contains account IDs and balances, never tokens or prompts.
+const creditAuditFile=path.join(os.homedir(),'.free-pi','proxy','credit-usage.jsonl');
+function auditCredit(record) {
+  try { fsSync.mkdirSync(path.dirname(creditAuditFile),{recursive:true});fsSync.appendFileSync(creditAuditFile,JSON.stringify({at:new Date().toISOString(),...record})+'\n'); }
+  catch(error) { console.error('[usage audit] '+error.message); }
+}
+function auditBalances() {
+  for(const a of STORE?.accounts||[]) { const u=a.usage; if(!u)continue;
+    auditCredit({event:'balance',account:a.id,measuredAt:u.fetchedAt,daily:u.remainingCreditsToday,allowance:u.allowanceCredits,premium:u.premiumCredits,visibleAllowance:u.visibleAllowance}); }
+}
+
 /** Background: keep the usage numbers warm and rotate before the budget dies. */
 async function runUsageLoop() {
   const tick = async () => {
@@ -1083,10 +1185,12 @@ async function runUsageLoop() {
         const selected = activeAccount();
         if (selected) await refreshAccount(STORE, selected, Date.now());
         await persist();
+        auditBalances();
         return;
       }
       await refreshAll(STORE, { now: Date.now() });
       await persist();
+      auditBalances();
       const d = decide(STORE, Date.now(), STORE.settings);
       if (d.action === 'switch') {
         const target = findAccount(STORE, d.accountId);
@@ -1123,7 +1227,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
   inReq.on('data', c => chunks.push(c));
   inReq.on('end', async () => {
     const body = Buffer.concat(chunks);
-    if (MANUAL_ACCOUNT_ID && !usableAccounts().length) {
+    if(runtimeStatus().restartPending){inRes.writeHead(503,{'content-type':'application/json','retry-after':'15'});inRes.end(JSON.stringify({error:{code:'upgrade_required',message:'Official CLI updated; restarting proxy and restoring active sessions.'}}));return;}
+    const routingSession = typeof inReq.headers['x-freepi-session'] === 'string' ? inReq.headers['x-freepi-session'].slice(0,200) : undefined;
+    const routingWorker = typeof inReq.headers['x-freepi-worker'] === 'string' ? inReq.headers['x-freepi-worker'].slice(0,200) : undefined;
+    if(routingWorker && inReq.headers['x-freepi-chat']!==routingWorker){inRes.writeHead(400,{'content-type':'application/json'});inRes.end(JSON.stringify({error:{code:'worker_chat_mismatch',message:'A subagent must use its own chat identity.'}}));return;}
+    if (!routingSession && MANUAL_ACCOUNT_ID && (!activeAccount()?.token || activeAccount()?.disabled || activeAccount()?.tokenBad)) {
       inRes.writeHead(401, { 'content-type': 'application/json' });
       inRes.end(JSON.stringify({ error: { message: 'The selected account needs a valid sign-in. Use /freepi-switch to select an existing account.', type: 'selected_account_unavailable' } }));
       return;
@@ -1184,9 +1292,31 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         return;
       }
       const pinnedAccount = STORE ? findAccount(STORE, pinnedAccountId) : null;
-      const why = pinnedUnusableReason(pinnedAccount);
+      let why = pinnedUnusableReason(pinnedAccount, Date.now(), wantedModel);
+      if(why==='waiting for a sponsor ad') {
+        const displayed=await recoverSponsor(pinnedAccount,inRes);
+        if(inRes.destroyed)return;
+        if(!displayed){
+          // The pinned account is in the ad cooldown and its sponsor window did
+          // not confirm in time. If another free account can serve this model,
+          // fall back to it instead of failing the whole request with 503.
+          // The pin only narrows the pool; it never makes a usable request fail
+          // just because the chosen lane is temporarily blocked.
+          const alt = retryCandidates(new Set([pinnedAccountId]), wantedModel, routingSession, routingWorker)[0];
+          if (alt) { pinnedAccountId = null; why = null; }
+          else { const error=sendPinnedError(503,pinnedAccountId,pinnedAccount,'ads_required',wantedModel);inRes.writeHead(503,error.headers);inRes.end(error.body);return; }
+        }
+        why=pinnedUnusableReason(pinnedAccount,Date.now(),wantedModel);
+      }
+      if (why && routingSession) {
+        const movedId = sessionRouter.moveReservation(routingSession, routingWorker, pinnedAccountId, routingCandidates(wantedModel), laneBusy);
+        if (movedId) {
+          pinnedAccountId = movedId;
+          why = null;
+        }
+      }
       if (why) {
-        const pinned = sendPinnedError(409, pinnedAccountId, pinnedAccount, 'account_unusable');
+        const pinned = sendPinnedError(409, pinnedAccountId, pinnedAccount, 'account_unusable', wantedModel);
         inRes.writeHead(pinned.status, pinned.headers);
         inRes.end(pinned.body);
         return;
@@ -1200,20 +1330,28 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     // local variable of exactly this request: every claim below uses claimFor(pin)
     // and every retry path is told about it, so the pin survives the whole
     // request and is never widened to "any account".
-    const pin = pinnedAccountId;
+    let pin = pinnedAccountId;
     const start = (claimed) => {
       let account = claimed ? claimed.account : null;
       let releaseLane = claimed ? claimed.release : () => {};
 
       const withAccount = async () => {
         if (!account && pin) {
-          // A pinned request never falls back: the account may have become
-          // unusable while it waited, and running on another lane would silently
-          // break the reservation.
-          const pinned = STORE ? findAccount(STORE, pin) : null;
+          // A pinned request never falls back unless it is a session-router
+          // reservation that can safely rebind to another free candidate.
+          let pinned = STORE ? findAccount(STORE, pin) : null;
           releaseLane();
-          if (pinnedUnusableReason(pinned)) { relayPinnedError(pin, pinned, 'account_unusable'); return; }
-          const reclaimed = claimFor(pin);
+          if (pinnedUnusableReason(pinned, Date.now(), wantedModel)) {
+            if (routingSession) {
+              const movedId = sessionRouter.moveReservation(routingSession, routingWorker, pin, routingCandidates(wantedModel), laneBusy);
+              if (movedId) {
+                pin = movedId;
+                pinned = STORE ? findAccount(STORE, pin) : null;
+              }
+            }
+            if (pinnedUnusableReason(pinned, Date.now(), wantedModel)) { relayPinnedError(pin, pinned, 'account_unusable'); return; }
+          }
+          const reclaimed = claimFor(pin, wantedModel, routingSession, routingWorker);
           if (reclaimed) { account = reclaimed.account; releaseLane = reclaimed.release; }
         }
         if (!account && !pin) {
@@ -1221,7 +1359,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           // still has to hold a lane, otherwise this request could run beside
           // another one on the same account and trigger a "concurrent" reject.
           const fallback = await chooseAccount();
-          const reclaimed = fallback ? claimFor(fallback.id) : null;
+          const reclaimed = fallback ? claimFor(fallback.id, wantedModel, routingSession, routingWorker) : null;
           if (reclaimed) { account = reclaimed.account; releaseLane = reclaimed.release; }
         }
         if (!account || !account.token) {
@@ -1244,7 +1382,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     const tryClaim = () => {
       // Pinned: only that lane is acceptable. claimAccount() must not be asked -
       // it would hand out any free lane and void the reservation.
-      const claimed = pin ? claimFor(pin) : claimAccount();
+      const claimed = pin ? claimFor(pin, wantedModel, routingSession, routingWorker) : claimAccount(wantedModel, routingSession);
       if (claimed) { start(claimed); return true; }
       return false;
     };
@@ -1252,7 +1390,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     if (!tryClaim()) {
       // Every lane busy: queue, and claim a lane when one frees up.
       let pinTimer = null;
-      const slot = enqueueClaim(() => { tryClaim(); }, pin ? { pinnedId: pin } : {});
+      const slot = enqueueClaim(() => {
+        const claimed = tryClaim();
+        if (claimed && pinTimer) clearTimeout(pinTimer);
+        return claimed;
+      }, { model: wantedModel, session: routingSession, worker: routingWorker, ...(pin ? { pinnedId: pin } : {}) });
       if (!slot.accepted) {
         inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
         inRes.end(JSON.stringify({
@@ -1263,16 +1405,21 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         }));
         return;
       }
-      if (pin) {
+      {
         // The caller picked this account on purpose, so waiting beats a 409 in a
         // retry loop - but not forever. When the lane is still occupied after
         // the timeout the answer is an explicit, retryable 409.
         pinTimer = setTimeout(() => {
           if (inRes.writableEnded || inRes.destroyed) return;
           slot.cancel?.();
-          const bodyPin = sendPinnedError(409, pin, STORE ? findAccount(STORE, pin) : null, 'account_busy');
-          inRes.writeHead(409, bodyPin.headers);
-          inRes.end(bodyPin.body);
+          if (pin) {
+            const bodyPin = sendPinnedError(409, pin, STORE ? findAccount(STORE, pin) : null, 'account_busy', wantedModel);
+            inRes.writeHead(409, bodyPin.headers);
+            inRes.end(bodyPin.body);
+          } else {
+            inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
+            inRes.end(JSON.stringify({ error: { message: 'All account lanes are busy. Queue wait timed out; retry shortly.', type: 'queue_timeout' } }));
+          }
         }, PIN_WAIT_TIMEOUT_MS);
         pinTimer.unref?.();
       }
@@ -1295,6 +1442,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     };
 
     let retries = 0;
+    let sponsorRetries = 0;
     const tried = new Set();      // accounts that already failed this request
     const MAX_RETRIES = 4;        // concurrent races tolerated on one account
     const MAX_SWAPS = 3;          // account switches for one client request
@@ -1307,8 +1455,6 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     const upstreamHeaders = {
       'content-type': 'application/json',
       'content-length': body.length,
-      'x-session-id': SESSION_ID,
-      'x-client-version': FREEPI_VERSION,
     };
     for (const [name, value] of Object.entries(inReq.headers)) {
       if (isPinHeader(name)) continue;
@@ -1316,13 +1462,50 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     }
 
     const send = (token) => {
+      auditCredit({event:'request',account:account.id,model:wantedModel});
+      let responseWillRetry=false;
       const upReq = https.request({
         hostname: 'api.freepi.ai',
         port: 443,
         path: '/v1/chat/completions',
         method: 'POST',
-        headers: { ...upstreamHeaders, authorization: 'Bearer ' + token },
+        headers: { ...upstreamHeaders, authorization: 'Bearer ' + token, 'x-session-id':sessionIdFor(account),'x-client-version':getClientVersion() },
       }, upRes => {
+        auditCredit({event:'response',account:account.id,model:wantedModel,status:upRes.statusCode});
+        if(upRes.statusCode===426&&!inRes.headersSent){
+          const chunks=[];upRes.on('data',chunk=>chunks.push(chunk));upRes.on('end',async()=>{
+            releaseLaneOnce();let error;try{error=JSON.parse(Buffer.concat(chunks).toString());}catch{}
+            if(error?.code!=='upgrade_required'&&error?.error?.code!=='upgrade_required'){relay(426,upstreamErrorBody(Buffer.concat(chunks),'Client upgrade required'));return;}
+            try{await upgradeClient(requiredVersion(error));if(!inRes.destroyed)relay(503,Buffer.from(JSON.stringify({error:{code:'upgrade_required',message:'Official CLI updated to '+getClientVersion()+'. Proxy is restarting; the active chat will resume.'}})));}
+            catch(updateError){console.error('[upgrade] '+updateError.message);if(!inRes.destroyed)relay(503,Buffer.from(JSON.stringify({error:{code:'client_update_failed',message:updateError.message}})));}
+          });return;
+        }
+        if(upRes.statusCode===502 && !inRes.headersSent) {
+          const errors=[];upRes.on('data',chunk=>errors.push(chunk));upRes.on('end',()=>{
+            const raw=Buffer.concat(errors);
+            if (/upstream responded 402/i.test(raw.toString())) {
+              failureAlert('upstream_402',account,'Free-Pi backend returned 502 / upstream 402; the proxy will try another eligible account.');
+              // This is an upstream failure, not evidence of an empty local
+              // balance. Briefly avoid hammering this account and try another
+              // only for an active routed session with an exclusive lane.
+              upstreamUnavailable.set(account.id,Date.now()+60000);
+              if(routingSession && swaps<MAX_SWAPS) {
+                const from=account.id;
+                const nextId=sessionRouter.moveReservation(routingSession,routingWorker,from,routingCandidates(wantedModel),laneBusy);
+                if(nextId) {
+                  const next=claimFor(nextId,wantedModel,routingSession,routingWorker);
+                  if(next) {
+                    releaseLane();releaseLane=next.release;account=next.account;
+                    swaps++;retries=0;responseWillRetry=true;
+                    console.log(`[proxy] upstream 402: ${from} -> ${nextId}`);
+                    send(account.token);return;
+                  }
+                }
+              }
+            }
+            releaseLaneOnce();relay(502,upstreamErrorBody(raw,'Free-Pi upstream temporarily unavailable.'));
+          });return;
+        }
         if (QUOTA_STATUS.has(upRes.statusCode) && inRes.headersSent) {
           // The upstream refused us after we had already committed a 200 to the
           // client (it happens on streamed responses). Nothing can be salvaged,
@@ -1331,10 +1514,11 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
           upRes.on('end', () => {
-            markExhausted(account, `upstream ${upRes.statusCode}`);
-            account.usage = account.usage || {};
-            account.usage.remainingCreditsToday = 0;
-            persist().catch(() => {});
+            const raw = Buffer.concat(errChunks);
+            if (!isHourlyCeiling(raw)) {
+              markExhausted(account, `upstream ${upRes.statusCode}`);
+              persist().catch(() => {});
+            }
             console.warn(`[rotator] ${account.id} returned ${upRes.statusCode} mid-stream - aborting response`);
             inRes.destroy(new Error('upstream quota exhausted mid-stream (' + upRes.statusCode + ')'));
             releaseLaneOnce();
@@ -1344,18 +1528,51 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => {
+          upRes.on('end', async () => {
             const raw = Buffer.concat(errChunks);
+            if (isHourlyCeiling(raw)) {
+              const reset=hourlyReset(raw,upRes.headers);
+              failureAlert('hourly_ceiling',account,'Free-Pi reported an hourly account limit; retry after the recorded reset.');
+              hourlyBlocked.set(account.id,reset.until);
+              saveHourlyBlocks();
+              console.log(`[proxy] hourly block for ${account.id} until ${new Date(reset.until).toISOString()} (${reset.source})`);
+              console.warn(`[proxy] ${account.id} hit Free-Pi hourly ceiling; daily balance unchanged`);
+              // Only routed Harness sessions may move their reservation. A
+              // manual x-freepi-account pin remains an explicit pin.
+              if (routingSession && swaps < MAX_SWAPS) {
+                const from=account.id;
+                const nextId=sessionRouter.moveReservation(routingSession,routingWorker,from,routingCandidates(wantedModel),laneBusy);
+                if(nextId) {
+                  const next=claimFor(nextId,wantedModel,routingSession,routingWorker);
+                  if(next) {
+                    releaseLane(); releaseLane=next.release; account=next.account;
+                    swaps++; retries=0; responseWillRetry=true;
+                    console.log(`[proxy] hourly limit: ${from} -> ${nextId}`);
+                    send(account.token); return;
+                  }
+                }
+              }
+              releaseLaneOnce();
+              relay(429, upstreamErrorBody(raw, 'Free-Pi reported an hourly limit.'));
+              return;
+            }
             // "concurrent" means *we* sent two requests at once, not that the
             // account is out of credits - never mark it exhausted for that.
             let code = '';
             try { code = JSON.parse(raw.toString()).code || ''; } catch { /* ignore */ }
+            if (code === 'model_at_capacity' || code === 'model_busy') {
+              // Capacity describes the model, never the account's balance.
+              releaseLaneOnce();
+              relay(503, upstreamErrorBody(raw,'Model temporarily busy; retry shortly.'));
+              return;
+            }
             if (code === 'concurrent' || raw.toString().includes('one request at a time')) {
               // Another client raced us on this account (e.g. the pi TUI). The
               // lane stays ours, so retry on it after a short backoff.
               console.warn('[proxy] upstream said concurrent - retrying after backoff');
               retries++;
               if (retries > MAX_RETRIES) { releaseLaneOnce(); relay(429, raw); return; }
+              responseWillRetry=true;
               setTimeout(() => {
                 if (inRes.destroyed) { releaseLaneOnce(); return; }
                 send(account.token);
@@ -1365,16 +1582,16 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             if (code === 'concurrent_session') {
               // Different from `concurrent`: this is an account-wide cap on
               // parallel CLI sessions (4 for a signed-in account), usually from
-              // crashed or abandoned runs. It is not a credit problem and the
-              // account is not broken, so retrying here does nothing - the slot
-              // frees itself after retry_after_seconds. Say so plainly instead
-              // of relaying a bare 409 the user cannot act on.
+              // crashed or abandoned runs. Temporarily park this account and
+              // rotate to another free account if available.
               let retryAfter = 0;
               try { retryAfter = Number(JSON.parse(raw.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
+              upstreamUnavailable.set(account.id, Date.now() + Math.min(300000, Math.max(15000, (retryAfter || 60) * 1000)));
               console.warn(
                 '[proxy] upstream session cap reached on ' + account.id +
                 (retryAfter ? ' - frees in about ' + Math.ceil(retryAfter / 60) + ' min' : ''),
               );
+              if (await tryNext('session cap')) return;
               releaseLaneOnce();
               relay(429, sessionCapBody(account, retryAfter));
               return;
@@ -1392,23 +1609,31 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (upRes.statusCode === 403 && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => {
+          upRes.on('end', async () => {
             const raw = Buffer.concat(errChunks);
-            releaseLaneOnce();
             if (raw.toString().includes('ads_required')) {
+              failureAlert('ads_required',account,'Free-Pi requires a visible sponsor display; the account sponsor window was requested.');
               // Park this account until its own sponsor window has shown an ad,
               // so the next requests go to a working account instead of
               // repeating the same 403 on every call.
+              responseWillRetry=true;
               markAdsRequired(account.id);
+              if(sponsorRetries++<1) {
+                const displayed=await recoverSponsor(account,inRes);
+                if(inRes.destroyed){releaseLaneOnce();return;}
+                if(displayed){send(account.token);return;}
+              }
+              releaseLaneOnce();
               // A browser problem must never turn this 403 into a 500: the
               // account stays parked either way, the window is only a courtesy.
               let opened = false;
               try { opened = openSponsorPanel(account) === true; } catch (e) { console.error('[sponsor] ' + e.message); }
-              relay(403, adsRequiredBody(opened));
+              relay(503, adsRequiredBody(opened, account));
               return;
             }
             // Never hand a raw upstream payload to the client: an OpenAI client
             // expects {error:{message,type}} and otherwise shows nothing useful.
+            releaseLaneOnce();
             relay(403, upstreamErrorBody(raw, 'upstream refused the request (403)'));
           });
           return;
@@ -1434,17 +1659,30 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       });
       upReq.on('error', err => {
         console.error('[proxy] upstream error: ' + err.message);
+        failureAlert('transport',account,'Connection to Free-Pi failed; retrying where possible.');
         if (inRes.destroyed) { releaseLaneOnce(); return; }
         // The upstream transport failing says nothing about the account, so try
         // a different lane instead of handing the client a 502 straight away.
         if (!inRes.headersSent && retries < 2) {
           retries++;
           tried.add(account.id);
-          const next = pin ? null : retryCandidates(tried)[0];
+          let next = pin ? null : retryCandidates(tried, wantedModel, routingSession, routingWorker)[0];
+          if (!next && pin && routingSession) {
+            const candidates = routingCandidates(wantedModel).filter(a => !tried.has(a.id));
+            const nextId = sessionRouter.moveReservation(routingSession, routingWorker, account.id, candidates, laneBusy);
+            const nextClaim = nextId ? claimFor(nextId, wantedModel, routingSession, routingWorker) : null;
+            if (nextClaim) {
+              releaseLane();
+              releaseLane = nextClaim.release;
+              pin = nextId;
+              next = nextClaim.account;
+            }
+          }
           if (next) {
             console.warn(`[proxy] ${account.id} unreachable (${err.message}) - retrying on ${next.id}`);
             account = next;
-            setTimeout(() => { if (!inRes.destroyed) send(next.token); }, 300 * retries);
+            responseWillRetry = true;
+            setTimeout(() => { if (!inRes.destroyed) send(next.token); else releaseLaneOnce(); }, 300 * retries);
             return;
           }
         }
@@ -1454,7 +1692,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           inRes.end(JSON.stringify({ error: { message: 'upstream: ' + err.message, type: 'proxy_error' } }));
         } else { inRes.destroy(err); releaseLaneOnce(); }
       });
-      bindRequestLifecycle(upReq, inRes, releaseLaneOnce);
+      bindRequestLifecycle(upReq, inRes, ()=>{if(!responseWillRetry)releaseLaneOnce();});
       upReq.write(body);
       upReq.end();
     };
@@ -1470,7 +1708,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
 
     /** Same as relay(), for a pin error built by sendPinnedError(). */
     const relayPinnedError = (id, acc, code) => {
-      const err = sendPinnedError(409, id, acc, code);
+      const err = sendPinnedError(409, id, acc, code, wantedModel);
       if (inRes.headersSent) { inRes.end(); return; }
       inRes.writeHead(err.status, err.headers);
       inRes.end(err.body);
@@ -1482,21 +1720,41 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
      * burns upstream requests without any chance of progress.
      */
     const tryNext = async (reason) => {
-      // A pinned request retries on its own account or not at all. Swapping in
-      // another account would hand the caller's work to a quota it did not
-      // choose, so the pin wins over the swap budget in every case.
-      if (pin) {
-        console.warn('[proxy] ' + pin + ' pinned by x-freepi-account - not switching (' + reason + ')');
-        return false;
-      }
       if (swaps >= MAX_SWAPS) return false;
       tried.add(account.id);
-      const next = retryCandidates(tried)[0];
+      if (pin) {
+        if (!routingSession) {
+          console.warn('[proxy] ' + pin + ' pinned by x-freepi-account - not switching (' + reason + ')');
+          return false;
+        }
+        const candidates = routingCandidates(wantedModel).filter(a => !tried.has(a.id));
+        const nextId = sessionRouter.moveReservation(routingSession, routingWorker, account.id, candidates, laneBusy);
+        if (!nextId) return false;
+        const nextClaim = claimFor(nextId, wantedModel, routingSession, routingWorker);
+        if (!nextClaim) return false;
+        releaseLane();
+        releaseLane = nextClaim.release;
+        pin = nextId;
+        swaps++;
+        await promote(nextClaim.account, reason);
+        account = nextClaim.account;
+        retries = 0;
+        responseWillRetry = true;
+        send(account.token);
+        return true;
+      }
+      const next = retryCandidates(tried, wantedModel, routingSession, routingWorker)[0];
       if (!next) return false;
+      const nextClaim = claimFor(next.id, wantedModel, routingSession, routingWorker);
+      if (nextClaim) {
+        releaseLane();
+        releaseLane = nextClaim.release;
+      }
       swaps++;
       await promote(next, reason);
       account = next;
       retries = 0;   // a fresh account deserves a fresh "concurrent" budget
+      responseWillRetry = true;
       send(next.token);
       return true;
     };
@@ -1510,6 +1768,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (code === 'concurrent_session') {
           let retryAfter = 0;
           try { retryAfter = Number(JSON.parse(buf.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
+          upstreamUnavailable.set(account.id, Date.now() + Math.min(300000, Math.max(15000, (retryAfter || 60) * 1000)));
           console.warn(
             '[proxy] session cap on ' + account.id +
             (retryAfter ? ' - frees in about ' + Math.ceil(retryAfter / 60) + ' min' : ''),
@@ -1582,22 +1841,32 @@ function usageSnapshot() {
       // looks healthy while one account quietly does all the work.
       lastUsedAt: a.lastUsedAt || null,
       busy: laneBusy.has(a.id),
+      hourlyBlocked: hourlyBlockedNow(a.id, now),
+      hourlyBlockedUntil: hourlyBlockedNow(a.id, now) ? new Date(Math.max(hourlyBlocked.get(a.id) || 0, upstreamUnavailable.get(a.id) || 0)).toISOString() : null,
       // True when `x-freepi-account: <id>` would be accepted right now - the
       // exact condition claimFor() uses (usable state, token, free lane, no ad
       // cooldown). A caller can plan its pin from this instead of probing.
-      selectable: USABLE.has(stateOf(a, now, STORE ? STORE.settings : {}))
-        && !!a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now),
+      selectable: modelAllowsAccount(a, undefined, now)
+        && !!a.token && !laneBusy.has(a.id) && !inAdCooldown(a.id, now) && !hourlyBlockedNow(a.id, now),
     })),
     // The hour picture the dollar-like credit numbers hide. free-pi meters in
     // hours (1 h = 5000 credits) and each model costs a multiple of the base
     // rate, so "12705 credits left" is anywhere between 2.5 h and 40 min
     // depending on the model. Computed from the same rows, at 1x: the number an
     // agent harness actually runs out of first.
-    budget: budgetSummary(
-      (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings)),
-      1,
-      USABLE,
-    ),
+    budget: (() => {
+      const rows = (STORE ? STORE.accounts : []).map(a => describe(a, now, STORE.settings));
+      const summary = budgetSummary(rows, 1, USABLE);
+      const freeEligible = (STORE ? STORE.accounts : []).filter(a => modelAllowsAccount(a, undefined, now)).length;
+      if (freeEligible > summary.usableAccounts) {
+        summary.usableAccounts = freeEligible;
+        for (const row of summary.accounts) {
+          const src = STORE?.accounts?.find(a => a.id === row.id);
+          if (src && modelAllowsAccount(src, undefined, now)) row.usable = true;
+        }
+      }
+      return summary;
+    })(),
     // Filled in from the cost ledger by /usage: who served what.
     served: laneServed,
   };
@@ -1671,7 +1940,7 @@ function historyLimit(url) {
 }
 
 function startServer(models, sponsorHtml) {
-  const catalog = (Array.isArray(models) && models.length)
+  catalog = (Array.isArray(models) && models.length)
     ? models
     : [{ id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' }];
 
@@ -1682,6 +1951,7 @@ function startServer(models, sponsorHtml) {
   // it; a live probe proved free-pi rejects that form with 404, so accepting it
   // here would only hide the real reason behind a clear local error.
   KNOWN_MODELS.clear();
+  updateFreeModels(catalog);
   for (const m of catalog) {
     if (m && m.id) KNOWN_MODELS.add(String(m.id));
   }
@@ -1694,7 +1964,7 @@ function startServer(models, sponsorHtml) {
   const sponsorPanel = createSponsorPanel({
     currentAccount: async () => { await syncStore(); return activeAccount(); },
     accounts: async () => { await syncStore(); return STORE.accounts || []; },
-    sessionId: SESSION_ID,
+    sessionId: sessionIdFor,
     usage: usageSnapshot,
     html: sponsorHtml,
     port: PORT,
@@ -1709,6 +1979,48 @@ function startServer(models, sponsorHtml) {
     // Let browser clients read which lane served a request (see send()).
     res.setHeader('access-control-expose-headers', 'x-free-pi-account, x-free-pi-handle');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    if (url.pathname === '/session-routing') {
+      if(req.method==='GET') {
+        const now=Date.now();
+        const valid=STORE?STORE.accounts.filter(a=>a.token&&!a.disabled&&!a.tokenBad):[];
+        const total=valid.length;
+        const available=routingCandidates(undefined,now).length;
+        const hourly=valid.filter(a=>hourlyBlockedNow(a.id,now)).length;
+        res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});
+        res.end(JSON.stringify({accounts:{total,available,busy:laneBusy.size,hourlyBlocked:hourly},sessions:sessionRouter.snapshot(laneBusy),workers:sessionRouter.workerSnapshot(),waitingWorkers:sessionRouter.waitingWorkerSnapshot()})); return;
+      }
+      if(req.method!=='POST' || req.headers['x-freepi-control']!=='session-routing' || req.headers.origin) {
+        res.writeHead(403);res.end();return;
+      }
+      try {
+        let raw=''; for await (const chunk of req) {raw+=chunk; if(raw.length>4096) throw Error('Request too large');}
+        const data=JSON.parse(raw);
+        if(typeof data.sessionId!=='string' || !data.sessionId || data.sessionId.length>200) throw Error('Missing session ID');
+        let result={ok:true};
+        if(data.action==='release') {sessionRouter.release(data.sessionId);setImmediate(pumpClaims);}
+        else if(data.action==='release-worker') {sessionRouter.releaseWorker(data.sessionId);setImmediate(pumpClaims);}
+        else if(data.action==='touch') sessionRouter.touch(data.sessionId);
+        else if(data.action==='notice') sessionRouter.notice(data.sessionId,data.message,data.retryAt);
+        else if(data.action==='reserve'||data.action==='cowork') {
+          // Only hand out accounts that can actually serve the request. The
+          // router used to accept every credentialed account, so a session that
+          // landed on an exhausted one was pinned there and failed with 409
+          // account_unusable on every later call, including every subagent.
+          const now=Date.now();
+          const candidates=routingCandidates(data.model,now);
+          const temporarilyBlocked = !candidates.length && routingCandidates(data.model,now,true).some(a=>hourlyBlockedNow(a.id,now));
+          if(temporarilyBlocked) {
+            const eligible=routingCandidates(data.model,now,true);
+            const next=Math.min(...eligible.map(a=>Math.max(hourlyBlocked.get(a.id)||0,upstreamUnavailable.get(a.id)||0)).filter(t=>t>now));
+            result={accountId:null,status:'waiting',message:'Waiting for Free-Pi account or backend to become available',retryAt:Number.isFinite(next)?next:null};
+          } else {
+            result=data.action==='cowork' ? sessionRouter.reserveWorker(data.workerId,data.sessionId,candidates,laneBusy) : sessionRouter.reserve(data.sessionId,candidates,laneBusy);
+          }
+        } else throw Error('Unknown action');
+        res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(result));
+      } catch(error) {res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({error:error.message}));}
+      return;
+    }
 
     // Cheap liveness probe for the supervisor. Must answer from memory only:
     // no account, no lane, no upstream. A busy proxy is a healthy proxy, so
@@ -1717,6 +2029,8 @@ function startServer(models, sponsorHtml) {
     if (req.method === 'GET' && url.pathname === '/health') {
       const body = JSON.stringify({
         status: 'ok',
+        creditGuard: 'disabled-by-user',
+        clientRuntime: runtimeStatus(),
         uptimeSeconds: Math.floor(process.uptime()),
         inFlight: queueDepth().inFlight,
         waiting: queueDepth().waiting,

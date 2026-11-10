@@ -65,6 +65,37 @@ function Start-Watchdog {
     Write-Guardian 'Watchdog was missing; started a new supervisor.'
 }
 
+function Get-HarnessWatcherPids {
+    $all = @()
+    foreach ($proc in (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
+        if ($proc.CommandLine -and $proc.CommandLine -match 'Watch-Harness\.ps1') {
+            $all += $proc.ProcessId
+        }
+    }
+    return $all
+}
+
+function Start-LimitWatcherIfMissing {
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'auto-continue-limit\.mjs' })
+    if ($running.Count -gt 0) { return }
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    $watch = Join-Path $proxyDirectory 'tools\auto-continue-limit.mjs'
+    Start-Process -FilePath $node -ArgumentList ('"{0}"' -f $watch) -WorkingDirectory $proxyDirectory -WindowStyle Hidden
+    Write-Guardian 'Started automatic API continuation for output token limits.'
+}
+
+function Start-HarnessWatcher {
+    $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $watch = Join-Path $proxyDirectory 'Watch-Harness.ps1'
+    if (-not (Test-Path -LiteralPath $watch)) { Write-Guardian 'Watch-Harness.ps1 missing; cannot start the DSH recovery watcher.'; return }
+    Start-Process -FilePath $ps -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden', '-File', $watch
+    ) -WindowStyle Hidden
+    Write-Guardian 'DSH reconnect watcher was missing; started it.'
+}
+
 # Wander through the sponsor panel exactly like Show-Sponsor.ps1 does: the list
 # sits behind the panel cookie, so a session has to be established first.
 function Get-SponsorAccounts {
@@ -73,6 +104,17 @@ function Get-SponsorAccounts {
         $null = Invoke-WebRequest ($proxyBase + '/sponsor') -WebSession $session -UseBasicParsing -TimeoutSec 8
         $resp = Invoke-RestMethod ($proxyBase + '/sponsor/accounts') -WebSession $session -TimeoutSec 8
         return @($resp.accounts)
+    } catch {
+        return @()
+    }
+}
+
+function Get-RegisteredSponsorAccounts {
+    $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    try {
+        $null = Invoke-WebRequest ($proxyBase + '/sponsor') -WebSession $session -UseBasicParsing -TimeoutSec 8
+        $resp = Invoke-RestMethod ($proxyBase + '/sponsor/windows') -WebSession $session -TimeoutSec 8
+        return @($resp.accounts.PSObject.Properties | Select-Object -ExpandProperty Name)
     } catch {
         return @()
     }
@@ -101,6 +143,8 @@ function Get-OpenSponsorWindows {
         # command line would map an account to a process that cannot be moved.
         if ($proc.CommandLine -match '--type=') { continue }
         if ($proc.CommandLine -match 'sponsor-window\\+(acc-[0-9]+)') {
+            $windowProcess = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+            if (-not $windowProcess -or $windowProcess.MainWindowHandle -eq 0) { continue }
             # Keep the process with a real window for accounts that have several.
             if (-not $map.ContainsKey($matches[1])) {
                 $map[$matches[1]] = [int]$proc.ProcessId
@@ -116,6 +160,7 @@ function Get-OpenSponsorWindows {
 try {
     Add-Type -Namespace GuardianWin -Name Api -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -129,6 +174,14 @@ try {
 function Test-Minimized([int]$Hwnd) {
     if (-not $script:WindowApiOk) { return $false }
     try { return [GuardianWin.Api]::IsIconic([IntPtr]$Hwnd) } catch { return $false }
+}
+
+function Hide-Window([int]$Hwnd) {
+    if ($Hwnd -le 0 -or -not $script:WindowApiOk) { return $false }
+    try {
+        [GuardianWin.Api]::ShowWindowAsync([IntPtr]$Hwnd, 0) | Out-Null
+        return $true
+    } catch { return $false }
 }
 
 function Restore-Window([int]$Hwnd) {
@@ -181,45 +234,9 @@ function Get-SponsorWindowHandle([string]$SafeId) {
 # folders (Crashpad, ShaderCache, Default, ...) and one of them may end up in
 # this directory, so listing it raw would push the slots far to the right and
 # stack the windows again.
-# A window that is merely open proves nothing. The page holds a cookie that is
-# only valid for the run that handed it out, and the panel records the last
-# display per account. After a proxy restart an old window therefore sits there
-# looking healthy while it can no longer confirm anything, and free-pi treats the
-# account as idle until it does. This asks the panel which accounts have gone
-# quiet, so the guardian can reopen exactly those windows and leave the rest
-# alone.
-#
-# The panel guards its account list with its own cookie, so the request has to
-# come from the same session the window would use - fetching /sponsor first and
-# keeping the cookies gives that.
-$script:QuietAfterSeconds = 900
-
-function Get-QuietSponsorAccounts([int]$QuietSeconds) {
-    $quiet = @()
-    try {
-        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-        [void](Invoke-WebRequest -Uri ($proxyBase + '/sponsor') -WebSession $session -UseBasicParsing -TimeoutSec 8)
-        $payload = Invoke-RestMethod -Uri ($proxyBase + '/sponsor/accounts') -WebSession $session -TimeoutSec 8
-    } catch {
-        return $quiet
-    }
-    $now = [DateTime]::UtcNow
-    foreach ($a in @($payload.accounts)) {
-        if (-not $a.id) { continue }
-        $last = $a.lastDisplay
-        if (-not $last) {
-            # Nothing recorded for this account in the current run or the last
-            # one it was written in, so the window has never confirmed.
-            $quiet += $a.id
-            continue
-        }
-        $at = [DateTime]::MinValue
-        $parsed = [DateTime]::TryParse([string]$last.at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$at)
-        if (-not $parsed) { continue }
-        if (($now - $at.ToUniversalTime()).TotalSeconds -ge $QuietSeconds) { $quiet += $a.id }
-    }
-    return $quiet
-}
+# Display age is deliberately not used as a window-health signal. A background
+# browser may be timer-throttled, and a missing impression must never make the
+# guardian kill a still-open sponsor page.
 
 function Get-SponsorSlotIds() {    $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
     $ids = @()
@@ -238,68 +255,29 @@ function Get-SlotFor([string]$SafeId) {
     return @{ X = 30 + ($index * 44); Y = 30 + ($index * 44) }
 }
 
-function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows, [switch]$Force) {
+function Show-SponsorFor([string]$SafeId, [string]$Url, $Browser, $OpenWindows, [switch]$Registered) {
     $root = Join-Path $env:USERPROFILE '.free-pi\sponsor-window'
     $profile = Join-Path $root $SafeId
 
-    if ($OpenWindows.ContainsKey($SafeId) -and -not $Force) {
-        # Already running: never stack a second window, just make sure the
-        # existing one is not minimised, otherwise free-pi pauses the account.
-        $procId = [int]$OpenWindows[$SafeId]
-        $hwnd = Get-MainWindowHandle $procId
-        if ($hwnd -gt 0) {
-            if (Test-Minimized $hwnd) {
-                if (Restore-Window $hwnd) { Write-Guardian ("Sponsor window for " + $SafeId + " was minimised; restored it.") }
+    if ($OpenWindows.ContainsKey($SafeId) -or $Registered) {
+        # A quiet account means no visible impression was recorded. It does not
+        # mean the window is dead, so never kill or reopen it for being quiet.
+        if ($OpenWindows.ContainsKey($SafeId)) {
+            $procId = [int]$OpenWindows[$SafeId]
+            $hwnd = Get-MainWindowHandle $procId
+            if ($hwnd -gt 0) {
+                if (Test-Minimized $hwnd) {
+                    if (Restore-Window $hwnd) { Write-Guardian ("Sponsor window for " + $SafeId + " was minimised; restored it.") }
+                }
+                $slot = Get-SlotFor $SafeId
+                [void](Move-WindowTo $hwnd $slot.X $slot.Y)
             }
-            $slot = Get-SlotFor $SafeId
-            [void](Move-WindowTo $hwnd $slot.X $slot.Y)
         }
         return $false
     }
 
-    if (-not $Browser) { return $false }
-    New-Item -ItemType Directory -Path $profile -Force | Out-Null
-    # Same profile marker the proxy writes: without it Edge opens the welcome
-    # tab and the sponsor card stops being the visible document.
-    try { Set-Content -LiteralPath (Join-Path $profile 'First Run') -Value '' -Force } catch { }
-    try {
-        Start-Process -FilePath $Browser -ArgumentList @(
-            ('--app=' + $Url),
-            ('--user-data-dir=' + $profile),
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--disable-sync',
-            '--disable-features=EdgeSyncConfirmation,MsEdgeFirstRunExperience,EdgePromoPopup',
-            '--no-service-autorun',
-            '--disable-component-update',
-            '--window-size=760,820'
-        ) | Out-Null
-        # Give the window its own place on the desktop. Edge starts every app
-        # window at the same coordinates, so without this every account after
-        # the first is covered by the previous one and never confirms a display.
-        #
-        # The window is looked up by its profile path rather than through the
-        # process Start-Process returned: when a browser for that profile is
-        # already running the new window belongs to the existing process, so the
-        # returned id would point at the wrong window and we would move someone
-        # else's.
-        $slot = Get-SlotFor $SafeId
-        for ($attempt = 0; $attempt -lt 10; $attempt++) {
-            Start-Sleep -Milliseconds 500
-            $hwnd = Get-SponsorWindowHandle $SafeId
-            if ($hwnd -gt 0) {
-                if (Move-WindowTo $hwnd $slot.X $slot.Y) {
-                    Write-Guardian ('Placed the sponsor window for ' + $SafeId + ' at ' + $slot.X + ',' + $slot.Y + '.')
-                }
-                break
-            }
-        }
-        Write-Guardian ('Opened sponsor window for ' + $SafeId)
-        return $true
-    } catch {
-        Write-Guardian ('Could not open the sponsor window for ' + $SafeId + ': ' + $_.Exception.Message)
-        return $false
-    }
+    & (Join-Path $proxyDirectory 'Show-Sponsor.ps1') -AccountId $SafeId
+    return $true
 }
 
 Write-Guardian ('Guardian started; checking every ' + $CheckSeconds + ' seconds.')
@@ -312,6 +290,8 @@ while ($true) {
     try {
         $alive = Test-ProxyAlive
         $watchdogPids = Get-WatchdogPids
+        if ((Get-HarnessWatcherPids).Count -eq 0) { Start-HarnessWatcher }
+        Start-LimitWatcherIfMissing
 
         if (-not $alive) {
             Write-Guardian 'Proxy is not answering; starting the supervisor to bring it back.'
@@ -330,45 +310,14 @@ while ($true) {
             Start-Watchdog
         }
 
-        # Sponsor windows keep the account's free allowance alive. They are only
-        # touched while the proxy answers, because the account list comes from it.
-        if ($alive) {
-            if (([DateTime]::UtcNow - $lastAccountRefresh).TotalSeconds -ge $accountRefreshEvery) {
-                $lastAccountRefresh = [DateTime]::UtcNow
-                $lastAccounts = Get-SponsorAccounts
-                if ($lastAccounts.Count -eq 0) {
-                    Write-Guardian 'Sponsor account list is empty; will retry on the next pass.'
-                }
-            }
-            if ($lastAccounts.Count -gt 0) {
-                $browser = Get-SponsorBrowser
-                if (-not $browser) {
-                    Write-Guardian 'No browser found for the sponsor windows.'
-                } else {
-                    $openWindows = Get-OpenSponsorWindows
-                    $quiet = @(Get-QuietSponsorAccounts $script:QuietAfterSeconds)
-                    foreach ($account in $lastAccounts) {
-                        if (-not $account.id) { continue }
-                        $safeId = ($account.id -replace '[^A-Za-z0-9_-]', '_')
-                        $url = if ($account.url) { $account.url } else { $proxyBase + '/sponsor' }
-                        $needsFresh = $quiet -contains $account.id
-                        if ($needsFresh -and $openWindows.ContainsKey($safeId)) {
-                            # The window is open but has stopped confirming, which
-                            # after a restart is the normal state of every window
-                            # that was opened before it. Replacing it is the only
-                            # way back: the page needs a cookie from this run.
-                            $oldId = [int]$openWindows[$safeId]
-                            & "$env:WINDIR\System32\taskkill.exe" /F /PID $oldId 2>&1 | Out-Null
-                            Write-Guardian ('Sponsor window for ' + $safeId + ' stopped confirming; replaced it.')
-                            Start-Sleep -Milliseconds 700
-                        }
-                        Show-SponsorFor -SafeId $safeId -Url $url -Browser $browser -OpenWindows $openWindows -Force:$needsFresh
-                    }
-                }
-            }
-        }
+        # Headless sponsor mode: sponsor windows are never opened. The node
+        # watchdog (tools/watchdog.mjs) keeps the proxy alive and the headless
+        # sponsor daemon (tools/headless-sponsor.mjs) confirms every impression
+        # over HTTP; free-pi still decides whether an ad counts.
     } catch {
         Write-Guardian ('Guardian error: ' + $_.Exception.Message)
     }
     Start-Sleep -Seconds $CheckSeconds
 }
+
+

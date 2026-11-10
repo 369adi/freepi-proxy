@@ -184,17 +184,7 @@ const utcDay = when => {
   return new Date(ms).toISOString().slice(0, 10);
 };
 
-/**
- * True when the upstream did NOT publish a visible allowance for this account.
- *
- * Measured on the live fleet: accounts with `visibleAllowance === true` can call
- * the "Free Unlimited" models indefinitely without the daily counter moving
- * (3x `particle` on acc-1: 6861 -> 6861). Accounts with `visibleAllowance ===
- * false` burned their whole daily allowance on exactly those same models
- * (acc-2 used 5744, acc-3 used 6000, free-unlimited ids only in the logs).
- * So "free unlimited" is only literally free while this flag is true; when it
- * is false those models bill against the daily allowance like any other.
- */
+/** A false visibility flag is a risk indicator, not proof of billing. */
 export function isMeteredDespiteFreeTier(account) {
   const usage = account && account.usage;
   return Boolean(usage) && usage.visibleAllowance === false;
@@ -228,7 +218,7 @@ export function recordUsage(store, account, me, now = Date.now()) {
     regularWalletCredits: num(me.regular_wallet_credits),
     bonusWalletCredits: num(me.bonus_wallet_credits),
     bonusCredits: num(me.bonus_credits),
-    visibleAllowance: me.visible_allowance === true,
+    visibleAllowance: typeof me.visible_allowance === 'boolean' ? me.visible_allowance : null,
     fetchedAt: new Date(now).toISOString(),
   };
 
