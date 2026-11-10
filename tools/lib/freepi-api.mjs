@@ -136,6 +136,10 @@ export async function confirmAdDirect(token, sessionId, slot = 'banner') {
 export const submitUserConsent = (token, consentVersion = CONSENT_VERSION) =>
   request('/me/consent', { method: 'POST', token, body: { consent_version: consentVersion } });
 
+/** Release any stuck upstream CLI session lease on this account (POST /session/reset). */
+export const resetUpstreamSession = token =>
+  request('/session/reset', { method: 'POST', token, body: {}, timeoutMs: 5000 });
+
 /** Decode a free-pi JWT payload without verifying it (exp/sub only). */
 export function decodeJwt(token) {
   try {

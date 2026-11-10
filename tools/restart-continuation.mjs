@@ -12,8 +12,11 @@ export async function rpc(port,method,args,requestId='restart-audit',fetcher=fet
     body:JSON.stringify({type:'client-request',rpcId:requestId,method,payload:{args}}),
     signal:AbortSignal.timeout(20000),
   });
-  const result=(await response.json()).result;
-  if(!response.ok || !result?.ok) {const error=new Error(result?.error?.message||'Harness API failed: '+response.status);error.details=result?.error?.details;throw error;}
+  const text=await response.text();
+  let parsed=null;
+  try{parsed=text?JSON.parse(text):null;}catch{}
+  const result=parsed?.result;
+  if(!response.ok || !result?.ok) {const error=new Error(result?.error?.message||('Harness API failed: '+response.status+(text?' ('+text.slice(0,80).trim()+')':'')));error.details=result?.error?.details;throw error;}
   return result.value;
 }
 export function readTurn(file) {
@@ -29,7 +32,7 @@ export async function captureTurns(port,manifestFile,{call=rpc,files=sessionFile
   const list=port?await call(port,'session/list',{_request:{}}):{items:[]};
   const entries=[];
   for(const item of list.items||[]) {
-    if(!item.running || item.origin==='subagent')continue;
+    if(!item.running || item.origin==='subagent' || item.parentSessionId)continue;
     const file=files.find(f=>path.basename(path.dirname(f))===item.sessionId);
     if(!file)throw Error('Cannot find active transcript: '+item.sessionId);
     const current=read(file);

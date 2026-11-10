@@ -38,18 +38,28 @@ export function apply(ctx) {
   ctx.on('agent/turn-stopping',async({agent,turn,signal})=>{
     const result=finalMessages.get(agent.session), message=result?.message;
     const content=message?.content;
-    if(result?.turn!==turn || message?.source?.provider!=='freepi' ||
-       message?.source?.replayState?.response?.stopReason!=='stop' ||
-       !Array.isArray(content) || !content.some(block=>block.type==='reasoning' && block.text?.trim()) ||
-       content.some(block=>block.type!=='reasoning') || continuedTurns.get(agent.session)===turn || signal?.aborted)return;
+    if(result?.turn!==turn || message?.source?.provider!=='freepi' || signal?.aborted)return;
+    const stopReason=message?.source?.replayState?.response?.stopReason ?? message?.stopReason;
+    const isReasoningOnly=stopReason==='stop' && Array.isArray(content) &&
+      content.some(block=>block.type==='reasoning' && block.text?.trim()) &&
+      !content.some(block=>block.type!=='reasoning');
+    const isLengthLimit=stopReason==='length' || stopReason==='max_tokens' || stopReason==='max-tokens';
+    if(!isReasoningOnly && !isLengthLimit)return;
+    const msgId=message?.id || `${turn}:${stopReason}`;
+    const prev=continuedTurns.get(agent.session) || {turn:-1,count:0,lastMsgId:null};
+    const count=prev.turn===turn ? prev.count : 0;
+    if(prev.lastMsgId===msgId || count>=5)return;
     // The live proxy must advertise enforcement; a stale/unpatched proxy must
     // never turn this recovery into an unprotected billable request.
     try {
       const response=await original(base+'/health',{signal:signal?AbortSignal.any([signal,AbortSignal.timeout(3000)]):AbortSignal.timeout(3000)});
       if(!response.ok || !['free-unlimited-visible-v1','disabled-by-user'].includes((await response.json()).creditGuard) || signal?.aborted)return;
     } catch {return;}
-    continuedTurns.set(agent.session,turn);
-    agent.inject({id:crypto.randomUUID(),role:'user',source:{kind:'freepi-recovery'},content:[{type:'text',text:'The previous model response contained reasoning only and ended without an answer or tool call. Continue the current task from the existing context. Do not repeat side effects unless verified.'}]});
+    continuedTurns.set(agent.session,{turn,count:count+1,lastMsgId:msgId});
+    const promptText=isLengthLimit
+      ? 'Your previous response hit the output token limit mid-generation. Continue seamlessly from the exact point where you stopped without repeating what you already wrote.'
+      : 'The previous model response contained reasoning only and ended without an answer or tool call. Continue the current task from the existing context. Do not repeat side effects unless verified.';
+    agent.inject({id:crypto.randomUUID(),role:'user',source:{kind:'freepi-recovery',reason:isLengthLimit?'max-tokens':'reasoning-only'},content:[{type:'text',text:promptText}]});
   });
   function control(data,signal) {
     const key=data.workerId||data.sessionId;
@@ -155,7 +165,7 @@ export function apply(ctx) {
     // Sponsor waits and transport failures use the longer, cancellable
     // Free-Pi recovery budget before the generic five-attempt policy.
     const failureText=JSON.stringify(payload.failure||{});
-    const managedRecovery=payload.provider==='freepi' && /ads_required|upstream responded 402|connection error|socket hang up|econnreset|etimedout|econnrefused|fetch failed/i.test(failureText);
+    const managedRecovery=payload.provider==='freepi' && /ads_required|hourly_ceiling|hourly limit|rolling_cap|queue_wait|account_busy|account_unusable|upstream responded 402|connection error|socket hang up|econnreset|etimedout|timed out|idle timeout|econnrefused|fetch failed/i.test(failureText);
     const prior=managedRecovery?undefined:await next();
     if(prior?.kind==='retry')return prior;
     const retry=recovery.next(payload);

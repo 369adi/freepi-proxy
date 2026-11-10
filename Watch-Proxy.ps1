@@ -1,4 +1,9 @@
 param([string]$ProxyDirectory = $PSScriptRoot)
+$createdNew = $false
+$watchMutex = New-Object System.Threading.Mutex($true, 'Local\FreePiWatchProxyMutex', [ref]$createdNew)
+if (-not $createdNew) {
+    exit 0
+}
 $ErrorActionPreference = 'Stop'
 $proxyDirectory = (Resolve-Path -LiteralPath $ProxyDirectory).Path
 $proxyNode = (Get-Command node.exe -ErrorAction Stop).Source

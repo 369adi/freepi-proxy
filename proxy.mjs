@@ -41,9 +41,11 @@ import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, isMeteredDespiteFreeTier, STORE_PATH } from './tools/lib/store.mjs';
 import { decide, describe, stateOf, sortForPick, USABLE, STATE } from './tools/lib/policy.mjs';
 import { ensureStore, refreshAccount, refreshAll } from './tools/lib/accounts.mjs';
-import { getCatalog, confirmAdDirect } from './tools/lib/freepi-api.mjs';
+import { getCatalog, confirmAdDirect, submitUserConsent, resetUpstreamSession } from './tools/lib/freepi-api.mjs';
 import {getClientVersion,requiredVersion,upgradeClient,runtimeStatus} from './tools/lib/client-runtime.mjs';
 import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_PER_HOUR, creditsToHours } from './tools/lib/budget.mjs';
+
+const upstreamAgent = new https.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
 const PORT           = Number(process.env.FREEPI_PROXY_PORT ?? 4000);
@@ -502,9 +504,17 @@ async function chooseAccount() {
  */
 function routingCandidates(model, now = Date.now(), includeTemporary = false) {
   if (!STORE) return [];
-  return STORE.accounts
+  const list = STORE.accounts
     .filter(a => a.token && !a.disabled && !a.tokenBad && !inAdCooldown(a.id, now) && (includeTemporary || !hourlyBlockedNow(a.id, now)) && modelAllowsAccount(a, model, now))
     .sort(compareRoutingAccounts);
+  if (MANUAL_ACCOUNT_ID) {
+    const idx = list.findIndex(a => a.id === MANUAL_ACCOUNT_ID);
+    if (idx > 0) {
+      const [picked] = list.splice(idx, 1);
+      list.unshift(picked);
+    }
+  }
+  return list;
 }
 
 /**
@@ -545,7 +555,13 @@ function saveHourlyBlocks() {
   catch(error) { console.warn('[proxy] could not persist hourly blocks: '+error.message); }
 }
 const upstreamUnavailable = new Map();
-const hourlyBlockedNow = (id, now = Date.now()) => Math.max(hourlyBlocked.get(id) || 0, upstreamUnavailable.get(id) || 0) > now;
+function hourlyBlockedNow(id, now = Date.now()) {
+  const hb = hourlyBlocked.get(id) || 0;
+  if (hb && hb <= now) hourlyBlocked.delete(id);
+  const uu = upstreamUnavailable.get(id) || 0;
+  if (uu && uu <= now) upstreamUnavailable.delete(id);
+  return Math.max(hb, uu) > now;
+}
 const adBlocked = new Map();   // account id -> when the block was recorded
 
 // Which accounts are currently waiting for a display is worth surviving a
@@ -591,12 +607,18 @@ function clearAdsRequired(id) {
 }
 async function recoverSponsor(account,downstream) {
   markAdsRequired(account.id);
-  const displayed=waitForSponsorDisplay(account.id,{events:sponsorEvents,downstream,isBlocked:inAdCooldown});
   if (!AUTO_SPONSOR && account && account.token) {
-    confirmAdDirect(account.token, sessionIdFor(account), 'banner')
-      .then(r => { if (r && r.confirmed) clearAdsRequired(account.id); })
-      .catch(() => {});
+    try {
+      let r = await confirmAdDirect(account.token, sessionIdFor(account), 'banner');
+      if (!r?.confirmed) r = await confirmAdDirect(account.token, sessionIdFor(account), 'inline');
+      if (r && r.confirmed) {
+        clearAdsRequired(account.id);
+        return true;
+      }
+    } catch {}
+    return waitForSponsorDisplay(account.id,{events:sponsorEvents,downstream,isBlocked:inAdCooldown,timeoutMs:2500});
   }
+  const displayed=waitForSponsorDisplay(account.id,{events:sponsorEvents,downstream,isBlocked:inAdCooldown});
   try{openSponsorPanel(account);}catch(error){console.error('[sponsor] '+error.message);}
   return displayed;
 }
@@ -651,14 +673,14 @@ function usableAccounts(model) {
  * every lane is busy. A free lane is preferred over the sticky active account so
  * parallel subagents spread across accounts instead of colliding on one.
  */
-function claimAccount(model, session) {
+function claimAccount(model, session, worker) {
   const usable = usableAccounts(model);
   if (!usable.length) {
     // No measured-but-usable account: fall back to the rotator decision path,
     // which may refresh stale data or report a quota problem.
     return null;
   }
-  const free = usable.filter(a => !laneBusy.has(a.id) && sessionRouter.allowed(a.id, session));
+  const free = usable.filter(a => !laneBusy.has(a.id) && sessionRouter.allowed(a.id, session, worker));
   if (!free.length) return null;
   // Balance by measured usage; least recently used breaks ties.
   free.sort(compareRoutingAccounts);
@@ -733,7 +755,7 @@ function sendPinnedError(status, id, account, code, model) {
   const payload = {
     error: {
       message,
-      type: adsRequired ? 'free_pi_error' : 'invalid_request_error',
+      type: adsRequired ? 'free_pi_error' : status === 429 ? 'rate_limit_error' : 'invalid_request_error',
       param: PIN_HEADER,
       code,
       ...(code === 'account_busy' ? { retry_after: Math.ceil(PIN_WAIT_TIMEOUT_MS / 1000) } : {}),
@@ -840,6 +862,9 @@ function startCatalogRefresh(getToken, intervalMs) {
       if (!next.size) return;
       catalog = list;
       updateFreeModels(list);
+      for (const m of DEFAULT_CATALOG) {
+        if (m && m.id) next.add(String(m.id));
+      }
       let added = 0;
       for (const id of next) if (!KNOWN_MODELS.has(id)) added += 1;
       if (added) console.log('[proxy] model catalog refreshed, ' + added + ' new id(s) now accepted');
@@ -1161,12 +1186,6 @@ async function runAdLoop() {
           cursor = (cursor + attempt + 1) % order.length;
           return;
         }
-        const a = await fetchAd(account);
-        if (a && a.status === 200) {
-          cursor = (cursor + attempt + 1) % order.length;
-          renderAd(a);
-          return;
-        }
       } catch { /* try the next account next round */ }
     }
     cursor = (cursor + 1) % order.length;
@@ -1349,6 +1368,14 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     // and every retry path is told about it, so the pin survives the whole
     // request and is never widened to "any account".
     let pin = pinnedAccountId;
+    const relayPinnedError = (id, acc, code) => {
+      const status = code === 'account_busy' ? 429 : 409;
+      const err = sendPinnedError(status, id, acc, code, wantedModel);
+      if (inRes.headersSent) { inRes.end(); return; }
+      inRes.writeHead(err.status, err.headers);
+      inRes.end(err.body);
+    };
+
     const start = (claimed) => {
       let account = claimed ? claimed.account : null;
       let releaseLane = claimed ? claimed.release : () => {};
@@ -1359,7 +1386,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           // reservation that can safely rebind to another free candidate.
           let pinned = STORE ? findAccount(STORE, pin) : null;
           releaseLane();
-          if (pinnedUnusableReason(pinned, Date.now(), wantedModel)) {
+          if (pinnedUnusableReason(pinned, Date.now(), wantedModel) || laneBusy.has(pin)) {
             if (routingSession) {
               const movedId = sessionRouter.moveReservation(routingSession, routingWorker, pin, routingCandidates(wantedModel), laneBusy);
               if (movedId) {
@@ -1398,9 +1425,16 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     };
 
     const tryClaim = () => {
-      // Pinned: only that lane is acceptable. claimAccount() must not be asked -
-      // it would hand out any free lane and void the reservation.
-      const claimed = pin ? claimFor(pin, wantedModel, routingSession, routingWorker) : claimAccount(wantedModel, routingSession);
+      // Pinned: only that lane is acceptable, unless this is a session-router
+      // reservation and the pinned lane is busy while another candidate is free.
+      let claimed = pin ? claimFor(pin, wantedModel, routingSession, routingWorker) : claimAccount(wantedModel, routingSession, routingWorker);
+      if (!claimed && pin && routingSession) {
+        const movedId = sessionRouter.moveReservation(routingSession, routingWorker, pin, routingCandidates(wantedModel), laneBusy);
+        if (movedId) {
+          pin = movedId;
+          claimed = claimFor(pin, wantedModel, routingSession, routingWorker);
+        }
+      }
       if (claimed) { start(claimed); return true; }
       return false;
     };
@@ -1412,7 +1446,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         const claimed = tryClaim();
         if (claimed && pinTimer) clearTimeout(pinTimer);
         return claimed;
-      }, { model: wantedModel, session: routingSession, worker: routingWorker, ...(pin ? { pinnedId: pin } : {}) });
+      }, { model: wantedModel, session: routingSession, worker: routingWorker, ...(pin && !routingSession ? { pinnedId: pin } : {}) });
       if (!slot.accepted) {
         inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
         inRes.end(JSON.stringify({
@@ -1426,13 +1460,15 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       {
         // The caller picked this account on purpose, so waiting beats a 409 in a
         // retry loop - but not forever. When the lane is still occupied after
-        // the timeout the answer is an explicit, retryable 409.
+        // the timeout the answer is an explicit, retryable error.
         pinTimer = setTimeout(() => {
           if (inRes.writableEnded || inRes.destroyed) return;
           slot.cancel?.();
+          if (tryClaim()) return;
           if (pin) {
-            const bodyPin = sendPinnedError(409, pin, STORE ? findAccount(STORE, pin) : null, 'account_busy', wantedModel);
-            inRes.writeHead(409, bodyPin.headers);
+            const errStatus = routingSession ? 429 : 409;
+            const bodyPin = sendPinnedError(errStatus, pin, STORE ? findAccount(STORE, pin) : null, 'account_busy', wantedModel);
+            inRes.writeHead(bodyPin.status, bodyPin.headers);
             inRes.end(bodyPin.body);
           } else {
             inRes.writeHead(503, { 'content-type': 'application/json', 'retry-after': '5' });
@@ -1449,21 +1485,19 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     }
 
     function run(account, releaseLane) {
-    // The lane is claimed once for the whole client request. A retry only swaps
-    // the *account*, never the lane: releasing it here would let a queued
-    // request claim the same account and collide with our own retry.
-    let laneReleased = false;
+    // Delegate to the current `releaseLane` function (each `makeRelease` handle
+    // is already idempotent per claim), so swapping to a new account properly
+    // releases the new account's lane when the request finishes.
     const releaseLaneOnce = () => {
-      if (laneReleased) return;
-      laneReleased = true;
       releaseLane();
     };
 
     let retries = 0;
     let sponsorRetries = 0;
+    let consentRetries = 0;
     const tried = new Set();      // accounts that already failed this request
     const MAX_RETRIES = 4;        // concurrent races tolerated on one account
-    const MAX_SWAPS = 3;          // account switches for one client request
+    const MAX_SWAPS = 5;          // account switches for one client request
     let swaps = 0;
 
     // Upstream headers are an explicit whitelist, never a copy of inReq.headers.
@@ -1487,9 +1521,15 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         port: 443,
         path: '/v1/chat/completions',
         method: 'POST',
+        agent: upstreamAgent,
         headers: { ...upstreamHeaders, authorization: 'Bearer ' + token, 'x-session-id':sessionIdFor(account),'x-client-version':getClientVersion() },
       }, upRes => {
         auditCredit({event:'response',account:account.id,model:wantedModel,status:upRes.statusCode});
+        if (!inRes.headersSent && (upRes.statusCode === 426 || upRes.statusCode === 502 || QUOTA_STATUS.has(upRes.statusCode) || upRes.statusCode === 401 || upRes.statusCode === 403)) {
+          // Prevent bindRequestLifecycle's response.once('end') from releasing
+          // the lane before our buffered error/retry handlers below run.
+          responseWillRetry = true;
+        }
         if(upRes.statusCode===426&&!inRes.headersSent){
           const chunks=[];upRes.on('data',chunk=>chunks.push(chunk));upRes.on('end',async()=>{
             releaseLaneOnce();let error;try{error=JSON.parse(Buffer.concat(chunks).toString());}catch{}
@@ -1524,25 +1564,6 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             releaseLaneOnce();relay(502,upstreamErrorBody(raw,'Free-Pi upstream temporarily unavailable.'));
           });return;
         }
-        if (QUOTA_STATUS.has(upRes.statusCode) && inRes.headersSent) {
-          // The upstream refused us after we had already committed a 200 to the
-          // client (it happens on streamed responses). Nothing can be salvaged,
-          // so make sure the account is retired and the client sees a real
-          // error instead of a silently truncated body.
-          const errChunks = [];
-          upRes.on('data', d => errChunks.push(d));
-          upRes.on('end', () => {
-            const raw = Buffer.concat(errChunks);
-            if (!isHourlyCeiling(raw)) {
-              markExhausted(account, `upstream ${upRes.statusCode}`);
-              persist().catch(() => {});
-            }
-            console.warn(`[rotator] ${account.id} returned ${upRes.statusCode} mid-stream - aborting response`);
-            inRes.destroy(new Error('upstream quota exhausted mid-stream (' + upRes.statusCode + ')'));
-            releaseLaneOnce();
-          });
-          return;
-        }
         if (QUOTA_STATUS.has(upRes.statusCode) && !inRes.headersSent) {
           const errChunks = [];
           upRes.on('data', d => errChunks.push(d));
@@ -1550,13 +1571,15 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             const raw = Buffer.concat(errChunks);
             if (isHourlyCeiling(raw)) {
               const reset=hourlyReset(raw,upRes.headers);
-              failureAlert('hourly_ceiling',account,'Free-Pi reported an hourly account limit; retry after the recorded reset.');
+              failureAlert('hourly_ceiling',account,'Free-Pi reported a temporary account limit; retry after the recorded reset.');
               hourlyBlocked.set(account.id,reset.until);
               saveHourlyBlocks();
-              console.log(`[proxy] hourly block for ${account.id} until ${new Date(reset.until).toISOString()} (${reset.source})`);
-              console.warn(`[proxy] ${account.id} hit Free-Pi hourly ceiling; daily balance unchanged`);
-              // Only routed Harness sessions may move their reservation. A
-              // manual x-freepi-account pin remains an explicit pin.
+              try {
+                const parsed = JSON.parse(raw.toString());
+                const rem = Number(parsed?.remaining_credits_today ?? parsed?.error?.remaining_credits_today);
+                if (Number.isFinite(rem) && rem >= 0 && account.usage) account.usage.remainingCreditsToday = rem;
+              } catch {}
+              console.log(`[proxy] temporary rate block for ${account.id} until ${new Date(reset.until).toISOString()} (${reset.source})`);
               if (routingSession && swaps < MAX_SWAPS) {
                 const from=account.id;
                 const nextId=sessionRouter.moveReservation(routingSession,routingWorker,from,routingCandidates(wantedModel),laneBusy);
@@ -1565,11 +1588,12 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
                   if(next) {
                     releaseLane(); releaseLane=next.release; account=next.account;
                     swaps++; retries=0; responseWillRetry=true;
-                    console.log(`[proxy] hourly limit: ${from} -> ${nextId}`);
+                    console.log(`[proxy] rate limit: ${from} -> ${nextId}`);
                     send(account.token); return;
                   }
                 }
               }
+              if (await tryNext('temporary rate limit')) return;
               releaseLaneOnce();
               relay(429, upstreamErrorBody(raw, 'Free-Pi reported an hourly limit.'));
               return;
@@ -1577,7 +1601,7 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             // "concurrent" means *we* sent two requests at once, not that the
             // account is out of credits - never mark it exhausted for that.
             let code = '';
-            try { code = JSON.parse(raw.toString()).code || ''; } catch { /* ignore */ }
+            try { const p = JSON.parse(raw.toString()); code = p?.error?.code || p?.code || ''; } catch { /* ignore */ }
             if (code === 'model_at_capacity' || code === 'model_busy') {
               // Capacity describes the model, never the account's balance.
               releaseLaneOnce();
@@ -1599,9 +1623,9 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             }
             if (code === 'concurrent_session') {
               // Different from `concurrent`: this is an account-wide cap on
-              // parallel CLI sessions (4 for a signed-in account), usually from
-              // crashed or abandoned runs. Temporarily park this account and
-              // rotate to another free account if available.
+              // parallel CLI sessions, usually from crashed or abandoned runs.
+              // Self-heal via POST /session/reset and rotate if another account is free.
+              resetUpstreamSession(account.token).catch(() => {});
               let retryAfter = 0;
               try { retryAfter = Number(JSON.parse(raw.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
               upstreamUnavailable.set(account.id, Date.now() + Math.min(300000, Math.max(15000, (retryAfter || 60) * 1000)));
@@ -1629,9 +1653,21 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
           upRes.on('data', d => errChunks.push(d));
           upRes.on('end', async () => {
             const raw = Buffer.concat(errChunks);
-            if (raw.toString().includes('ads_required')) {
-              failureAlert('ads_required',account,'Free-Pi requires a visible sponsor display; the account sponsor window was requested.');
-              // Park this account until its own sponsor window has shown an ad,
+            const rawStr = raw.toString();
+            if (rawStr.includes('consent_required') && consentRetries++ < 1) {
+              try {
+                await submitUserConsent(account.token);
+                if (!inRes.destroyed) { send(account.token); return; }
+              } catch {}
+            }
+            if (rawStr.includes('account_review')) {
+              markInvalid(account, 'account under review (403)');
+              await persist();
+              if (await tryNext('account review')) return;
+            }
+            if (rawStr.includes('ads_required')) {
+              failureAlert('ads_required',account,'Free-Pi requires a visible sponsor display; confirming sponsor impression.');
+              // Park this account until its sponsor impression is confirmed,
               // so the next requests go to a working account instead of
               // repeating the same 403 on every call.
               responseWillRetry=true;
@@ -1643,8 +1679,6 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
               }
               if (await tryNext('ads required')) return;
               releaseLaneOnce();
-              // A browser problem must never turn this 403 into a 500: the
-              // account stays parked either way, the window is only a courtesy.
               let opened = false;
               try { opened = openSponsorPanel(account) === true; } catch (e) { console.error('[sponsor] ' + e.message); }
               relay(503, adsRequiredBody(opened, account));
@@ -1685,7 +1719,18 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (!inRes.headersSent && retries < 2) {
           retries++;
           tried.add(account.id);
-          let next = pin ? null : retryCandidates(tried, wantedModel, routingSession, routingWorker)[0];
+          let next = null;
+          if (!pin) {
+            for (const cand of retryCandidates(tried, wantedModel, routingSession, routingWorker)) {
+              const nextClaim = claimFor(cand.id, wantedModel, routingSession, routingWorker);
+              if (nextClaim) {
+                releaseLane();
+                releaseLane = nextClaim.release;
+                next = nextClaim.account;
+                break;
+              }
+            }
+          }
           if (!next && pin && routingSession) {
             const candidates = routingCandidates(wantedModel).filter(a => !tried.has(a.id));
             const nextId = sessionRouter.moveReservation(routingSession, routingWorker, account.id, candidates, laneBusy);
@@ -1725,14 +1770,6 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
       inRes.end(buf);
     };
 
-    /** Same as relay(), for a pin error built by sendPinnedError(). */
-    const relayPinnedError = (id, acc, code) => {
-      const err = sendPinnedError(409, id, acc, code, wantedModel);
-      if (inRes.headersSent) { inRes.end(); return; }
-      inRes.writeHead(err.status, err.headers);
-      inRes.end(err.body);
-    };
-
     /**
      * Switch this request to another account while keeping its lane. Accounts
      * that already failed for this request are never retried: bouncing A->B->A
@@ -1762,42 +1799,23 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         send(account.token);
         return true;
       }
-      const next = retryCandidates(tried, wantedModel, routingSession, routingWorker)[0];
-      if (!next) return false;
-      const nextClaim = claimFor(next.id, wantedModel, routingSession, routingWorker);
-      if (nextClaim) {
+      for (const cand of retryCandidates(tried, wantedModel, routingSession, routingWorker)) {
+        const nextClaim = claimFor(cand.id, wantedModel, routingSession, routingWorker);
+        if (!nextClaim) continue;
         releaseLane();
         releaseLane = nextClaim.release;
+        swaps++;
+        await promote(nextClaim.account, reason);
+        account = nextClaim.account;
+        retries = 0;   // a fresh account deserves a fresh "concurrent" budget
+        responseWillRetry = true;
+        send(account.token);
+        return true;
       }
-      swaps++;
-      await promote(next, reason);
-      account = next;
-      retries = 0;   // a fresh account deserves a fresh "concurrent" budget
-      responseWillRetry = true;
-      send(next.token);
-      return true;
+      return false;
     };
 
     const onQuota = async (status, buf) => {
-      // A 409 is a session cap, not a spent budget: marking the account
-      // exhausted here would retire a perfectly good account.
-      if (status === 409) {
-        let code = '';
-        try { code = JSON.parse(buf.toString()).code || ''; } catch { /* ignore */ }
-        if (code === 'concurrent_session') {
-          let retryAfter = 0;
-          try { retryAfter = Number(JSON.parse(buf.toString()).retry_after_seconds) || 0; } catch { /* ignore */ }
-          upstreamUnavailable.set(account.id, Date.now() + Math.min(300000, Math.max(15000, (retryAfter || 60) * 1000)));
-          console.warn(
-            '[proxy] session cap on ' + account.id +
-            (retryAfter ? ' - frees in about ' + Math.ceil(retryAfter / 60) + ' min' : ''),
-          );
-          if (await tryNext('session cap')) return;
-          releaseLaneOnce();
-          relay(429, sessionCapBody(account, retryAfter));
-          return;
-        }
-      }
       markExhausted(account, `upstream ${status}`);
       account.usage = account.usage || {};
       account.usage.remainingCreditsToday = 0;

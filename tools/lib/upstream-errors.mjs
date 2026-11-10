@@ -3,7 +3,8 @@ export function upstreamCode(raw) {
   try { const body = JSON.parse(String(raw)); return body?.error?.code || body?.code || null; }
   catch { return null; }
 }
-export function isHourlyCeiling(raw) { return upstreamCode(raw) === 'hourly_ceiling'; }
+const TEMPORARY_LIMIT_CODES = new Set(['hourly_ceiling', 'rolling_cap', 'queue_wait']);
+export function isHourlyCeiling(raw) { return TEMPORARY_LIMIT_CODES.has(upstreamCode(raw)); }
 
 // Prefer a server reset timestamp or retry delay; otherwise a one-hour
 // conservative fallback is an estimate, never a known provider reset.

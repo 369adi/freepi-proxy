@@ -73,9 +73,14 @@ export function burnRatePerHour(samples) {
   if (!Array.isArray(samples) || samples.length < 2) return null;
   const first = samples[0];
   const last = samples[samples.length - 1];
-  const spent = num(last.credits) - num(first.credits);
+  const firstCredits = num(first.credits);
+  const lastCredits = num(last.credits);
+  if (firstCredits === null || lastCredits === null) return null;
+  // Support both monotonic spent counters (last > first) and decreasing
+  // remaining-credit series (first > last, as recorded by proxy.mjs).
+  const spent = lastCredits >= firstCredits ? (lastCredits - firstCredits) : (firstCredits - lastCredits);
   const elapsedMs = num(last.at) - num(first.at);
-  if (spent === null || elapsedMs === null || elapsedMs < 60_000 || spent <= 0) return null;
+  if (elapsedMs === null || elapsedMs < 60_000 || spent <= 0) return null;
   const creditsPerHour = spent / (elapsedMs / 3_600_000);
   return creditsPerHour / CREDITS_PER_HOUR;
 }

@@ -195,11 +195,16 @@ async function looksLikeGui(port) {
 export async function guiPort() {
   const rows = await appProcesses();
   if (rows.length === 0) return undefined;
-  const ports = await listeningPorts(rows.map((row) => row.pid));
+  const ports = (await listeningPorts(rows.map((row) => row.pid)))
+    .sort((a, b) => (a === 18723 ? 1 : b === 18723 ? -1 : b - a));
+  let fallbackPort;
   for (const port of ports) {
-    if (await looksLikeGui(port)) return port;
+    if (await looksLikeGui(port)) {
+      if (port !== 18723) return port;
+      fallbackPort = port;
+    }
   }
-  return undefined;
+  return fallbackPort;
 }
 
 /**
