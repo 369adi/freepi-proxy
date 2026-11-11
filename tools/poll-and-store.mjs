@@ -2,8 +2,9 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const REPO = 'C:\\Users\\liket\\Documents\\freepi-proxy';
+const REPO = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const ENTRY = path.join(REPO, 'plugin', 'lib', 'index.js');
 const COPY = path.join(REPO, 'plugin', 'lib', '_internals-poll.mjs');
 
@@ -12,7 +13,7 @@ fs.appendFileSync(
   COPY,
   '\nexport const __internals = { deviceStart, devicePoll, deviceConsent, getMe, loadStore, saveStore };\n',
 );
-const api = await import('file:///' + COPY.replace(/\\/g, '/'));
+const api = await import(pathToFileURL(COPY).href);
 const I = api.__internals;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,7 +75,7 @@ if (existing) {
   store.accounts.push({
     id: 'acc-' + n,
     number: n,
-    email: 'gh-' + n + '@arisya.de',
+    email: 'gh-' + n + '@' + (store.settings?.emailDomain || 'example.com'),
     handle: handle,
     userId: me.id || null,
     token: token,

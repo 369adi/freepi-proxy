@@ -13,18 +13,38 @@ import { request } from './freepi-api.mjs';
  * A random value is generated once and then reused. Only a local process can
  * read the file, and the value grants nothing beyond the sponsor routes.
  */
-function loadCookie() {
-  const file = path.join(os.homedir(), '.free-pi', 'proxy', 'sponsor-cookie');
-  try {
-    const raw = fs.readFileSync(file, 'utf8').trim();
-    if (/^[0-9a-f]{48}$/.test(raw)) return raw;
-  } catch { /* first run */ }
+function defaultStateDir() {
+  if (process.env.FREEPI_STATE_DIR) return process.env.FREEPI_STATE_DIR;
+  if (process.env.FREEPI_ACCOUNTS_PATH) return path.dirname(process.env.FREEPI_ACCOUNTS_PATH);
+  return path.join(os.homedir(), '.free-pi', 'proxy');
+}
+
+function loadCookie(stateDir = defaultStateDir()) {
+  const file = path.join(stateDir, 'sponsor-cookie');
+  const readValid = () => {
+    try {
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      if (/^[0-9a-f]{48}$/.test(raw)) return raw;
+    } catch { /* first run or unreadable */ }
+    return null;
+  };
+  const existing = readValid();
+  if (existing) return existing;
   const fresh = crypto.randomBytes(24).toString('hex');
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, fresh + '\n', { mode: 0o600 });
-  } catch { /* an unwritable home still works, it just loses the cookie */ }
-  return fresh;
+    fs.writeFileSync(file, fresh + '\n', { flag: 'wx', mode: 0o600 });
+    return fresh;
+  } catch (err) {
+    if (err?.code === 'EEXIST') {
+      const raced = readValid();
+      if (raced) return raced;
+      try {
+        fs.writeFileSync(file, fresh + '\n', { mode: 0o600 });
+      } catch { /* unwritable */ }
+    }
+    return fresh;
+  }
 }
 
 /**
@@ -36,8 +56,8 @@ function loadCookie() {
  * entry says "this account displayed something at that time", which is exactly
  * what happened.
  */
-function displayStore() {
-  const file = path.join(os.homedir(), '.free-pi', 'proxy', 'sponsor-displays.json');
+function displayStore(stateDir = defaultStateDir()) {
+  const file = path.join(stateDir, 'sponsor-displays.json');
   const read = () => {
     try {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -81,9 +101,10 @@ function displayStore() {
  * `currentAccount` returns the account a request is about; the panel is
  * account-aware so several windows can be open at the same time.
  */
-export function createSponsorPanel({ currentAccount, accounts, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now, port = 4000, onDisplayed = null }) {
+export function createSponsorPanel({ currentAccount, accounts, sessionId, usage, html, apiRequest = request, pixelFetch = fetch, clock = Date.now, port = 4000, onDisplayed = null, stateDir = undefined }) {
+  const resolvedStateDir = stateDir || defaultStateDir();
   const sessionFor=account=>typeof sessionId==='function'?sessionId(account):sessionId;
-  const cookie = loadCookie();
+  const cookie = loadCookie(resolvedStateDir);
   const pending = new Map();
   const windows = new Map();
   const WINDOW_HEARTBEAT_TTL_MS = 90_000;
@@ -96,8 +117,8 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
   // ad, or one account would acknowledge another account's creative.
   const latest = new Map();
   const fetching = new Map();
-  const lastDisplay = displayStore().read();
-  const displays = displayStore();
+  const displays = displayStore(resolvedStateDir);
+  const lastDisplay = displays.read();
   // The panel is only reachable from this machine, on the proxy's own port.
   // localhost and 127.0.0.1 are the same origin as far as the user is
   // concerned, so both are accepted (and both appear in the allowlist).
@@ -137,10 +158,18 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
   /** Latest ad for one account, fetched at most once concurrently. */
   async function adFor(account) {
     const cached = latest.get(account.id);
-    if (cached && clock() - cached.created <= 60_000) return cached.ad;
+    if (cached && clock() - cached.created <= 60_000) return cached;
     if (!fetching.has(account.id)) {
-      const job = apiRequest('/ads/next?slot=banner', { token: account.token, headers: { 'x-session-id': sessionFor(account) } })
-        .then(ad => { latest.set(account.id, { ad, created: clock() }); return ad; })
+      const turnId = crypto.randomUUID();
+      const job = apiRequest('/ads/next?slot=banner', {
+        token: account.token,
+        headers: { 'x-session-id': sessionFor(account), 'x-turn-id': turnId },
+      })
+        .then(ad => {
+          const entry = { ad, turnId, created: clock() };
+          latest.set(account.id, entry);
+          return entry;
+        })
         .finally(() => { fetching.delete(account.id); });
       fetching.set(account.id, job);
     }
@@ -178,9 +207,16 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
     }
     if (!authorized(req)) { json(res, 403, { error: 'Open the local sponsor window first.' }); return true; }
     if(req.method==='POST' && url.pathname==='/sponsor/window') {
-      let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>1024)throw Error('Request too large');}
-      const data=JSON.parse(raw),account=await accountFor(url);
-      if(!account || typeof data.id!=='string' || data.id.length>100){json(res,400,{error:'Invalid window'});return true;}
+      let raw='', data;
+      try {
+        for await(const chunk of req){raw+=chunk;if(raw.length>1024){json(res,413,{error:'Request too large'});return true;}}
+        data=JSON.parse(raw);
+      } catch {
+        json(res,400,{error:'Invalid window'});
+        return true;
+      }
+      const account=await accountFor(url);
+      if(!account || !data || typeof data.id!=='string' || data.id.length>100){json(res,400,{error:'Invalid window'});return true;}
       if(data.closed){windows.delete(data.id);json(res,200,{ok:true});return true;}
       const live=liveWindows();
       let entry=windows.get(data.id);
@@ -216,13 +252,13 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
       const account = await accountFor(url);
       if (!account) { json(res, 404, { error: 'No such account - /sponsor/accounts lists the open windows.' }); return true; }
       if (!account.token) { json(res, 401, { error: 'The selected account needs a valid sign-in.' }); return true; }
-      const ad = await adFor(account);
+      const { ad, turnId } = await adFor(account);
       if (!ad?.ad_id || !ad.click_token || !ad.creative) {
         json(res, 200, { noAd: true, account: account.handle || account.id, accountId: account.id, usage: usage() }); return true;
       }
       const nonce = crypto.randomBytes(24).toString('hex');
       for (const [key, value] of pending) if (clock() - value.created > 120_000) pending.delete(key);
-      pending.set(nonce, { accountId: account.id, ad, created: clock() });
+      pending.set(nonce, { accountId: account.id, ad, turnId, created: clock() });
       json(res, 200, { nonce, account: account.handle || account.id, accountId: account.id, creative: {
         headline: String(ad.creative.headline || ''), body: String(ad.creative.body || ''), cta: String(ad.creative.cta || 'Learn more'),
       }, url: safeUrl(ad.click_url), usage: usage() });
@@ -255,7 +291,7 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
           try { const response = await pixelFetch(pixel, { signal: AbortSignal.timeout(3000), redirect: 'error' }); pixelSent = response.ok; } catch {}
         }
         await apiRequest('/ads/impression', { method: 'POST', token: account.token,
-          headers: { 'x-session-id': sessionFor(account) }, body: { ad_id: record.ad.ad_id, click_token: record.ad.click_token, ...(pixelSent ? { imp_fired: true } : {}) } });
+          headers: { 'x-session-id': sessionFor(account), 'x-turn-id': record.turnId }, body: { ad_id: record.ad.ad_id, click_token: record.ad.click_token, ...(pixelSent ? { imp_fired: true } : {}) } });
         acknowledged.add(record.ad.click_token);
         if (acknowledged.size > 500) acknowledged.delete(acknowledged.values().next().value);
       }
@@ -263,7 +299,7 @@ export function createSponsorPanel({ currentAccount, accounts, sessionId, usage,
       displays.write(lastDisplay);
       // The proxy lifts this account's ad cooldown so it serves requests again.
       if (typeof onDisplayed === 'function') {
-        try { onDisplayed(account.id); } catch {}
+        try { onDisplayed(account.id, record.turnId); } catch {}
       }
       json(res, 200, { displayed: true, accountId: account.id }); return true;
     }

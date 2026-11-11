@@ -9,7 +9,7 @@
 // Usage
 //   node tools/freepi-passwords.mjs              list account, handle, email
 //   node tools/freepi-passwords.mjs acc-3        show one password
-//   node tools/freepi-passwords.mjs gh-4@arisya.de
+//   node tools/freepi-passwords.mjs gh-4@example.com
 //   node tools/freepi-passwords.mjs --export     print every password (careful)
 //
 // The password is only printed when explicitly asked for, so a careless

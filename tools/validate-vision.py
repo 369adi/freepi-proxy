@@ -1,7 +1,9 @@
 import sys
+import os
+from pathlib import Path
 import yaml
 
-path = r'C:\Users\liket\.dsh\profiles\desktop\cordis.patch.yml'
+path = os.environ.get('CORDIS_PATCH_PATH', str(Path.home() / '.dsh' / 'profiles' / 'desktop' / 'cordis.patch.yml'))
 with open(path, 'r', encoding='utf-8') as fh:
     raw = fh.read()
 

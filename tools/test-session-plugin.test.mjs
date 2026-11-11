@@ -84,3 +84,38 @@ test('Aborted waiting request releases its pending reservation and /freepi-sessi
     assert.match(out.text,/6\/6/);
   } finally {for(const dispose of disposers.reverse())dispose?.();globalThis.fetch=original;}
 });
+
+test('Idle running main session automatically releases its account after inactivity timeout',async()=>{
+  const original=globalThis.fetch;
+  const oldIdle=process.env.FREEPI_IDLE_RELEASE_MS;
+  const oldKeep=process.env.FREEPI_KEEPALIVE_MS;
+  process.env.FREEPI_IDLE_RELEASE_MS='20';
+  process.env.FREEPI_KEEPALIVE_MS='15';
+  const router=new SessionRouter(),accounts=[{id:'a'}],busy=new Set();
+  const main1={id:'idle-main',status:'running'};
+  const handlers=new Map(),disposers=[];
+  globalThis.fetch=async(input,init)=>{
+    if(String(input).endsWith('/session-routing')){
+      const d=JSON.parse(init.body);
+      if(d.action==='reserve')return new Response(JSON.stringify(router.reserve(d.sessionId,accounts,busy)));
+      if(d.action==='release')router.release(d.sessionId);
+      if(d.action==='touch')router.touch(d.sessionId);
+      return new Response(JSON.stringify({ok:true}));
+    }
+    return new Response('{}');
+  };
+  try{
+    apply({agents:{list:()=>[main1],isOwnedBy:()=>false,currentInitiator:()=>main1},
+      commands:{register:()=>()=>{}},
+      effect:f=>disposers.push(f()),on:(name,fn)=>handlers.set(name,fn)});
+    await globalThis.fetch('http://127.0.0.1:4000/v1/chat/completions',{body:JSON.stringify({model:'particle'}),method:'POST'});
+    assert.equal(router.owner('a'),'idle-main');
+    await new Promise(resolve=>setTimeout(resolve,70));
+    assert.equal(router.owner('a'),null);
+  } finally {
+    for(const dispose of disposers.reverse())dispose?.();
+    globalThis.fetch=original;
+    if(oldIdle===undefined)delete process.env.FREEPI_IDLE_RELEASE_MS; else process.env.FREEPI_IDLE_RELEASE_MS=oldIdle;
+    if(oldKeep===undefined)delete process.env.FREEPI_KEEPALIVE_MS; else process.env.FREEPI_KEEPALIVE_MS=oldKeep;
+  }
+});

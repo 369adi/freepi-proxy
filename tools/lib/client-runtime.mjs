@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const prefix = path.join(root, 'runtime', 'freepi-cli');
@@ -24,15 +27,14 @@ function compareSemver(a, b) {
 }
 
 function readVersionFromDisk() {
-  let best = '0.6.16';
-  for (const candidate of [stateFile, vendorPkg, runtimePkg]) {
+  for (const candidate of [runtimePkg, vendorPkg]) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       const v = data?.version;
-      if (SEMVER_RE.test(v) && compareSemver(v, best) >= 0) best = v;
+      if (SEMVER_RE.test(v)) return v;
     } catch {}
   }
-  return best;
+  throw new Error('No installed official free-pi-cli package found');
 }
 
 export function getClientVersion() {
@@ -49,14 +51,8 @@ export function syncClientVersionFromCatalog(catalogData) {
       next = String(cand);
     }
   }
-  if (next !== current) {
-    cachedVersion = next;
-    try {
-      fs.mkdirSync(prefix, { recursive: true });
-      fs.writeFileSync(stateFile, JSON.stringify({ checkedAt: Date.now(), version: next }, null, 2));
-    } catch {}
-  }
-  return cachedVersion;
+  if (next !== current) upgradeClient(next).catch(error => log('Client update failed: ' + error.message));
+  return current;
 }
 
 export function requiredVersion(error) {
@@ -94,13 +90,22 @@ export function upgradeClient(minimum) {
         }
       }
     } catch {}
-    cachedVersion = next;
+    const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (!fs.existsSync(npmCli)) throw new Error('npm CLI not found next to Node.js; cannot install official free-pi-cli');
+    fs.mkdirSync(prefix, { recursive: true });
+    log('Installing official free-pi-cli@latest; installed version ' + getClientVersion());
+    await execFileAsync(process.execPath, [npmCli, 'install', '--prefix', prefix, '--save-exact', '--no-audit', '--no-fund', 'free-pi-cli@latest'], { windowsHide: true, timeout: 120000, maxBuffer: 1024 * 1024 });
+    const installed = JSON.parse(fs.readFileSync(runtimePkg, 'utf8')).version;
+    if (!SEMVER_RE.test(installed) || compareSemver(installed, next) < 0) {
+      throw new Error('Installed CLI ' + installed + ' does not satisfy required version ' + next);
+    }
+    cachedVersion = installed;
     try {
       fs.mkdirSync(prefix, { recursive: true });
-      fs.writeFileSync(stateFile, JSON.stringify({ checkedAt: Date.now(), version: next }, null, 2));
+      fs.writeFileSync(stateFile, JSON.stringify({ checkedAt: Date.now(), version: installed }, null, 2));
     } catch {}
-    log('Client version synced directly via API: ' + next);
-    return { version: next, restartPending: false };
+    log('Official CLI installed and verified: ' + installed);
+    return { version: installed, restartPending: false };
   })();
   updating = operation;
   operation.finally(() => { if (updating === operation) updating = null; }).catch(() => {});

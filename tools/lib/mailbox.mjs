@@ -1,7 +1,7 @@
-// mailbox.mjs — zero-dependency IMAP reader for the arisya.de catch-all.
+// mailbox.mjs — zero-dependency IMAP reader for a catch-all mailbox.
 //
 // Why this exists: a catch-all domain accepts every address of the form
-// anything@arisya.de and drops the mail into one mailbox. That is what makes
+// anything@example.com and drops the mail into one mailbox. That is what makes
 // unattended account creation possible at all -- the signup form can use a
 // fresh address and the verification mail is still reachable.
 //

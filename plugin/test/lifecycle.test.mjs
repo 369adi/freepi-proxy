@@ -203,3 +203,48 @@ test('/freepi-usage --json tolerates an unreachable proxy by erroring cleanly', 
   assert.equal(result.kind, 'error');
   assert.match(result.text, /nicht erreichbar/);
 });
+
+test('/freepi-cloud claims arguments and /deploy + /freepi-deploy are registered', async () => {
+  const f = fixture();
+  const dummySetup = path.join(f.dir, 'cloud-stub.mjs');
+  fs.writeFileSync(dummySetup, "console.log('stub accounts: ' + process.argv.slice(2).join(' '));");
+  const prevSkip = process.env.FREEPI_SKIP_CLOUD_WINDOW;
+  const prevPath = process.env.FREEPI_CLOUD_SETUP_PATH;
+  process.env.FREEPI_SKIP_CLOUD_WINDOW = '1';
+  process.env.FREEPI_CLOUD_SETUP_PATH = dummySetup;
+  try {
+    const commands = await loadPlugin(f);
+    assert.equal(typeof commands.get('freepi-cloud').input?.hint, 'string');
+    assert.ok(commands.has('freepi-deploy'));
+    assert.ok(commands.has('deploy'));
+
+    const listRes = await call(commands, 'freepi-cloud', 'list');
+    assert.equal(listRes.kind, 'success');
+    assert.match(listRes.text, /stub accounts: --list/);
+
+    const listAllRes = await call(commands, 'freepi-cloud', 'list --all');
+    assert.equal(listAllRes.kind, 'success');
+    assert.match(listAllRes.text, /stub accounts: --list --all/);
+
+    const bareRes = await call(commands, 'freepi-cloud', '');
+    assert.equal(bareRes.kind, 'success');
+    assert.match(bareRes.text, /Google Setup window/);
+
+    const deployViaCloud = await call(commands, 'freepi-cloud', 'deploy');
+    assert.equal(deployViaCloud.kind, 'success');
+    assert.match(deployViaCloud.text, /Google Cloud Deploy/);
+
+    const directDeploy = await call(commands, 'deploy', '');
+    assert.equal(directDeploy.kind, 'success');
+    assert.match(directDeploy.text, /Google Cloud Deploy/);
+
+    const freepiDeploy = await call(commands, 'freepi-deploy', '');
+    assert.equal(freepiDeploy.kind, 'success');
+    assert.match(freepiDeploy.text, /Google Cloud Deploy/);
+  } finally {
+    if (prevSkip === undefined) delete process.env.FREEPI_SKIP_CLOUD_WINDOW;
+    else process.env.FREEPI_SKIP_CLOUD_WINDOW = prevSkip;
+    if (prevPath === undefined) delete process.env.FREEPI_CLOUD_SETUP_PATH;
+    else process.env.FREEPI_CLOUD_SETUP_PATH = prevPath;
+  }
+});

@@ -496,12 +496,12 @@ Check `lanes` in `GET /usage`: it should equal the number of usable accounts.
 
 #### Manual route (always works)
 
-When `plan` reports `create a NEW account gh-N@arisya.de`:
+When `plan` reports `create a NEW account gh-N@example.com` (replace the domain with your configured catch-all domain):
 
 1. create a GitHub account using that address (a catch-all domain delivers the
    verification mail to the catch-all mailbox)
 2. read the verification link:
-   `node tools\fetch-verify-mail.mjs gh-N@arisya.de`
+   `node tools\fetch-verify-mail.mjs gh-N@example.com`
    (configured through `IMAP_USER`, `IMAP_PASS`, `IMAP_HOST`, `IMAP_PORT`)
 3. `node tools\freepi-accounts.mjs add` — opens GitHub with the code pre-filled,
    handles the consent step, stores the token
@@ -544,7 +544,7 @@ email once the account is stored) and is deliberately separate from
 ```powershell
 node tools\freepi-passwords.mjs                  # list account, handle, email
 node tools\freepi-passwords.mjs acc-3            # show one password
-node tools\freepi-passwords.mjs gh-4@arisya.de   # look up by email
+node tools\freepi-passwords.mjs gh-4@example.com # look up by email
 ```
 
 The list never prints passwords; you have to name the account. On Windows the

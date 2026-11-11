@@ -32,13 +32,20 @@ export function switchSavedAccount(rawInput, storePath, selectionPath) {
   let selected;
   try { selected = JSON.parse(fs.readFileSync(selectionPath, 'utf8')).accountId; } catch {}
   if (!input) return { kind: 'success', text: accountList(store, selected) };
-  const matches = (store.accounts || []).filter(a => a.id === input || a.email?.toLowerCase() === input.toLowerCase());
+  const accounts = store.accounts || [];
+  const exactId = accounts.filter(a => a.id === input);
+  const matches = exactId.length ? exactId : accounts.filter(a => a.email?.toLowerCase() === input.toLowerCase());
   if (matches.length !== 1) return { kind: 'error', text: 'Account not found or ambiguous. Run /freepi-switch to list saved account IDs.' };
   const account = matches[0];
   if (account.disabled || !account.token || account.tokenBad) return { kind: 'error', text: 'This account is disabled or needs a new sign-in. Your selection was not changed.' };
   fs.mkdirSync(path.dirname(selectionPath), { recursive: true });
   const temporary = selectionPath + '.tmp-' + process.pid;
-  fs.writeFileSync(temporary, JSON.stringify({ accountId: account.id }, null, 2), { mode: 0o600 });
-  fs.renameSync(temporary, selectionPath);
+  try {
+    fs.writeFileSync(temporary, JSON.stringify({ accountId: account.id }, null, 2), { mode: 0o600 });
+    fs.renameSync(temporary, selectionPath);
+  } catch (err) {
+    try { fs.unlinkSync(temporary); } catch {}
+    throw err;
+  }
   return { kind: 'success', text: `Selected ${account.handle || account.email || account.id} (${account.id}).\nNew requests use only this account; running requests finish on their previous account.\nThis account's authentication, advertising requirements and usage limits still apply.\nUndo with /freepi-auto.` };
 }

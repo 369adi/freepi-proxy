@@ -1,0 +1,16 @@
+.git/
+node_modules/
+logs/
+out/
+runtime/
+.codebase-memory/
+autostart-backup/
+*.log
+.tmp-*
+*.tmp
+accounts.json
+secrets.json
+credentials.json
+*.credentials.json
+.DS_Store
+Thumbs.db

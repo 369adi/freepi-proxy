@@ -8,6 +8,8 @@ logs/
 
 # Node
 node_modules/
+runtime/
+.cbmignore
 
 # OS
 .DS_Store

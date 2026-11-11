@@ -15,13 +15,18 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { bindRequestLifecycle } from './tools/lib/request-lifecycle.mjs';
+import { relayWithStopRecovery } from './tools/lib/stream-recovery.mjs';
 import { compareRoutingAccounts } from './tools/lib/routing-order.mjs';
 import { isHourlyCeiling, hourlyReset } from './tools/lib/upstream-errors.mjs';
 import { record as recordAlert } from './tools/alert.mjs';
 import { SessionRouter } from './tools/lib/session-router.mjs';
 import {upstreamSessionId} from './tools/lib/upstream-session.mjs';
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { waitForSponsorDisplay } from './tools/lib/ad-recovery.mjs';
+import { resolveBindConfig, extractRequestApiKey, verifyApiKey } from './tools/lib/proxy-auth.mjs';
+const BIND_CONFIG = resolveBindConfig(process.env);
+const STATE_DIR = process.env.FREEPI_STATE_DIR || (process.env.FREEPI_ACCOUNTS_PATH ? path.dirname(STORE_PATH) : path.join(os.homedir(), '.free-pi', 'proxy'));
 const alertLastSent=new Map();
 function failureAlert(kind,account,message) {
   const key=kind+':'+(account?.id||'-'), now=Date.now();
@@ -31,11 +36,26 @@ function failureAlert(kind,account,message) {
 }
 const sponsorEvents=new EventEmitter();
 sponsorEvents.setMaxListeners(0);
-const workerBindingsFile=path.join(os.homedir(),'.free-pi','proxy','worker-account-bindings.json');
+const accountTurns = new Map();
+const TURN_TTL_MS = 10 * 60 * 1000;
+function rememberAccountTurn(accountId, turnId) {
+  if (accountId && turnId) accountTurns.set(accountId, { turnId, at: Date.now() });
+}
+function activeAccountTurn(accountId) {
+  const entry = accountTurns.get(accountId);
+  if (!entry) return null;
+  if (Date.now() - entry.at > TURN_TTL_MS) {
+    accountTurns.delete(accountId);
+    return null;
+  }
+  return entry.turnId;
+}
+const workerBindingsFile=path.join(STATE_DIR,'worker-account-bindings.json');
+const IDLE_BINDING_TTL_MS = Number(process.env.FREEPI_BINDING_TTL_MS || 30 * 60 * 1000);
 const sessionRouter = new SessionRouter(Date.now,90000,{
   load:()=>{try{const value=JSON.parse(fsSync.readFileSync(workerBindingsFile,'utf8').replace(/^\uFEFF/,''));if(!Array.isArray(value)||value.some(row=>!Array.isArray(row)||typeof row[0]!=='string'||typeof row[1]?.accountId!=='string'||typeof row[1]?.sessionId!=='string'))throw Error('Invalid exclusive subagent account bindings');return value;}catch(error){if(error.code==='ENOENT')return [];throw error;}},
   save:bindings=>{fsSync.mkdirSync(path.dirname(workerBindingsFile),{recursive:true});const tmp=workerBindingsFile+'.tmp';fsSync.writeFileSync(tmp,JSON.stringify(bindings,null,2));fsSync.renameSync(tmp,workerBindingsFile);},
-});
+},IDLE_BINDING_TTL_MS);
 import { createSponsorPanel } from './tools/lib/sponsor-panel.mjs';
 
 import { loadStore, saveStore, findAccount, markExhausted, markInvalid, isMeteredDespiteFreeTier, STORE_PATH } from './tools/lib/store.mjs';
@@ -48,7 +68,8 @@ import { budgetSummary, modelMultiplier, burnRatePerHour, runwayHours, CREDITS_P
 const upstreamAgent = new https.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 
 const FREEPI_BASE    = 'https://api.freepi.ai';
-const PORT           = Number(process.env.FREEPI_PROXY_PORT ?? 4000);
+const HOST           = BIND_CONFIG.host;
+const PORT           = BIND_CONFIG.port;
 const AD_INTERVAL_MS = 30_000;
 const USAGE_POLL_MS  = Number(process.env.FREEPI_USAGE_POLL_MS ?? 60_000);
 const CREDENTIALS_PATH = path.join(os.homedir(), '.free-pi', 'agent', 'credentials.json');
@@ -544,7 +565,7 @@ function retryCandidates(exclude, model, session, worker) {
 // window has shown something (or the cooldown expires, whichever is first).
 
 const AD_COOLDOWN_MS = 10 * 60 * 1000;
-const hourlyBlockFile=path.join(os.homedir(),'.free-pi','proxy','hourly-blocks.json');
+const hourlyBlockFile=path.join(STATE_DIR,'hourly-blocks.json');
 const hourlyBlocked = new Map();
 try {
   const saved=JSON.parse(fsSync.readFileSync(hourlyBlockFile,'utf8').replace(/^\uFEFF/,''));
@@ -569,7 +590,7 @@ const adBlocked = new Map();   // account id -> when the block was recorded
 // stops reopening the window and stops telling the caller why a request was
 // refused. Kept next to the store but in its own file: it is derived state and
 // must never risk the account data itself.
-const AD_STATE_FILE = path.join(os.homedir(), '.free-pi', 'proxy', 'ad-state.json');
+const AD_STATE_FILE = path.join(STATE_DIR, 'ad-state.json');
 
 function loadAdState() {
   try {
@@ -609,9 +630,11 @@ async function recoverSponsor(account,downstream) {
   markAdsRequired(account.id);
   if (!AUTO_SPONSOR && account && account.token) {
     try {
-      let r = await confirmAdDirect(account.token, sessionIdFor(account), 'banner');
-      if (!r?.confirmed) r = await confirmAdDirect(account.token, sessionIdFor(account), 'inline');
+      const turnId = randomUUID();
+      let r = await confirmAdDirect(account.token, sessionIdFor(account), 'banner', turnId);
+      if (!r?.confirmed) r = await confirmAdDirect(account.token, sessionIdFor(account), 'inline', turnId);
       if (r && r.confirmed) {
+        rememberAccountTurn(account.id, r.turnId);
         clearAdsRequired(account.id);
         return true;
       }
@@ -736,9 +759,10 @@ const PIN_WAIT_TIMEOUT_MS = Math.max(0, Number(process.env.FREEPI_PIN_WAIT_MS ??
 
 /** 409 for a pin we cannot honour: unusable account, or lane still busy. */
 function sendPinnedError(status, id, account, code, model) {
+  const now = Date.now();
   const label = (account && (account.handle || account.id)) || id;
-  const why = pinnedUnusableReason(account, Date.now(), model);
-  const budgetState = account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing';
+  const why = pinnedUnusableReason(account, now, model);
+  const budgetState = account ? stateOf(account, now, STORE ? STORE.settings : {}) : 'missing';
   const adsRequired = why === 'waiting for a sponsor ad';
   if(adsRequired) {status=403;code='ads_required';}
   const headers = { 'content-type': 'application/json', 'access-control-allow-origin': '*' };
@@ -749,8 +773,7 @@ function sendPinnedError(status, id, account, code, model) {
     message = 'account \'' + label + '\' is busy (one request per account) and no lane '
       + 'freed up within ' + retryAfter + 's. Retry after ' + retryAfter + 's.';
   } else {
-    message = 'account \'' + label + '\' cannot be used right now: '
-      + (why || 'state ' + (account ? stateOf(account, Date.now(), STORE ? STORE.settings : {}) : 'missing')) + '.';
+    message = 'account \'' + label + '\' cannot be used right now: ' + (why || 'state ' + budgetState) + '.';
   }
   const payload = {
     error: {
@@ -1178,6 +1201,7 @@ async function runAdLoop() {
       try {
         const direct = await confirmAdDirect(account.token, sessionIdFor(account), 'banner');
         if (direct && direct.confirmed) {
+          rememberAccountTurn(account.id, direct.turnId);
           clearAdsRequired(account.id);
         }
       } catch { /* continue with next account */ }
@@ -1188,7 +1212,7 @@ async function runAdLoop() {
 }
 
 // Local rolling audit contains account IDs and balances, never tokens or prompts.
-const creditAuditFile=path.join(os.homedir(),'.free-pi','proxy','credit-usage.jsonl');
+const creditAuditFile=path.join(STATE_DIR,'credit-usage.jsonl');
 function auditCredit(record) {
   try { fsSync.mkdirSync(path.dirname(creditAuditFile),{recursive:true});fsSync.appendFileSync(creditAuditFile,JSON.stringify({at:new Date().toISOString(),...record})+'\n'); }
   catch(error) { console.error('[usage audit] '+error.message); }
@@ -1509,13 +1533,14 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
     const send = (token) => {
       auditCredit({event:'request',account:account.id,model:wantedModel});
       let responseWillRetry=false;
+      const turnId = activeAccountTurn(account.id);
       const upReq = https.request({
         hostname: 'api.freepi.ai',
         port: 443,
         path: '/v1/chat/completions',
         method: 'POST',
         agent: upstreamAgent,
-        headers: { ...upstreamHeaders, authorization: 'Bearer ' + token, 'x-session-id':sessionIdFor(account),'x-client-version':getClientVersion() },
+        headers: { ...upstreamHeaders, authorization: 'Bearer ' + token, 'x-session-id':sessionIdFor(account),'x-client-version':getClientVersion(), ...(turnId ? { 'x-turn-id': turnId } : {}) },
       }, upRes => {
         auditCredit({event:'response',account:account.id,model:wantedModel,status:upRes.statusCode});
         if (!inRes.headersSent && (upRes.statusCode === 426 || upRes.statusCode === 502 || QUOTA_STATUS.has(upRes.statusCode) || upRes.statusCode === 401 || upRes.statusCode === 403)) {
@@ -1698,10 +1723,51 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
         if (upRes.headers['cache-control'])     h['cache-control']     = upRes.headers['cache-control'];
         if (upRes.headers['transfer-encoding']) h['transfer-encoding'] = upRes.headers['transfer-encoding'];
         noteServed(account, upRes.statusCode);
-        inRes.writeHead(upRes.statusCode, h);
-        upRes.pipe(inRes);
-        upRes.on('end', releaseLaneOnce);
-        upRes.on('error', releaseLaneOnce);
+        responseWillRetry = true;
+        const requestContinuation = (nextBody, attempt) => new Promise((resolve, reject) => {
+          if (inRes.destroyed) { reject(new Error('client closed')); return; }
+          auditCredit({ event: 'continuation_request', account: account.id, model: wantedModel, attempt });
+          const continuationTurnId = activeAccountTurn(account.id);
+          const contHeaders = {
+            ...upstreamHeaders,
+            'content-length': nextBody.length,
+            authorization: 'Bearer ' + token,
+            'x-session-id': sessionIdFor(account),
+            'x-client-version': getClientVersion(),
+            ...(continuationTurnId ? { 'x-turn-id': continuationTurnId } : {}),
+          };
+          if (contHeaders['x-request-id']) contHeaders['x-request-id'] = contHeaders['x-request-id'] + '-c' + attempt;
+          const contReq = https.request({
+            hostname: 'api.freepi.ai',
+            port: 443,
+            path: '/v1/chat/completions',
+            method: 'POST',
+            agent: upstreamAgent,
+            headers: contHeaders,
+          }, contRes => {
+            auditCredit({ event: 'continuation_response', account: account.id, model: wantedModel, attempt, status: contRes.statusCode });
+            resolve({ upReq: contReq, upRes: contRes });
+          });
+          contReq.on('error', reject);
+          bindRequestLifecycle(contReq, inRes, () => {});
+          contReq.write(nextBody);
+          contReq.end();
+        });
+        void relayWithStopRecovery({
+          upReq,
+          upRes,
+          inRes,
+          headersOut: h,
+          origBody: body,
+          requestAttempt: requestContinuation,
+          releaseOnce: releaseLaneOnce,
+          onRecoveryAttempt: ({ attempt, reasoningChars }) => {
+            console.warn(`[proxy] ${account.id} sent premature mid-thought stop (${reasoningChars} reasoning chars) - auto-continuing (attempt ${attempt})`);
+          },
+        }).catch(err => {
+          console.error('[proxy] stream recovery error: ' + err.message);
+          releaseLaneOnce();
+        });
       });
       upReq.on('error', err => {
         console.error('[proxy] upstream error: ' + err.message);
@@ -1740,6 +1806,12 @@ function proxyCompletions(inReq, inRes, attempt = 0) {
             account = next;
             responseWillRetry = true;
             setTimeout(() => { if (!inRes.destroyed) send(next.token); else releaseLaneOnce(); }, 300 * retries);
+            return;
+          }
+          if (pin) {
+            console.warn(`[proxy] ${account.id} transport error (${err.message}) - retrying same pinned account`);
+            responseWillRetry = true;
+            setTimeout(() => { if (!inRes.destroyed) send(account.token); else releaseLaneOnce(); }, 300 * retries);
             return;
           }
         }
@@ -2019,17 +2091,69 @@ function startServer(models, sponsorHtml) {
     usage: usageSnapshot,
     html: sponsorHtml,
     port: PORT,
-    onDisplayed: (accountId) => clearAdsRequired(accountId),
+    stateDir: STATE_DIR,
+    onDisplayed: (accountId, turnId) => {
+      rememberAccountTurn(accountId, turnId);
+      clearAdsRequired(accountId);
+    },
   });
   const server = http.createServer(async function(req, res) {
-    const url = new URL(req.url, 'http://127.0.0.1:' + PORT);
-    if (url.pathname.startsWith('/sponsor')) { await sponsorPanel(req, res, url); return; }
+    let url;
+    try {
+      url = new URL(req.url, 'http://' + (req.headers.host || '127.0.0.1:' + PORT));
+    } catch {
+      url = new URL(req.url, 'http://127.0.0.1:' + PORT);
+    }
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
-    res.setHeader('access-control-allow-headers', 'content-type, authorization, x-request-id');
+    res.setHeader('access-control-allow-headers', 'content-type, authorization, x-api-key, x-request-id, x-freepi-account, x-freepi-session, x-freepi-worker, x-freepi-chat, x-freepi-control');
     // Let browser clients read which lane served a request (see send()).
     res.setHeader('access-control-expose-headers', 'x-free-pi-account, x-free-pi-handle');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    const requestAuthorized = !BIND_CONFIG.authRequired
+      || verifyApiKey(extractRequestApiKey(req.headers), BIND_CONFIG.apiKeys);
+
+    // Cheap liveness probe for the supervisor and Cloud Run. Must answer from
+    // memory only: no account, no lane, no upstream.
+    if (req.method === 'GET' && url.pathname === '/health') {
+      const payload = requestAuthorized
+        ? {
+            status: 'ok',
+            creditGuard: 'disabled-by-user',
+            clientRuntime: runtimeStatus(),
+            uptimeSeconds: Math.floor(process.uptime()),
+            inFlight: queueDepth().inFlight,
+            waiting: queueDepth().waiting,
+            accounts: STORE ? STORE.accounts.length : 0,
+          }
+        : {
+            status: 'ok',
+            creditGuard: 'disabled-by-user',
+            uptimeSeconds: Math.floor(process.uptime()),
+          };
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(payload));
+      return;
+    }
+
+    if (!requestAuthorized) {
+      res.writeHead(401, {
+        'content-type': 'application/json',
+        'www-authenticate': 'Bearer',
+        'cache-control': 'no-store',
+      });
+      res.end(JSON.stringify({
+        error: {
+          message: 'Invalid or missing API key.',
+          type: 'authentication_error',
+          code: 'invalid_api_key',
+        },
+      }));
+      return;
+    }
+
+    if (url.pathname.startsWith('/sponsor')) { await sponsorPanel(req, res, url); return; }
     if (url.pathname === '/session-routing') {
       if(req.method==='GET') {
         const now=Date.now();
@@ -2076,24 +2200,7 @@ function startServer(models, sponsorHtml) {
       return;
     }
 
-    // Cheap liveness probe for the supervisor. Must answer from memory only:
-    // no account, no lane, no upstream. A busy proxy is a healthy proxy, so
-    // this endpoint stays instant even while every lane is taken - otherwise
-    // the supervisor kills the proxy in the middle of a running request.
-    if (req.method === 'GET' && url.pathname === '/health') {
-      const body = JSON.stringify({
-        status: 'ok',
-        creditGuard: 'disabled-by-user',
-        clientRuntime: runtimeStatus(),
-        uptimeSeconds: Math.floor(process.uptime()),
-        inFlight: queueDepth().inFlight,
-        waiting: queueDepth().waiting,
-        accounts: STORE ? STORE.accounts.length : 0,
-      });
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      res.end(body);
-      return;
-    }
+    // Diagnostics path handled above (/health) before auth; keep remaining routes authenticated.
 
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       const body = JSON.stringify({
@@ -2193,21 +2300,22 @@ function startServer(models, sponsorHtml) {
     throw err;
   });
 
-  server.listen(PORT, '127.0.0.1', function() {
+  server.listen(PORT, HOST, function() {
     const W = 60, sep = '='.repeat(W);
+    const displayHost = HOST === '0.0.0.0' ? '0.0.0.0' : HOST;
     console.log('\n' + sep);
-    console.log(' free-pi proxy  ->  http://127.0.0.1:' + PORT + '/v1');
+    console.log(' free-pi proxy  ->  http://' + displayHost + ':' + PORT + '/v1' + (BIND_CONFIG.authRequired ? ' (API key required)' : ''));
     console.log(sep);
     console.log(' opencode.json:');
     console.log('   {');
     console.log('     "provider": "openai",');
     console.log('     "openai": {');
-    console.log('       "baseUrl": "http://127.0.0.1:' + PORT + '/v1",');
-    console.log('       "apiKey": "freepi-proxy"');
+    console.log('       "baseUrl": "http://' + displayHost + ':' + PORT + '/v1",');
+    console.log('       "apiKey": "' + (BIND_CONFIG.authRequired ? '<FREEPI_PROXY_API_KEY>' : 'freepi-proxy') + '"');
     console.log('     }');
     console.log('   }');
     console.log(sep);
-    console.log(' usage:   GET http://127.0.0.1:' + PORT + '/usage');
+    console.log(' usage:   GET http://' + displayHost + ':' + PORT + '/usage');
     console.log(' accounts: node tools/freepi-accounts.mjs status');
     console.log(sep);
     console.log(' Models (copy an ID into the opencode "model" setting):');
@@ -2218,9 +2326,15 @@ function startServer(models, sponsorHtml) {
     console.log(' Suggested: "model": "' + catalog[0].id + '"');
     console.log(sep + '\n');
   });
+  return server;
 }
 
 async function main() {
+  if (BIND_CONFIG.misconfiguredPublic) {
+    console.error('[security] Refusing to listen publicly on ' + HOST + ':' + PORT + ' without FREEPI_PROXY_API_KEY.');
+    console.error('[security] Set FREEPI_PROXY_API_KEY (or keep FREEPI_PROXY_HOST=127.0.0.1 for local use).');
+    process.exit(1);
+  }
   const { store, seeded } = await ensureStore();
   STORE = store;
   // Restore which accounts were waiting for a display before the last stop, so
@@ -2233,7 +2347,7 @@ async function main() {
     console.error('Expected credentials: ' + CREDENTIALS_PATH);
     process.exit(1);
   }
-  if (seeded) console.log('[rotator] imported existing credentials from ' + CREDENTIALS_PATH);
+  if (seeded) console.log('[rotator] seeded account store at ' + STORE_PATH);
 
   // Measure everything once at startup so the very first request is routed well.
   const results = await refreshAll(STORE, { force: true });
@@ -2271,7 +2385,13 @@ async function main() {
   }
 
   const sponsorHtml = await fs.readFile(new URL('./tools/sponsor.html', import.meta.url), 'utf8');
-  startServer(models, sponsorHtml);
+  const server = startServer(models, sponsorHtml);
+  const shutdown = () => {
+    try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   // Pick up models free-pi launches later instead of 404ing them until a restart.
   startCatalogRefresh(function () {
     const a = activeAccount() || (STORE && STORE.accounts && STORE.accounts.find(x => x && x.token && !x.disabled));
@@ -2279,7 +2399,9 @@ async function main() {
   }, 30 * 60 * 1000);
   runUsageLoop().catch(function() {});
   runAdLoop().catch(function() {});
-  console.log('[sponsor] Open http://127.0.0.1:' + PORT + '/sponsor and keep the sponsor card visible.');
+  if (!BIND_CONFIG.isCloudRun) {
+    console.log('[sponsor] Open http://127.0.0.1:' + PORT + '/sponsor and keep the sponsor card visible.');
+  }
 }
 
 main().catch(function(err) { console.error('[proxy] Fatal:', err); process.exit(1); });

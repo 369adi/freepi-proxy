@@ -26,10 +26,16 @@ const inject = ['commands'];
 
 const API_BASE = 'https://api.freepi.ai';
 const CONSENT_VERSION = '4';
-const PROXY_URL = process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000';
+const PROXY_URL = (process.env.FREEPI_PROXY_URL || 'http://127.0.0.1:4000').replace(/\/$/, '');
 const PROXY_USAGE = PROXY_URL + '/usage';
 const PROXY_BUDGET = PROXY_URL + '/budget';
 const PROXY_HISTORY = PROXY_URL + '/history';
+const proxyFetchInit = (timeoutMs) => ({
+  signal: AbortSignal.timeout(timeoutMs),
+  ...(process.env.FREEPI_PROXY_API_KEY
+    ? { headers: { authorization: 'Bearer ' + process.env.FREEPI_PROXY_API_KEY } }
+    : {}),
+});
 const STORE_PATH =
   process.env.FREEPI_ACCOUNTS_PATH ||
   path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
@@ -748,7 +754,7 @@ function saveStore(store) {
 
 /** Next unused gh-N@domain suggestion, matching the proxy's own minting rule. */
 function nextMintEmail(store) {
-  const domain = store?.settings?.emailDomain || 'arisya.de';
+  const domain = store?.settings?.emailDomain || process.env.FREEPI_EMAIL_DOMAIN || 'example.com';
   const prefix = store?.settings?.emailPrefix || 'gh';
   const taken = new Set((store?.accounts || []).map((a) => a.email));
   let n = store?.nextAccountNumber || (store?.accounts?.length || 0) + 1;
@@ -1254,7 +1260,7 @@ async function handleStatus(invocation) {
   if (wantsJson(invocation)) {
     let live = null;
     try {
-      const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(PROXY_USAGE, proxyFetchInit(2000));
       if (res.ok) live = await res.json();
     } catch {
       /* proxy down: the store still answers everything that is persisted */
@@ -1313,7 +1319,7 @@ async function handleStatus(invocation) {
 
   let proxy = 'Proxy nicht erreichbar';
   try {
-    const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(2000) });
+    const res = await fetch(PROXY_USAGE, proxyFetchInit(2000));
     if (res.ok) {
       const u = await res.json();
       proxy = `Proxy laeuft - inFlight ${u.queue?.inFlight ?? 0}, waiting ${u.queue?.waiting ?? 0}, lanes ${u.queue?.lanes ?? usable}`;
@@ -1329,7 +1335,7 @@ async function handleStatus(invocation) {
 async function handleUsage(invocation) {
   const wantJson = wantsJson(invocation);
   try {
-    const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(3000) });
+    const res = await fetch(PROXY_USAGE, proxyFetchInit(3000));
     if (!res.ok) {
       return { kind: 'error', text: `Proxy antwortet ${res.status} auf ${PROXY_USAGE}` };
     }
@@ -1341,7 +1347,7 @@ async function handleUsage(invocation) {
     // multiple of the base rate, so credits alone hide the real remaining time.
     let budget = null;
     try {
-      const bres = await fetch(PROXY_BUDGET, { signal: AbortSignal.timeout(2000) });
+      const bres = await fetch(PROXY_BUDGET, proxyFetchInit(2000));
       if (bres.ok) budget = await bres.json();
     } catch {
       /* older proxy without /budget - the rest of the output still works */
@@ -1393,7 +1399,7 @@ async function handleUsage(invocation) {
 async function handleHistory(invocation) {
   const wantJson = wantsJson(invocation);
   try {
-    const res = await fetch(PROXY_HISTORY, { signal: AbortSignal.timeout(3000) });
+    const res = await fetch(PROXY_HISTORY, proxyFetchInit(3000));
     if (!res.ok) {
       return { kind: 'error', text: `Proxy antwortet ${res.status} auf ${PROXY_HISTORY}` };
     }
@@ -1625,7 +1631,7 @@ async function handleDoctor() {
   }
 
   try {
-    const res = await fetch(PROXY_USAGE, { signal: AbortSignal.timeout(3000) });
+    const res = await fetch(PROXY_USAGE, proxyFetchInit(3000));
     if (!res.ok) {
       bad.push(['Proxy', `antwortet ${res.status} auf ${PROXY_USAGE}`]);
     } else {
@@ -1640,7 +1646,7 @@ async function handleDoctor() {
 
   // Hours, not credits: that is the number the harness actually runs out of.
   try {
-    const bres = await fetch(PROXY_BUDGET, { signal: AbortSignal.timeout(2500) });
+    const bres = await fetch(PROXY_BUDGET, proxyFetchInit(2500));
     if (bres.ok) {
       const b = await bres.json();
       const left = typeof b.hoursLeft === 'number' ? `${b.hoursLeft.toFixed(2)} h` : '?';
@@ -1681,37 +1687,113 @@ async function handleDoctor() {
   return { kind: bad.length ? 'error' : 'success', text: lines.join('\n') };
 }
 
+function resolveNodeExecutable() {
+  if (process.env.FREEPI_NODE_EXE) return process.env.FREEPI_NODE_EXE;
+  if (path.basename(process.execPath).toLowerCase().replace(/\.exe$/, '') === 'node') return process.execPath;
+  if (process.platform === 'win32') {
+    for (const candidate of [
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
+      path.join(process.env.LocalAppData || '', 'Programs', 'nodejs', 'node.exe'),
+    ]) {
+      if (candidate && fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return 'node';
+}
+
+function parseCloudArgs(rawInput, { forceDeploy = false } = {}) {
+  const cleaned = String(rawInput || '')
+    .trim()
+    .replace(/^\/(?:freepi-cloud|freepi-deploy|deploy)\b\s*/i, '')
+    .trim();
+  const parts = cleaned ? cleaned.split(/\s+/) : [];
+  const first = (parts[0] || '').toLowerCase();
+  const wantsList = first === '--list' || first === 'list' || first === 'status';
+  if (forceDeploy && !wantsList && !parts.some((p) => p === 'deploy' || p === '--deploy')) {
+    parts.unshift('--deploy');
+  }
+  return parts;
+}
+
+async function listCloudAccountsText(setupMjs, extraArgs = []) {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const run = promisify(execFile);
+  const cliArgs = [setupMjs, '--list', ...extraArgs.filter((a) => a === '--all' || a === '--refresh')];
+  try {
+    const { stdout, stderr } = await run(resolveNodeExecutable(), cliArgs, {
+      encoding: 'utf8',
+      timeout: 60000,
+      windowsHide: true,
+    });
+    return { ok: true, text: (stdout || stderr || 'No output returned from Google setup.').trim() };
+  } catch (error) {
+    if (error?.killed || error?.signal === 'SIGTERM') {
+      return { ok: false, text: 'Google setup timed out (60s).' };
+    }
+    const msg = (error?.stdout || error?.stderr || error?.message || 'Google setup failed.').toString().trim();
+    return { ok: false, text: msg };
+  }
+}
+
+async function launchCloudWindow(setupMjs, parts) {
+  if (process.env.FREEPI_SKIP_CLOUD_WINDOW === '1') return;
+  const workDir = path.dirname(path.dirname(setupMjs));
+  const detach = (cmd, args) => {
+    const child = spawn(cmd, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: process.platform !== 'win32',
+    });
+    child.on('error', () => {});
+    child.unref();
+  };
+  if (process.platform === 'win32') {
+    const cmdFile = path.join(workDir, 'Google-Cloud-Setup.cmd');
+    if (fs.existsSync(cmdFile)) {
+      detach('cmd.exe', ['/c', 'start', 'Free-Pi Google Setup', '/D', workDir, cmdFile, ...parts]);
+    } else {
+      detach('cmd.exe', ['/c', 'start', 'Free-Pi Google Setup', 'cmd.exe', '/k', resolveNodeExecutable(), setupMjs, ...parts]);
+    }
+  } else {
+    detach(resolveNodeExecutable(), [setupMjs, ...parts]);
+  }
+}
+
 /**
- * /freepi-cloud: listing is quick and answered inline. The actual setup can wait
- * minutes for a browser sign-in, so it runs in its own visible console window
- * instead of blocking the harness with no feedback. Uses `node` from PATH, not
- * process.execPath: inside the desktop app that is the app binary, not Node.
+ * /freepi-cloud, /freepi-deploy, /deploy:
+ * - `list` / `--list` / `status`: inline status + browser account list
+ * - empty `/freepi-cloud`: opens the interactive Setup console window AND prints the status list
+ * - `deploy` / `1..9` / `email` / `new`: runs in its own visible console window
  */
-async function runCloudCommand(setupMjs, parts) {
-  const { spawn, spawnSync } = await import('node:child_process');
-  const listOnly = !parts.length || parts[0] === '--list' || parts[0] === 'status';
-  if (listOnly) {
-    const res = spawnSync('node', [setupMjs, '--list'], { encoding: 'utf8', timeout: 60000, windowsHide: true });
-    return {
-      kind: res.status === 0 ? 'success' : 'error',
-      text: (res.stdout || res.stderr || 'Keine Rueckmeldung vom Google-Setup.').trim(),
-    };
+async function runCloudCommand(setupMjs, rawInputOrParts, options = {}) {
+  const effectiveSetup = process.env.FREEPI_CLOUD_SETUP_PATH || setupMjs;
+  const parts = Array.isArray(rawInputOrParts)
+    ? parseCloudArgs(rawInputOrParts.join(' '), options)
+    : parseCloudArgs(rawInputOrParts, options);
+  const first = (parts[0] || '').toLowerCase();
+  if (first === '--list' || first === 'list' || first === 'status') {
+    const res = await listCloudAccountsText(effectiveSetup, parts.slice(1));
+    return { kind: res.ok ? 'success' : 'error', text: res.text };
   }
   try {
-    if (process.platform === 'win32') {
-      const cmdFile = path.join(path.dirname(path.dirname(setupMjs)), 'Google-Cloud-Setup.cmd');
-      spawn('cmd.exe', ['/c', 'start', 'Google Setup', cmdFile, ...parts], {
-        detached: true, stdio: 'ignore', windowsHide: false,
-      }).unref();
-    } else {
-      spawn('node', [setupMjs, ...parts], { detached: true, stdio: 'ignore' }).unref();
-    }
+    await launchCloudWindow(effectiveSetup, parts);
   } catch (error) {
-    return { kind: 'error', text: 'Setup konnte nicht gestartet werden: ' + error.message };
+    return { kind: 'error', text: 'Could not launch Google setup: ' + error.message };
   }
+  if (parts.length === 0) {
+    const listed = await listCloudAccountsText(effectiveSetup);
+    return {
+      kind: 'success',
+      text: 'Google Setup window opened. Pick a Google Pro account there (or run /deploy).\n\n' + listed.text,
+    };
+  }
+  const isDeploy = parts.includes('--deploy') || parts.includes('deploy');
   return {
     kind: 'success',
-    text: 'Google-Setup laeuft jetzt in einem eigenen Fenster. Falls eine Anmeldung noetig ist, oeffnet sich dein Browser. Danach zeigt /freepi-cloud den neuen Stand.',
+    text: isDeploy
+      ? 'Google Cloud Deploy is running in its own window. Your browser will open if sign-in or billing is needed.'
+      : 'Google Setup is running in its own window and will verify Google Pro (>= 2 TB). Check /freepi-cloud list afterwards.',
   };
 }
 
@@ -1775,16 +1857,28 @@ function apply(ctx) {
         handler: (invocation) => track(handleAds(invocation)),
       });
 
+      const resolveCloudSetup = async () => {
+        const { fileURLToPath } = await import('node:url');
+        return fileURLToPath(new URL('../../tools/google-cloud-setup.mjs', import.meta.url));
+      };
+
       yield ctx.commands.register({
         name: 'freepi-cloud',
-        description: 'Set up Google Cloud & Google Drive with any browser account (/freepi-cloud <num|email>)',
-        handler: async (invocation) => {
-          const { fileURLToPath } = await import('node:url');
-          const input = String(invocation?.rawInput || '').trim();
-          const parts = input ? input.split(/\s+/) : [];
-          const setupMjs = fileURLToPath(new URL('../../tools/google-cloud-setup.mjs', import.meta.url));
-          return runCloudCommand(setupMjs, parts);
-        },
+        description: 'Set up Google Pro Drive or deploy 24/7 Cloud Run (/freepi-cloud [deploy|1..9|new|list])',
+        input: { hint: 'deploy | 1..9 | new | list [--all] (Enter = Setup window)', attachments: false },
+        handler: (invocation) => track(resolveCloudSetup().then((setupMjs) => runCloudCommand(setupMjs, invocation?.rawInput))),
+      });
+
+      yield ctx.commands.register({
+        name: 'freepi-deploy',
+        description: 'Deploy the Free-Pi proxy to 24/7 Google Cloud Run in a setup window',
+        handler: (invocation) => track(resolveCloudSetup().then((setupMjs) => runCloudCommand(setupMjs, invocation?.rawInput, { forceDeploy: true }))),
+      });
+
+      yield ctx.commands.register({
+        name: 'deploy',
+        description: 'Deploy the Free-Pi proxy to 24/7 Google Cloud Run (/freepi-deploy)',
+        handler: (invocation) => track(resolveCloudSetup().then((setupMjs) => runCloudCommand(setupMjs, invocation?.rawInput, { forceDeploy: true }))),
       });
 
       yield ctx.commands.register({

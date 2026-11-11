@@ -25,39 +25,59 @@ export function apply(ctx) {
   const owner={};
   const base=(process.env.FREEPI_PROXY_URL||'http://127.0.0.1:4000').replace(/\/$/,'');
   const endpoint=base+'/session-routing';
+  const authHeaders=()=>process.env.FREEPI_PROXY_API_KEY?{authorization:'Bearer '+process.env.FREEPI_PROXY_API_KEY}:{};
   const chains=new Map();
   const activeWorkers=new Set();
   const recovery=new RecoveryBudget();
   // Track only the final assistant message of each step; never restart a turn
   // that produced visible text or tool calls, or one explicitly stopped by user.
-  const finalMessages=new WeakMap(), continuedTurns=new WeakMap();
+  const finalMessages=new WeakMap(), continuedTurns=new WeakMap(), lastActivity=new WeakMap();
+  const IDLE_RELEASE_MS=Number(process.env.FREEPI_IDLE_RELEASE_MS || 30*60*1000);
+  const activityKey=(obj)=>obj?.session??obj;
+  const noteActivity=(obj)=>{const k=activityKey(obj);if(k)lastActivity.set(k,Date.now());};
   ctx.on('session/event',(session,event)=>{
-    if(event.type==='assistant/message')finalMessages.set(session,event.data);
-    else if(event.type==='turn/start')finalMessages.delete(session);
+    if(event.type==='assistant/message'){finalMessages.set(session,event.data);noteActivity(session);}
+    else if(event.type==='turn/start'){finalMessages.delete(session);continuedTurns.delete(session);noteActivity(session);}
+    else if(event.type==='user/message')noteActivity(session);
   });
   ctx.on('agent/turn-stopping',async({agent,turn,signal})=>{
     const result=finalMessages.get(agent.session), message=result?.message;
     const content=message?.content;
-    if(result?.turn!==turn || message?.source?.provider!=='freepi' || signal?.aborted)return;
+    const provider=message?.source?.provider;
+    if(result?.turn!==turn || !['freepi','llama-local'].includes(provider) || signal?.aborted)return;
     const stopReason=message?.source?.replayState?.response?.stopReason ?? message?.stopReason;
     const isReasoningOnly=stopReason==='stop' && Array.isArray(content) &&
       content.some(block=>block.type==='reasoning' && block.text?.trim()) &&
-      !content.some(block=>block.type!=='reasoning');
+      !content.some(block=>block.type==='tool-call' || (block.type==='text' && block.text?.trim()));
     const isLengthLimit=stopReason==='length' || stopReason==='max_tokens' || stopReason==='max-tokens';
     if(!isReasoningOnly && !isLengthLimit)return;
-    const msgId=message?.id || `${turn}:${stopReason}`;
-    const prev=continuedTurns.get(agent.session) || {turn:-1,count:0,lastMsgId:null};
+    const msgId=message?.id || null;
+    const prev=continuedTurns.get(agent.session) || {turn:-1,count:0,lastMsgId:null,lastResult:null};
     const count=prev.turn===turn ? prev.count : 0;
-    if(prev.lastMsgId===msgId || count>=5)return;
-    // The live proxy must advertise enforcement; a stale/unpatched proxy must
-    // never turn this recovery into an unprotected billable request.
-    try {
-      const response=await original(base+'/health',{signal:signal?AbortSignal.any([signal,AbortSignal.timeout(3000)]):AbortSignal.timeout(3000)});
-      if(!response.ok || !['free-unlimited-visible-v1','disabled-by-user'].includes((await response.json()).creditGuard) || signal?.aborted)return;
-    } catch {return;}
-    continuedTurns.set(agent.session,{turn,count:count+1,lastMsgId:msgId});
+    if(prev.lastResult===result || (msgId && prev.lastMsgId===msgId) || count>=10)return;
+    // Local GPU llama-server has no credit limit; Free-Pi requires active credit guard advertisement.
+    let guardOk=provider==='llama-local';
+    if(provider==='freepi'){
+      for(let attempt=0;attempt<2 && !signal?.aborted;attempt++){
+        try{
+          const response=await original(base+'/health',{headers:authHeaders(),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(3000)]):AbortSignal.timeout(3000)});
+          if(response.ok){
+            const body=await response.json();
+            if(['free-unlimited-visible-v1','disabled-by-user'].includes(body?.creditGuard))guardOk=true;
+            break;
+          }
+          if(response.status<500)break;
+        }catch{}
+        if(attempt===0 && !signal?.aborted)await new Promise(r=>setTimeout(r,200));
+      }
+    }
+    if(!guardOk || signal?.aborted)return;
+    continuedTurns.set(agent.session,{turn,count:count+1,lastMsgId:msgId,lastResult:result});
+    const hasVisibleOutput=Array.isArray(content) && content.some(b=>b.type==='tool-call' || (b.type==='text' && b.text?.trim()));
     const promptText=isLengthLimit
-      ? 'Your previous response hit the output token limit mid-generation. Continue seamlessly from the exact point where you stopped without repeating what you already wrote.'
+      ? (hasVisibleOutput
+          ? 'Your previous response hit the output token limit mid-generation. Continue seamlessly from the exact point where you stopped without repeating what you already wrote.'
+          : 'Your previous thought reached the output token limit before producing an answer or tool call. Conclude your thinking concisely and provide your visible answer or tool call now.')
       : 'The previous model response contained reasoning only and ended without an answer or tool call. Continue the current task from the existing context. Do not repeat side effects unless verified.';
     agent.inject({id:crypto.randomUUID(),role:'user',source:{kind:'freepi-recovery',reason:isLengthLimit?'max-tokens':'reasoning-only'},content:[{type:'text',text:promptText}]});
   });
@@ -65,7 +85,7 @@ export function apply(ctx) {
     const key=data.workerId||data.sessionId;
     const pending=(chains.get(key)||Promise.resolve()).catch(()=>{}).then(async()=>{
       const timeout=AbortSignal.timeout(4000);
-      const response=await original(endpoint,{method:'POST',headers:{'content-type':'application/json','x-freepi-control':'session-routing'},body:JSON.stringify(data),signal:signal?AbortSignal.any([signal,timeout]):timeout});
+      const response=await original(endpoint,{method:'POST',headers:{'content-type':'application/json','x-freepi-control':'session-routing',...authHeaders()},body:JSON.stringify(data),signal:signal?AbortSignal.any([signal,timeout]):timeout});
       if(!response.ok) throw Error('Free-Pi session routing returned '+response.status);
       return response.json();
     });
@@ -87,6 +107,8 @@ export function apply(ctx) {
     if(!agent)return original(input,init);
     if(agent.session?.id && agent.session.id!==agent.id)throw Error('Subagent/chat identity mismatch');
     const root=rootAgent(ctx.agents,agent);
+    noteActivity(agent);
+    if(root!==agent)noteActivity(root);
     const cowork=agent!==root;
     let model, parsedBody;
     try{parsedBody=JSON.parse(typeof init?.body==='string'?init.body:await input.clone().text());model=parsedBody?.model;}catch{}
@@ -127,13 +149,23 @@ export function apply(ctx) {
     slot.owner=owner;
     slot.handler=wrapped;
     globalThis.fetch=slot.dispatch;
+    const KEEPALIVE_MS=Number(process.env.FREEPI_KEEPALIVE_MS || 15000);
     const timer=setInterval(()=>{
+      const now=Date.now();
       for(const agent of ctx.agents.list()) {
         if(agent.status!=='running')continue;
         const isWorker=activeWorkers.has(agent.id);
-        if(isWorker || rootAgent(ctx.agents,agent)===agent)control({action:'touch',sessionId:agent.id}).catch(()=>{});
+        if(!isWorker && rootAgent(ctx.agents,agent)!==agent)continue;
+        const key=activityKey(agent);
+        const last=lastActivity.get(key);
+        if(last===undefined){lastActivity.set(key,now);}
+        else if(now-last>=IDLE_RELEASE_MS){
+          release(agent);
+          continue;
+        }
+        control({action:'touch',sessionId:agent.id}).catch(()=>{});
       }
-    },15000);
+    },KEEPALIVE_MS);
     timer.unref?.();
     return ()=>{
       clearInterval(timer);
@@ -159,7 +191,8 @@ export function apply(ctx) {
     const model=(!rawModel||rawModel==='particle')?'deepseek-v4.1-flash':rawModel;
     // Reserve as soon as the child is created; the first model fetch keeps
     // polling if the pool is full. No sign-in or manual activation is required.
-    await control({action:'cowork',sessionId:root.id,workerId:agent.id,model}).catch(()=>{});
+    const allocation=await control({action:'cowork',sessionId:root.id,workerId:agent.id,model}).catch(()=>null);
+    if(!allocation || allocation.status==='unavailable') activeWorkers.delete(agent.id);
   });
   ctx.on('agent/request-error',async(payload,next)=>{
     // Sponsor waits and transport failures use the longer, cancellable
@@ -178,7 +211,7 @@ export function apply(ctx) {
   });
   ctx.commands.register({name:'freepi-session',description:'Show main account reservations and cowork handovers',handler:async invocation=>{
     try {
-      const response=await original(endpoint,{signal:AbortSignal.timeout(3000)});
+      const response=await original(endpoint,{headers:authHeaders(),signal:AbortSignal.timeout(3000)});
       const data=await response.json();
       const pool=data.accounts?[`Accounts available: ${data.accounts.available}/${data.accounts.total} (busy: ${data.accounts.busy||0})`]:[];
       const lines=[...pool,...(data.sessions||[]).map(s=>`${s.sessionId}: ${s.message}`),...(data.workers||[]).map(w=>`Subagent/chat ${w.chatId} -> ${w.accountId} (exclusive; parent ${w.parentSessionId})`),...(data.waitingWorkers||[]).map(w=>`Subagent/chat ${w.workerId}: waiting for a free account`)];

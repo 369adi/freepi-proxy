@@ -9,6 +9,7 @@
 //   POST /auth/token              -> {status:"pending"} | {token} | 403 consent_required
 //   GET  /ads/next?slot=banner    -> sponsor banner
 
+import { randomUUID } from 'node:crypto';
 import {getClientVersion,requiredVersion,upgradeClient,syncClientVersionFromCatalog} from './client-runtime.mjs';
 export const BASE = process.env.FREEPI_API_BASE || 'https://api.freepi.ai';
 export const VERSION = getClientVersion();
@@ -63,7 +64,7 @@ export const getMe = token => request('/me', { token });
 /** Model catalog (also carries the minimum supported client version). */
 export const getCatalog = async token => {
   const res = await request('/client-version?cli_version=' + encodeURIComponent(getClientVersion()), token ? { token } : {});
-  syncClientVersionFromCatalog(res);
+  if (res && typeof res === 'object') syncClientVersionFromCatalog(res);
   return res;
 };
 
@@ -89,8 +90,14 @@ export const devicePoll = (sessionId, { timezone, locale } = {}) =>
   });
 
 /** Sponsor banner for the active account. */
-export const getAds = (token, sessionId, slot = 'banner') =>
-  request('/ads/next?slot=' + encodeURIComponent(slot), { token, headers: { 'x-session-id': sessionId } });
+export const getAds = (token, sessionId, slot = 'banner', turnId = null) =>
+  request('/ads/next?slot=' + encodeURIComponent(slot), {
+    token,
+    headers: {
+      'x-session-id': sessionId,
+      ...(turnId ? { 'x-turn-id': turnId } : {}),
+    },
+  });
 
 /**
  * Direct sponsor confirmation from official free-pi-cli (vendor/free-pi-cli/src/vendor/pi-ads/api.ts):
@@ -98,11 +105,11 @@ export const getAds = (token, sessionId, slot = 'banner') =>
  * 2. If Gravity imp_url on https://*.trygravity.(ai|com), fire GET imp_url
  * 3. POST /ads/impression with { ad_id, click_token, imp_fired }
  */
-export async function confirmAdDirect(token, sessionId, slot = 'banner') {
+export async function confirmAdDirect(token, sessionId, slot = 'banner', turnId = randomUUID()) {
   if (!token || !sessionId) return { confirmed: false };
-  const ad = await getAds(token, sessionId, slot);
+  const ad = await getAds(token, sessionId, slot, turnId);
   if (!ad || typeof ad !== 'object' || !ad.ad_id || !ad.click_token) {
-    return { confirmed: false, ad: ad || null };
+    return { confirmed: false, ad: ad || null, turnId };
   }
   let impFired = false;
   if (ad.source === 'gravity' && typeof ad.imp_url === 'string' && ad.imp_url) {
@@ -121,7 +128,7 @@ export async function confirmAdDirect(token, sessionId, slot = 'banner') {
   await request('/ads/impression', {
     method: 'POST',
     token,
-    headers: { 'x-session-id': sessionId },
+    headers: { 'x-session-id': sessionId, 'x-turn-id': turnId },
     body: {
       ad_id: ad.ad_id,
       click_token: ad.click_token,
@@ -129,7 +136,7 @@ export async function confirmAdDirect(token, sessionId, slot = 'banner') {
     },
     timeoutMs: 5000,
   });
-  return { confirmed: true, ad, impFired };
+  return { confirmed: true, ad, impFired, turnId };
 }
 
 /** /me/consent for an already authenticated account. */

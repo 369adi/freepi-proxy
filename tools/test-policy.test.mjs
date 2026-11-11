@@ -18,7 +18,7 @@ function acct(store, id, { remaining, allowance = 15000, refillIn = 12 * HOUR, f
   const account = {
     id,
     token: 'tok-' + id,
-    email: `${id}@arisya.de`,
+    email: `${id}@example.com`,
     handle: id,
     disabled: false,
     lastUsedAt: new Date(now - lastUsedAgo).toISOString(),
@@ -124,10 +124,10 @@ test('picks the account with the most budget left', () => {
 test('mint address never collides with a known identity', () => {
   const store = emptyStore();
   store.nextAccountNumber = 3;
-  acct(store, 'acc-1').email = 'gh-3@arisya.de';
+  acct(store, 'acc-1').email = 'gh-3@example.com';
   const email = nextMintEmail(store);
-  assert.notEqual(email, 'gh-3@arisya.de');
-  assert.match(email, /^gh-\d+@arisya\.de$/);
+  assert.notEqual(email, 'gh-3@example.com');
+  assert.match(email, /^gh-\d+@example\.com$/);
 });
 
 test('low watermark scales with the allowance', () => {
@@ -137,7 +137,7 @@ test('low watermark scales with the allowance', () => {
 
 test('usage is remembered and rolled over at refill', () => {
   const store = emptyStore();
-  const account = addAccount(store, { token: 't', email: 'gh-1@arisya.de' });
+  const account = addAccount(store, { token: 't', email: 'gh-1@example.com' });
   const me = now => ({
     allowance_credits: 15000,
     remaining_credits_today: now,

@@ -3,7 +3,7 @@
 # app never takes the alert channel down with it.
 $ErrorActionPreference = 'Stop'
 
-$repo = 'C:\Users\liket\Documents\freepi-proxy'
+$repo = Split-Path -Parent $PSScriptRoot
 $node = (Get-Command node).Source
 $script = Join-Path $repo 'tools\alert.mjs'
 

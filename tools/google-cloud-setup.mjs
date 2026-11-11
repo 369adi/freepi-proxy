@@ -13,6 +13,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +27,8 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const WORKSPACE_ROOT = path.join(os.homedir(), '.dsh', 'google-workspace');
 const AUTH_CONFIG_DIR = path.join(WORKSPACE_ROOT, 'auth');
 const ACCOUNT_FILE = path.join(WORKSPACE_ROOT, 'account.json');
+const TIERS_FILE = path.join(WORKSPACE_ROOT, 'account-tiers.json');
+export const MIN_PRO_STORAGE_BYTES = 2 * 1024 ** 4; // 2 TiB (Google One / AI Pro)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -315,30 +318,255 @@ function getGcloudAuthedAccounts() {
   }
 }
 
-export function readSavedWorkspaceAccount() {
-  return safeReadJson(ACCOUNT_FILE);
+export function readSavedWorkspaceAccount(accountFile = ACCOUNT_FILE) {
+  return safeReadJson(accountFile);
 }
 
-export function saveWorkspaceAccount(patch) {
-  fs.mkdirSync(WORKSPACE_ROOT, { recursive: true });
-  const current = safeReadJson(ACCOUNT_FILE) || {};
+export function saveWorkspaceAccount(patch, accountFile = ACCOUNT_FILE) {
+  fs.mkdirSync(path.dirname(accountFile), { recursive: true });
+  const current = safeReadJson(accountFile) || {};
   const next = {
     ...current,
     ...patch,
     updatedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(next, null, 2), 'utf8');
+  fs.writeFileSync(accountFile, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 });
   return next;
+}
+
+export function readAccountTiers(tiersFile = TIERS_FILE) {
+  const data = safeReadJson(tiersFile);
+  return data && typeof data === 'object' ? data : {};
+}
+
+export function saveAccountTier(entry, tiersFile = TIERS_FILE) {
+  const email = String(entry?.email || '').trim();
+  if (!email) return null;
+  fs.mkdirSync(path.dirname(tiersFile), { recursive: true });
+  const current = readAccountTiers(tiersFile);
+  const key = email.toLowerCase();
+  const next = {
+    ...current,
+    [key]: {
+      email,
+      isPro: Boolean(entry.isPro),
+      tier: entry.isPro ? 'pro' : 'free',
+      limitBytes: entry.limitBytes ?? null,
+      storageLabel: entry.storageLabel || 'unknown',
+      checkedAt: entry.checkedAt || new Date().toISOString(),
+    },
+  };
+  fs.writeFileSync(tiersFile, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 });
+  return next[key];
+}
+
+export function classifyDriveQuota(about) {
+  const limitRaw = about?.storageQuota?.limit;
+  const limitBytes = limitRaw !== undefined && limitRaw !== null && limitRaw !== '' ? Number(limitRaw) : null;
+  const valid = Number.isFinite(limitBytes) && limitBytes > 0;
+  const tb = valid ? +(limitBytes / (1024 ** 4)).toFixed(2) : null;
+  const gb = valid ? +(limitBytes / (1024 ** 3)).toFixed(1) : null;
+  const isPro = valid && limitBytes >= MIN_PRO_STORAGE_BYTES;
+  const storageLabel = tb !== null && tb >= 1 ? `${tb} TB` : gb !== null ? `${gb} GB` : 'unknown';
+  return {
+    isPro,
+    tier: valid ? (isPro ? 'pro' : 'free') : 'unknown',
+    limitBytes: valid ? limitBytes : null,
+    storageLabel,
+  };
+}
+
+async function fetchDriveQuotaWithGcloud(email, { timeoutMs = 15000 } = {}) {
+  const tokRes = runGcloud(['auth', 'print-access-token', `--account=${email}`, '--quiet'], { timeoutMs });
+  const token = tokRes.stdout.trim();
+  if (!tokRes.ok || !token || /\s/.test(token)) {
+    return { ok: false, error: tokRes.stderr || 'Google access token unavailable' };
+  }
+  const response = await fetch('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress),storageQuota', {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    return { ok: false, error: `Google Drive API returned HTTP ${response.status}` };
+  }
+  return { ok: true, about: await response.json() };
+}
+
+export async function probeAccountProStatus(
+  email,
+  { tiersFile = TIERS_FILE, accountFile = ACCOUNT_FILE, fetcher = fetchDriveQuotaWithGcloud, timeoutMs = 15000 } = {},
+) {
+  const targetEmail = String(email || '').trim();
+  if (!targetEmail) return { ok: false, isPro: false, tier: 'unknown', storageLabel: 'unknown', error: 'Email required' };
+  try {
+    const res = await fetcher(targetEmail, { timeoutMs });
+    if (!res?.ok || !res.about) {
+      return { ok: false, isPro: null, tier: 'unknown', storageLabel: 'unknown', error: res?.error || 'Quota check failed' };
+    }
+    const classified = classifyDriveQuota(res.about);
+    const verifiedEmail = String(res.about?.user?.emailAddress || targetEmail).trim();
+    saveAccountTier({ email: verifiedEmail, ...classified }, tiersFile);
+    const saved = readSavedWorkspaceAccount(accountFile);
+    if (saved?.account && saved.account.toLowerCase() === verifiedEmail.toLowerCase()) {
+      saveWorkspaceAccount(
+        {
+          isPro: classified.isPro,
+          tier: classified.tier,
+          storageLabel: classified.storageLabel,
+          storageLimitBytes: classified.limitBytes,
+        },
+        accountFile,
+      );
+    }
+    return { ok: true, email: verifiedEmail, ...classified };
+  } catch (err) {
+    return { ok: false, isPro: null, tier: 'unknown', storageLabel: 'unknown', error: err?.message || String(err) };
+  }
+}
+
+/**
+ * Build a minimal, password-free account store JSON for Cloud Run Secret Manager.
+ * Never reads or exports secrets.json passwords.
+ */
+export function sanitizeAccountsStoreForCloud(storePath = null) {
+  const target =
+    storePath ||
+    process.env.FREEPI_ACCOUNTS_PATH ||
+    path.join(os.homedir(), '.free-pi', 'proxy', 'accounts.json');
+  const raw = safeReadJson(target);
+  const srcAccounts = Array.isArray(raw?.accounts) ? raw.accounts : [];
+  const valid = srcAccounts
+    .filter((a) => a && !a.disabled && !a.tokenBad && typeof a.token === 'string' && a.token.trim())
+    .map((a, idx) => ({
+      id: a.id || `acc-${idx + 1}`,
+      number: Number.isFinite(a.number) ? a.number : idx + 1,
+      email: a.email || null,
+      handle: a.handle || null,
+      userId: a.userId || null,
+      token: a.token.trim(),
+      createdAt: a.createdAt || new Date().toISOString(),
+      disabled: false,
+      tokenExpiresAt: a.tokenExpiresAt || null,
+      usage: a.usage || null,
+    }));
+  if (!valid.length) return { count: 0, json: null };
+  const activeAccountId = valid.some((a) => a.id === raw?.activeAccountId)
+    ? raw.activeAccountId
+    : valid[0].id;
+  const maxNum = valid.reduce((m, a) => Math.max(m, Number(a.number) || 0), 0);
+  const payload = {
+    version: 1,
+    activeAccountId,
+    nextAccountNumber: Math.max(Number(raw?.nextAccountNumber) || 1, maxNum + 1),
+    settings: raw?.settings && typeof raw.settings === 'object' ? raw.settings : {},
+    totals: { accountsMinted: valid.length, creditsUsedTotal: 0, byDay: {} },
+    accounts: valid,
+  };
+  return { count: valid.length, json: JSON.stringify(payload) };
+}
+
+function ensureCloudApiKey(rotate = false) {
+  const saved = readSavedWorkspaceAccount();
+  if (!rotate && typeof saved?.cloudApiKey === 'string' && saved.cloudApiKey.trim().length >= 24) {
+    return saved.cloudApiKey.trim();
+  }
+  const key = 'fp_' + crypto.randomBytes(24).toString('hex');
+  saveWorkspaceAccount({ cloudApiKey: key });
+  return key;
+}
+
+function ensureSecretWithValue(projectId, secretName, value) {
+  const desc = runGcloud(['secrets', 'describe', secretName, `--project=${projectId}`, '--quiet'], {
+    timeoutMs: 20000,
+  });
+  if (!desc.ok) {
+    const createRes = runGcloud(
+      ['secrets', 'create', secretName, '--replication-policy=automatic', `--project=${projectId}`, '--quiet'],
+      { timeoutMs: 30000 },
+    );
+    if (!createRes.ok) {
+      throw new Error(`Could not create secret ${secretName}: ${createRes.stderr || createRes.stdout}`);
+    }
+  }
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `freepi-sec-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`,
+  );
+  fs.writeFileSync(tmpFile, value, { encoding: 'utf8', mode: 0o600 });
+  try {
+    const addRes = runGcloud(
+      ['secrets', 'versions', 'add', secretName, `--data-file=${tmpFile}`, `--project=${projectId}`, '--quiet'],
+      { timeoutMs: 30000 },
+    );
+    if (!addRes.ok) {
+      throw new Error(`Could not update secret ${secretName}: ${addRes.stderr || addRes.stdout}`);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
+  }
+}
+
+async function grantSecretAccessToComputeSa(projectId, secretName) {
+  const projRes = runGcloud(['projects', 'describe', projectId, '--format=value(projectNumber)', '--quiet'], {
+    timeoutMs: 20000,
+  });
+  const projectNumber = projRes.stdout.trim();
+  if (!projRes.ok || !/^\d+$/.test(projectNumber)) return;
+  const member = `serviceAccount:${projectNumber}-compute@developer.gserviceaccount.com`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const bindRes = runGcloud(
+      [
+        'secrets',
+        'add-iam-policy-binding',
+        secretName,
+        `--member=${member}`,
+        '--role=roles/secretmanager.secretAccessor',
+        `--project=${projectId}`,
+        '--quiet',
+      ],
+      { timeoutMs: 25000 },
+    );
+    if (bindRes.ok) return;
+    await sleep(3000);
+  }
+}
+
+async function verifyCloudRunDeployment(serviceUrl, apiKey) {
+  const base = serviceUrl.replace(/\/+$/, '');
+  const healthRes = await fetch(`${base}/health`, { signal: AbortSignal.timeout(20000) });
+  const healthOk = healthRes.ok;
+  const unauthRes = await fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(15000) });
+  const authBlocked = unauthRes.status === 401;
+  const authRes = await fetch(`${base}/v1/models`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  let modelsCount = 0;
+  if (authRes.ok) {
+    try {
+      const data = await authRes.json();
+      if (Array.isArray(data?.data)) modelsCount = data.data.length;
+    } catch {}
+  }
+  return {
+    ok: healthOk && authBlocked && authRes.ok,
+    healthStatus: healthRes.status,
+    unauthStatus: unauthRes.status,
+    authStatus: authRes.status,
+    modelsCount,
+  };
 }
 
 /**
  * Discover all Google accounts logged into Brave, Edge, Chrome, Vivaldi,
  * plus any accounts already authenticated in gcloud.
  */
-export function discoverBrowserGoogleAccounts() {
+function discoverRawBrowserGoogleAccounts({ accountFile = ACCOUNT_FILE } = {}) {
   const byEmail = new Map();
   const gcloudMap = getGcloudAuthedAccounts();
-  const saved = readSavedWorkspaceAccount();
+  const saved = readSavedWorkspaceAccount(accountFile);
   const savedEmail = String(saved?.account || '').trim().toLowerCase();
 
   const recordAccount = ({ email, fullName, browser, browserExe, userDataDir, profileDir, profileName }) => {
@@ -464,28 +692,123 @@ export function discoverBrowserGoogleAccounts() {
     });
   }
 
-  const list = Array.from(byEmail.values()).sort((a, b) => {
+  return Array.from(byEmail.values());
+}
+
+/**
+ * Filter & annotate discovered accounts using verified Google Drive quota (>= 2 TB = Pro).
+ * Confirmed free (< 2 TB) accounts are hidden when `proOnly` is true; unverified accounts
+ * remain selectable so they can be checked automatically upon sign-in.
+ */
+export function getAccountDiscoverySummary({
+  proOnly = true,
+  tiersFile = TIERS_FILE,
+  accountFile = ACCOUNT_FILE,
+  rawAccounts = null,
+} = {}) {
+  const tiers = readAccountTiers(tiersFile);
+  const raw = Array.isArray(rawAccounts) ? rawAccounts : discoverRawBrowserGoogleAccounts({ accountFile });
+  const enriched = raw.map((item) => {
+    const key = String(item.email || '').trim().toLowerCase();
+    const cached = tiers[key] || null;
+    const tier = cached?.tier || 'unknown';
+    const isPro = cached ? Boolean(cached.isPro) : null;
+    return {
+      ...item,
+      tier,
+      isPro,
+      storageLabel: cached?.storageLabel || null,
+      storageLimitBytes: cached?.limitBytes ?? null,
+    };
+  });
+
+  const hiddenNonProCount = proOnly ? enriched.filter((a) => a.tier === 'free').length : 0;
+  const visible = proOnly ? enriched.filter((a) => a.tier !== 'free') : enriched;
+
+  visible.sort((a, b) => {
     if (a.configuredInDsh !== b.configuredInDsh) return a.configuredInDsh ? -1 : 1;
+    const aPro = a.tier === 'pro';
+    const bPro = b.tier === 'pro';
+    if (aPro !== bPro) return aPro ? -1 : 1;
     if (a.gcloudAuthed !== b.gcloudAuthed) return a.gcloudAuthed ? -1 : 1;
+    const aFree = a.tier === 'free';
+    const bFree = b.tier === 'free';
+    if (aFree !== bFree) return aFree ? 1 : -1;
     return a.email.localeCompare(b.email);
   });
 
-  return list.map((item, idx) => ({
+  const accounts = visible.map((item, idx) => ({
     index: idx + 1,
     ...item,
   }));
+
+  return {
+    accounts,
+    hiddenNonProCount,
+    proCount: enriched.filter((a) => a.tier === 'pro').length,
+    unverifiedCount: enriched.filter((a) => a.tier === 'unknown').length,
+  };
+}
+
+export function discoverBrowserGoogleAccounts(options = {}) {
+  return getAccountDiscoverySummary(options).accounts;
+}
+
+export async function refreshAuthedAccountTiers({
+  force = false,
+  tiersFile = TIERS_FILE,
+  accountFile = ACCOUNT_FILE,
+  prober = probeAccountProStatus,
+} = {}) {
+  const tiers = readAccountTiers(tiersFile);
+  const raw = discoverRawBrowserGoogleAccounts({ accountFile });
+  const saved = readSavedWorkspaceAccount(accountFile);
+  const candidates = new Set(raw.filter((a) => a.gcloudAuthed).map((a) => a.email));
+  if (saved?.account) candidates.add(saved.account);
+
+  const results = [];
+  for (const email of candidates) {
+    const key = email.toLowerCase();
+    if (!force && tiers[key] && tiers[key].tier && tiers[key].tier !== 'unknown') {
+      continue;
+    }
+    results.push(await prober(email, { tiersFile, accountFile }));
+  }
+  return results;
+}
+
+/**
+ * Append `authuser=<email>` (for Google Cloud / Google web URLs) or `login_hint=<email>`
+ * (for OAuth URLs) so multi-account browsers never default to the wrong signed-in Google user.
+ */
+export function buildGoogleAccountUrl(rawUrl, email) {
+  const cleanEmail = String(email || '').trim();
+  if (!cleanEmail || !cleanEmail.includes('@')) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    if (/\.google\.com$/i.test(parsed.hostname)) {
+      if (parsed.pathname.startsWith('/o/oauth2')) {
+        if (!parsed.searchParams.has('login_hint')) parsed.searchParams.set('login_hint', cleanEmail);
+      } else if (!parsed.searchParams.has('authuser')) {
+        parsed.searchParams.set('authuser', cleanEmail);
+      }
+      return parsed.toString();
+    }
+  } catch {}
+  return rawUrl;
 }
 
 /**
  * Open a URL in the user's exact logged-in browser profile (Brave, Edge, Chrome)
- * so they don't have to log in again or switch accounts manually.
+ * with `authuser=<email>` so Google never switches to another logged-in account.
  */
 export function openInAccountBrowser(url, accountObj = null) {
+  const targetUrl = buildGoogleAccountUrl(url, accountObj?.email);
   try {
     if (accountObj?.browserExe && fs.existsSync(accountObj.browserExe)) {
       const args = [
         `--profile-directory=${accountObj.profileDir || 'Default'}`,
-        url,
+        targetUrl,
       ];
       const child = spawn(accountObj.browserExe, args, {
         detached: true,
@@ -493,28 +816,36 @@ export function openInAccountBrowser(url, accountObj = null) {
         windowsHide: false,
       });
       child.unref();
-      return { opened: true, browser: accountObj.primaryBrowser, profileDir: accountObj.profileDir };
+      return { opened: true, browser: accountObj.primaryBrowser, profileDir: accountObj.profileDir, url: targetUrl };
     }
 
-    for (const b of getBrowserDefinitions()) {
+    const defs = getBrowserDefinitions();
+    const preferred = accountObj?.primaryBrowser
+      ? defs.filter((b) => b.name.toLowerCase() === accountObj.primaryBrowser.toLowerCase())
+      : [];
+    for (const b of [...preferred, ...defs]) {
       const exe = findExistingExe(b.exeCandidates);
       if (exe) {
-        const child = spawn(exe, [url], {
+        const args = [
+          ...(accountObj?.profileDir ? [`--profile-directory=${accountObj.profileDir}`] : []),
+          targetUrl,
+        ];
+        const child = spawn(exe, args, {
           detached: true,
           stdio: 'ignore',
           windowsHide: false,
         });
         child.unref();
-        return { opened: true, browser: b.name, profileDir: 'Default' };
+        return { opened: true, browser: b.name, profileDir: accountObj?.profileDir || 'Default', url: targetUrl };
       }
     }
 
     if (process.platform === 'win32') {
-      spawn('cmd.exe', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
-      return { opened: true, browser: 'System', profileDir: 'Default' };
+      spawn('cmd.exe', ['/c', 'start', '', targetUrl], { detached: true, stdio: 'ignore' }).unref();
+      return { opened: true, browser: 'System', profileDir: 'Default', url: targetUrl };
     }
   } catch {}
-  return { opened: false, browser: null, profileDir: null };
+  return { opened: false, browser: null, profileDir: null, url: targetUrl };
 }
 
 /**
@@ -527,7 +858,7 @@ export async function authorizeGoogleAccount(accountObj, onLog = console.log) {
     ? `${accountObj.primaryBrowser} (${accountObj.profileDir || 'Default'})`
     : 'Browser';
 
-  onLog(`Oeffne Google-Anmeldung fuer ${email || 'neuen Account'} in ${browserLabel}...`);
+  onLog(`Opening Google sign-in for ${email || 'new account'} in ${browserLabel}...`);
 
   const g = findGcloudEnv();
   const loginArgs = [
@@ -618,7 +949,7 @@ export function ensureGcpProject(email, preferredProjectId = null, onLog = conso
       .slice(0, 10) || 'user';
     const suffix = Math.floor(1000 + Math.random() * 9000);
     chosenId = `freepi-${prefix}-${suffix}`;
-    onLog(`Erstelle neues Google Cloud Projekt: ${chosenId} ...`);
+    onLog(`Creating new Google Cloud project: ${chosenId} ...`);
     const createRes = runGcloud(['projects', 'create', chosenId, '--name=FreePi Cloud', '--quiet'], {
       timeoutMs: 45000,
     });
@@ -637,15 +968,20 @@ export function ensureGcpProject(email, preferredProjectId = null, onLog = conso
   return { ok: true, projectId: chosenId, projectsCount: projects.length };
 }
 
+export function enableGoogleDriveApi(projectId, onLog = console.log) {
+  onLog('Enabling Google Drive API...');
+  return runGcloud(['services', 'enable', 'drive.googleapis.com', `--project=${projectId}`, '--quiet'], {
+    timeoutMs: 45000,
+  });
+}
+
 /**
  * Enable Google Drive API and verify/create the DSH Workspace Artifacts folder.
  * Works WITHOUT a billing account!
  */
 export async function setupGoogleDriveWorkspace(projectId, onLog = console.log) {
-  onLog('Aktiviere Google Drive Schnittstelle fuer Cloud-Kontext & Handysynchronisation...');
-  runGcloud(['services', 'enable', 'drive.googleapis.com', `--project=${projectId}`, '--quiet'], {
-    timeoutMs: 45000,
-  });
+  onLog('Configuring Google Drive workspace folder and memory sync...');
+  enableGoogleDriveApi(projectId, () => {});
 
   const dshGoogleModulePath = path.resolve(REPO_ROOT, '..', 'dsh-google', 'google.mjs');
   if (fs.existsSync(dshGoogleModulePath)) {
@@ -675,6 +1011,7 @@ export async function ensureCloudBillingAndDeploy({
   accountObj,
   projectId,
   deploy = false,
+  rotateKey = false,
   waitForBrowserMs = 8 * 60 * 1000,
   onLog = console.log,
 }) {
@@ -714,18 +1051,21 @@ export async function ensureCloudBillingAndDeploy({
 
   let billing = checkBilling();
   if (!billing.enabled && deploy) {
-    const setupUrl = `https://console.cloud.google.com/billing/linkedaccount?project=${encodeURIComponent(projectId)}`;
+    const setupUrl = buildGoogleAccountUrl(
+      `https://console.cloud.google.com/billing/linkedaccount?project=${encodeURIComponent(projectId)}`,
+      accountObj?.email,
+    );
     onLog('');
     onLog('======================================================================');
-    onLog('GOOGLE CLOUD RUN NOCH NICHT AKTIVIERT - BROWSER WIRD GEOEFFNET');
+    onLog('GOOGLE CLOUD RUN NOT ENABLED YET - OPENING BROWSER');
     onLog('======================================================================');
-    onLog(`Ich oeffne jetzt automatisch deinen Browser (${accountObj?.primaryBrowser || 'Standard'})`);
-    onLog(`mit dem Account ${accountObj?.email || ''}:`);
+    onLog(`Opening your browser (${accountObj?.primaryBrowser || 'Default'})`);
+    onLog(`with account ${accountObj?.email || ''}:`);
     onLog(`  ${setupUrl}`);
     onLog('');
-    onLog('Bitte im geoeffneten Browserfenster einmal kurz:');
-    onLog('  1. Nutzungsbedingungen akzeptieren / Rechnungskonto (Free Trial) aktivieren');
-    onLog('  2. Ich erkenne das automatisch und mache hier sofort alleine weiter!');
+    onLog('In the opened browser tab, please briefly:');
+    onLog('  1. Accept Terms of Service / enable billing (or Free Trial)');
+    onLog('  2. Setup will detect it automatically and continue!');
     onLog('======================================================================');
 
     openInAccountBrowser(setupUrl, accountObj);
@@ -735,7 +1075,7 @@ export async function ensureCloudBillingAndDeploy({
       await sleep(6000);
       billing = checkBilling();
       if (billing.enabled) {
-        onLog('Google Cloud Rechnungskonto erkannt und automatisch verknuepft! Mache weiter...');
+        onLog('Google Cloud billing account detected and linked automatically! Continuing...');
         break;
       }
     }
@@ -746,7 +1086,7 @@ export async function ensureCloudBillingAndDeploy({
       ok: false,
       billingEnabled: false,
       message:
-        'Google Drive (Cloud-Kontext & Handy-Uebergabe) ist fertig eingerichtet! Fuer 24/7 Cloud Run Server muss im geoeffneten Browser noch einmalig das Google Cloud Konto aktiviert werden.',
+        'Google Drive is ready! To deploy the 24/7 Cloud Run server, enable a billing account in the opened browser tab.',
     };
   }
 
@@ -754,21 +1094,54 @@ export async function ensureCloudBillingAndDeploy({
     return { ok: true, billingEnabled: true };
   }
 
-  onLog('Aktiviere Cloud Run, Cloud Build und Artifact Registry...');
-  runGcloud(
+  const sanitized = sanitizeAccountsStoreForCloud();
+  if (!sanitized.count || !sanitized.json) {
+    return {
+      ok: false,
+      billingEnabled: true,
+      error: 'No valid local Free-Pi accounts found. Run /freepi-add first.',
+    };
+  }
+
+  onLog('Enabling Cloud Run, Cloud Build, Artifact Registry, and Secret Manager...');
+  const apiRes = runGcloud(
     [
       'services',
       'enable',
       'run.googleapis.com',
       'cloudbuild.googleapis.com',
       'artifactregistry.googleapis.com',
+      'secretmanager.googleapis.com',
       `--project=${projectId}`,
       '--quiet',
     ],
     { timeoutMs: 120000 },
   );
+  if (!apiRes.ok) {
+    return {
+      ok: false,
+      billingEnabled: true,
+      error: `Failed to enable Google Cloud services: ${apiRes.stderr || apiRes.stdout}`,
+    };
+  }
 
-  onLog('Starte automatisches Deployment von freepi-proxy auf Google Cloud Run (dauert ca. 1-2 Min)...');
+  const apiKey = ensureCloudApiKey(rotateKey);
+  onLog(`Uploading ${sanitized.count} Free-Pi account(s) and API key securely to Secret Manager...`);
+  try {
+    ensureSecretWithValue(projectId, 'freepi-accounts', sanitized.json);
+    ensureSecretWithValue(projectId, 'freepi-proxy-api-key', apiKey);
+    await grantSecretAccessToComputeSa(projectId, 'freepi-accounts');
+    await grantSecretAccessToComputeSa(projectId, 'freepi-proxy-api-key');
+  } catch (err) {
+    return {
+      ok: false,
+      billingEnabled: true,
+      error: err.message,
+    };
+  }
+
+  const cloudRegion = process.env.FREEPI_CLOUD_REGION || 'us-central1';
+  onLog(`Deploying freepi-proxy to Google Cloud Run (${cloudRegion}, Always-Free eligible, ~1-2 min)...`);
   const deployRes = runGcloud(
     [
       'run',
@@ -777,15 +1150,18 @@ export async function ensureCloudBillingAndDeploy({
       '--source',
       REPO_ROOT,
       `--project=${projectId}`,
-      '--region=europe-west1',
+      `--region=${cloudRegion}`,
       '--allow-unauthenticated',
       '--port=8080',
       '--memory=512Mi',
       '--min-instances=0',
       '--max-instances=1',
+      '--timeout=300',
+      '--set-env-vars=FREEPI_ACCOUNTS_PATH=/tmp/freepi/accounts.json,FREEPI_ACCOUNTS_SEED_PATH=/secrets/accounts.json,FREEPI_STATE_DIR=/tmp/freepi,FREEPI_AUTO_SPONSOR=0',
+      '--set-secrets=/secrets/accounts.json=freepi-accounts:latest,FREEPI_PROXY_API_KEY=freepi-proxy-api-key:latest',
       '--quiet',
     ],
-    { timeoutMs: 300000 },
+    { timeoutMs: 360000 },
   );
 
   if (!deployRes.ok) {
@@ -802,37 +1178,66 @@ export async function ensureCloudBillingAndDeploy({
     'describe',
     'freepi-proxy',
     `--project=${projectId}`,
-    '--region=europe-west1',
+    `--region=${cloudRegion}`,
     '--format=value(status.url)',
     '--quiet',
   ]);
   const serviceUrl = urlRes.stdout.trim();
+  let verify = null;
   if (serviceUrl) {
-    saveWorkspaceAccount({ projectId, cloudRunUrl: serviceUrl });
+    saveWorkspaceAccount({ projectId, cloudRunUrl: serviceUrl, cloudAccountsCount: sanitized.count });
+    onLog('Verifying live endpoint and API key protection...');
+    try {
+      verify = await verifyCloudRunDeployment(serviceUrl, apiKey);
+    } catch (err) {
+      verify = { ok: false, error: err?.message || String(err) };
+    }
   }
 
   return {
     ok: true,
     billingEnabled: true,
     cloudRunUrl: serviceUrl || null,
+    cloudApiKey: apiKey,
+    cloudAccountsCount: sanitized.count,
+    verified: verify,
   };
 }
 
 /**
  * Full automatic setup flow for a selected account (by number, email, or 'new').
+ * Verifies Google Pro (>= 2 TB Drive storage) before saving as the active account.
  */
 export async function runGoogleCloudSetup({
   accountSelector = null,
   deploy = false,
+  rotateKey = false,
   reauth = false,
+  allowFree = false,
+  includeAll = false,
+  tiersFile = TIERS_FILE,
+  accountFile = ACCOUNT_FILE,
+  rawAccounts = null,
+  prober = probeAccountProStatus,
+  authorizeFn = authorizeGoogleAccount,
+  ensureProjectFn = ensureGcpProject,
+  enableDriveFn = enableGoogleDriveApi,
+  setupDriveFn = setupGoogleDriveWorkspace,
+  deployFn = ensureCloudBillingAndDeploy,
+  setGcloudAccountFn = (email) => runGcloud(['config', 'set', 'account', email, '--quiet']),
+  setGcloudProjectFn = (projectId) => runGcloud(['config', 'set', 'project', projectId, '--quiet']),
+  revokeGcloudAccountFn = (email) => runGcloud(['auth', 'revoke', email, '--quiet'], { timeoutMs: 15000 }),
   onLog = console.log,
 } = {}) {
-  const accounts = discoverBrowserGoogleAccounts();
+  const proOnly = !includeAll && !allowFree;
+  const discovery = getAccountDiscoverySummary({ proOnly, tiersFile, accountFile, rawAccounts });
+  const accounts = discovery.accounts;
+  const savedBefore = readSavedWorkspaceAccount(accountFile);
   let chosen = null;
 
   if (accountSelector && String(accountSelector).toLowerCase() !== 'new') {
     const sel = String(accountSelector).trim();
-    const asNum = Number(sel);
+    const asNum = /^\d+$/.test(sel) ? Number(sel) : NaN;
     if (Number.isInteger(asNum) && asNum >= 1 && asNum <= accounts.length) {
       chosen = accounts[asNum - 1];
     } else {
@@ -854,7 +1259,7 @@ export async function runGoogleCloudSetup({
   } else if (String(accountSelector).toLowerCase() === 'new') {
     chosen = {
       email: '',
-      fullName: 'Neuer Account',
+      fullName: 'New Account',
       primaryBrowser: 'Browser',
       browsers: [],
       browserExe: null,
@@ -868,170 +1273,323 @@ export async function runGoogleCloudSetup({
       ok: false,
       needsSelection: true,
       accounts,
+      hiddenNonProCount: discovery.hiddenNonProCount,
+    };
+  }
+
+  // Reject already-cached non-Pro accounts immediately unless --allow-free is set
+  const cachedTiers = readAccountTiers(tiersFile);
+  const preKey = chosen.email ? chosen.email.toLowerCase() : '';
+  if (!allowFree && preKey && cachedTiers[preKey]?.tier === 'free' && !reauth) {
+    return {
+      ok: false,
+      notPro: true,
+      account: chosen.email,
+      tier: 'free',
+      storageLabel: cachedTiers[preKey].storageLabel || '< 2 TB',
+      error: `Account ${chosen.email} is not a Google Pro account (${cachedTiers[preKey].storageLabel || '< 2 TB'}; requires >= 2 TB). Pass --allow-free to override.`,
     };
   }
 
   // Step 1: Ensure gcloud OAuth login with Drive access
   if (!chosen.gcloudAuthed || reauth || !chosen.email) {
-    const authRes = await authorizeGoogleAccount(chosen, onLog);
+    const authRes = await authorizeFn(chosen, onLog);
     if (!authRes.ok) {
       return {
         ok: false,
-        error: `Google-Anmeldung fehlgeschlagen: ${authRes.error}`,
+        error: `Google sign-in failed: ${authRes.error}`,
       };
     }
     chosen.email = authRes.email;
     chosen.gcloudAuthed = true;
   } else {
-    onLog(`Nutze bereits verbundenen Google-Account: ${chosen.email}`);
-    runGcloud(['config', 'set', 'account', chosen.email, '--quiet']);
+    onLog(`Using already authenticated Google account: ${chosen.email}`);
+    setGcloudAccountFn(chosen.email);
   }
 
-  saveWorkspaceAccount({
-    account: chosen.email,
-    browser: chosen.primaryBrowser || 'Browser',
-    profileDir: chosen.profileDir || 'Default',
-    authorizedAt: new Date().toISOString(),
-  });
-
   // Step 2: Ensure GCP Project (if TOS not accepted yet, open Console in that browser!)
-  let projRes = ensureGcpProject(chosen.email, null, onLog);
+  const preferredProject =
+    savedBefore?.account && savedBefore.account.toLowerCase() === chosen.email.toLowerCase()
+      ? savedBefore.projectId || null
+      : null;
+  let projRes = ensureProjectFn(chosen.email, preferredProject, onLog);
   if (!projRes.ok && projRes.needsConsoleTos) {
-    const consoleUrl = 'https://console.cloud.google.com/projectcreate';
+    const consoleUrl = buildGoogleAccountUrl('https://console.cloud.google.com/projectcreate', chosen.email);
     onLog('');
-    onLog('Google Cloud wird zum ersten Mal mit diesem Account genutzt.');
-    onLog(`Ich oeffne jetzt ${consoleUrl} in ${chosen.primaryBrowser || 'deinem Browser'} (${chosen.email}).`);
-    onLog('Bitte dort einmal den Nutzungsbedingungen zustimmen - ich warte und mache automatisch weiter...');
+    onLog('First-time Google Cloud use detected for this account.');
+    onLog(`Opening ${consoleUrl} in ${chosen.primaryBrowser || 'your browser'} (${chosen.email}).`);
+    onLog('Please accept Terms of Service there - waiting to continue automatically...');
     openInAccountBrowser(consoleUrl, chosen);
 
     const tosDeadline = Date.now() + 5 * 60 * 1000;
     while (Date.now() < tosDeadline) {
       await sleep(6000);
-      projRes = ensureGcpProject(chosen.email, null, onLog);
+      projRes = ensureProjectFn(chosen.email, preferredProject, onLog);
       if (projRes.ok) break;
     }
   }
 
   if (!projRes.ok) {
+    if (savedBefore?.account && savedBefore.account.toLowerCase() !== chosen.email.toLowerCase()) {
+      setGcloudAccountFn(savedBefore.account);
+      if (savedBefore.projectId) setGcloudProjectFn(savedBefore.projectId);
+    }
     return {
       ok: false,
       account: chosen.email,
-      error: `Konnte Google Cloud Projekt nicht einrichten: ${projRes.error}`,
+      error: `Could not set up Google Cloud project: ${projRes.error}`,
     };
   }
 
-  saveWorkspaceAccount({ projectId: projRes.projectId });
-  onLog(`Aktives Google Cloud Projekt: ${projRes.projectId}`);
+  // Step 3: Enable Drive API and verify Google Pro tier (>= 2 TB) BEFORE overwriting active account.json
+  enableDriveFn(projRes.projectId, onLog);
+  onLog(`Checking Google Pro plan (>= 2 TB Drive storage) for ${chosen.email}...`);
+  let proCheck = await prober(chosen.email, { tiersFile, accountFile });
+  if (!proCheck.ok) {
+    await sleep(2000);
+    proCheck = await prober(chosen.email, { tiersFile, accountFile });
+  }
 
-  // Step 3: Enable Google Drive API & Workspace folder (always free, no billing required)
-  const driveRes = await setupGoogleDriveWorkspace(projRes.projectId, onLog);
+  if (!allowFree) {
+    if (proCheck.ok && !proCheck.isPro) {
+      onLog(`Account ${chosen.email} has ${proCheck.storageLabel} storage (< 2 TB) -> NOT a Google Pro account.`);
+      revokeGcloudAccountFn(chosen.email);
+      if (savedBefore?.account && savedBefore.account.toLowerCase() !== chosen.email.toLowerCase()) {
+        setGcloudAccountFn(savedBefore.account);
+        if (savedBefore.projectId) setGcloudProjectFn(savedBefore.projectId);
+      }
+      return {
+        ok: false,
+        notPro: true,
+        account: chosen.email,
+        tier: proCheck.tier,
+        storageLabel: proCheck.storageLabel,
+        error: `Account ${chosen.email} is not a Google Pro account (${proCheck.storageLabel} < 2 TB). Excluded from Pro list; previous setup kept.`,
+      };
+    }
+    if (!proCheck.ok) {
+      if (savedBefore?.account && savedBefore.account.toLowerCase() !== chosen.email.toLowerCase()) {
+        setGcloudAccountFn(savedBefore.account);
+        if (savedBefore.projectId) setGcloudProjectFn(savedBefore.projectId);
+      }
+      return {
+        ok: false,
+        account: chosen.email,
+        error: `Could not verify Google Pro status for ${chosen.email}: ${proCheck.error}`,
+      };
+    }
+    onLog(`Verified Google Pro account: ${chosen.email} (${proCheck.storageLabel}).`);
+  }
 
-  // Step 4: Billing & Cloud Run deployment (only when explicitly requested with --deploy)
+  saveWorkspaceAccount(
+    {
+      account: chosen.email,
+      browser: chosen.primaryBrowser || 'Browser',
+      profileDir: chosen.profileDir || 'Default',
+      projectId: projRes.projectId,
+      authorizedAt: new Date().toISOString(),
+      isPro: proCheck.ok ? proCheck.isPro : null,
+      tier: proCheck.ok ? proCheck.tier : 'unknown',
+      storageLabel: proCheck.ok ? proCheck.storageLabel : null,
+      storageLimitBytes: proCheck.ok ? proCheck.limitBytes : null,
+    },
+    accountFile,
+  );
+  onLog(`Active Google Cloud project: ${projRes.projectId}`);
+
+  // Step 4: Initialize Google Drive Workspace artifacts folder & memory sync
+  const driveRes = await setupDriveFn(projRes.projectId, onLog);
+
+  // Step 5: Billing & Cloud Run deployment (only when explicitly requested with --deploy)
   const cloudRes = deploy
-    ? await ensureCloudBillingAndDeploy({
+    ? await deployFn({
         accountObj: chosen,
         projectId: projRes.projectId,
         deploy,
+        rotateKey,
         onLog,
       })
-    : { billingEnabled: false, message: null };
+    : { ok: true, billingEnabled: false, message: null };
 
+  if (deploy && !cloudRes.ok && cloudRes.error) {
+    return {
+      ok: false,
+      account: chosen.email,
+      projectId: projRes.projectId,
+      isPro: proCheck.ok ? proCheck.isPro : null,
+      tier: proCheck.ok ? proCheck.tier : 'unknown',
+      storageLabel: proCheck.ok ? proCheck.storageLabel : null,
+      driveReady: driveRes.ok,
+      billingEnabled: Boolean(cloudRes.billingEnabled),
+      error: cloudRes.error,
+    };
+  }
+
+  const savedAfter = readSavedWorkspaceAccount(accountFile);
   return {
     ok: true,
     account: chosen.email,
     browser: chosen.primaryBrowser,
     projectId: projRes.projectId,
+    isPro: proCheck.ok ? proCheck.isPro : savedAfter?.isPro ?? null,
+    tier: proCheck.ok ? proCheck.tier : savedAfter?.tier ?? 'unknown',
+    storageLabel: proCheck.ok ? proCheck.storageLabel : savedAfter?.storageLabel ?? null,
     driveReady: driveRes.ok,
     driveFolderId: driveRes.folderId || null,
     billingEnabled: Boolean(cloudRes.billingEnabled),
-    cloudRunUrl: cloudRes.cloudRunUrl || readSavedWorkspaceAccount()?.cloudRunUrl || null,
+    cloudRunUrl: cloudRes.cloudRunUrl || savedAfter?.cloudRunUrl || null,
+    cloudApiKey: cloudRes.cloudApiKey || null,
+    cloudAccountsCount: cloudRes.cloudAccountsCount || savedAfter?.cloudAccountsCount || null,
+    verified: cloudRes.verified || null,
     message: cloudRes.message || null,
   };
 }
 
-export function formatCloudStatusAndAccounts() {
-  const accounts = discoverBrowserGoogleAccounts();
-  const saved = readSavedWorkspaceAccount();
+export function formatCloudStatusAndAccounts({ includeAll = false, tiersFile = TIERS_FILE, accountFile = ACCOUNT_FILE } = {}) {
+  const { accounts, hiddenNonProCount } = getAccountDiscoverySummary({ proOnly: !includeAll, tiersFile, accountFile });
+  const saved = readSavedWorkspaceAccount(accountFile);
   const lines = [
-    'Google Cloud & Drive Auto-Setup (/freepi-cloud)',
+    'Google Pro Cloud & Drive Auto-Setup (/freepi-cloud)',
     '',
   ];
 
   if (saved?.account) {
-    lines.push(`Aktuell verbunden: ${saved.account}`);
-    if (saved.projectId) lines.push(`Cloud-Projekt:     ${saved.projectId}`);
-    if (saved.cloudRunUrl) lines.push(`24/7 Cloud-URL:    ${saved.cloudRunUrl}`);
+    const tierNote = saved.storageLabel
+      ? ` (${saved.isPro ? 'PRO' : 'Free'} ${saved.storageLabel})`
+      : '';
+    lines.push(`Connected account: ${saved.account}${tierNote}`);
+    if (saved.projectId) lines.push(`Cloud project:     ${saved.projectId}`);
+    if (saved.cloudRunUrl) lines.push(`24/7 Cloud URL:    ${saved.cloudRunUrl}`);
+    if (saved.cloudApiKey) lines.push('API key:           saved in ~/.dsh/google-workspace/account.json');
     lines.push('');
   } else {
-    lines.push('Aktuell ist noch kein Google-Account fest eingerichtet.');
+    lines.push('No Google Pro account configured yet.');
     lines.push('');
   }
 
   if (accounts.length === 0) {
-    lines.push('Keine eingeloggten Google-Accounts in Brave/Edge/Chrome gefunden.');
-    lines.push('Starte mit: /freepi-cloud new');
+    lines.push('No eligible Google accounts found in Brave/Edge/Chrome.');
+    if (hiddenNonProCount > 0) {
+      lines.push(`Hidden non-Pro accounts (< 2 TB): ${hiddenNonProCount} (run "/freepi-cloud list --all" to view all).`);
+    }
+    lines.push('Sign in a Pro account with: /freepi-cloud new');
     return lines.join('\n');
   }
 
-  lines.push('Gefundene Google-Accounts aus deinen Browsern (Brave / Edge / Chrome):');
+  lines.push(includeAll
+    ? 'Google accounts from browsers (Brave / Edge / Chrome) [all]:'
+    : 'Google accounts from browsers (Pro-only mode, >= 2 TB verified on connect):');
   for (const a of accounts) {
     const browsers = a.browsers.length ? a.browsers.join(', ') : 'gcloud';
+    const tierTag = a.tier === 'pro'
+      ? `PRO ${a.storageLabel || '>= 2 TB'}`
+      : a.tier === 'free'
+        ? `NOT PRO (${a.storageLabel || '< 2 TB'})`
+        : 'unverified - checked on connect';
     const flags = [
-      a.configuredInDsh ? 'AKTIV' : null,
-      a.gcloudAuthed ? 'verbunden' : 'Klick im Browser noetig',
+      a.configuredInDsh ? 'ACTIVE' : null,
+      tierTag,
+      a.gcloudAuthed ? 'authed' : 'browser sign-in required',
     ]
       .filter(Boolean)
       .join(', ');
     const namePart = a.fullName ? ` (${a.fullName})` : '';
-    lines.push(`  [${a.index}] ${a.email}${namePart}  —  ${browsers} [${flags}]`);
+    lines.push(`  [${a.index}] ${a.email}${namePart}  --  ${browsers} [${flags}]`);
+  }
+
+  if (hiddenNonProCount > 0) {
+    lines.push('');
+    lines.push(`Hidden confirmed non-Pro account(s) (< 2 TB): ${hiddenNonProCount} (use "/freepi-cloud list --all" to inspect).`);
   }
 
   lines.push('');
-  lines.push('So richtest du Google Drive (Cloud-Kontext & Handy-Uebergabe) ein:');
-  lines.push('  /freepi-cloud 1          (nimmt Account Nr. 1 und richtet alles automatisch ein)');
-  lines.push('  /freepi-cloud 2          (nimmt Account Nr. 2)');
-  lines.push('  /freepi-cloud new        (neuen Google-Account im Browser anmelden)');
-  lines.push('Das Setup laeuft in einem eigenen Fenster, damit du jeden Schritt siehst.');
+  lines.push('Connect Google Drive (verifies Pro >= 2 TB automatically):');
+  lines.push('  /freepi-cloud 1          (connects account #1 and verifies Pro quota)');
+  lines.push('  /freepi-cloud 2          (connects account #2)');
+  lines.push('  /freepi-cloud new        (sign in a new Google Pro account in browser)');
+  lines.push('  /freepi-cloud deploy     (deploy 24/7 Cloud Run server; requires billing)');
 
   return lines.join('\n');
+}
+
+export function parseCloudCliArgs(args = []) {
+  const wantsJson = args.includes('--json');
+  let wantsList = args.includes('--list');
+  let wantsDeploy = args.includes('--deploy');
+  const rotateKey = args.includes('--rotate-key');
+  const reauth = args.includes('--reauth');
+
+  let accountArg = null;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--account' && args[i + 1]) {
+      accountArg = args[i + 1];
+      i += 1;
+    } else if (!arg.startsWith('--')) {
+      const lower = arg.toLowerCase();
+      if (lower === 'deploy') wantsDeploy = true;
+      else if (lower === 'status' || lower === 'list') wantsList = true;
+      else if (!accountArg) accountArg = arg;
+    }
+  }
+
+  return { wantsJson, wantsList, wantsDeploy, rotateKey, reauth, accountArg };
+}
+
+export function parseExtraCloudFlags(args = []) {
+  return {
+    showAll: args.includes('--all'),
+    allowFree: args.includes('--allow-free'),
+    refreshTiers: args.includes('--refresh'),
+  };
 }
 
 // --------------------------------------------------------- CLI Entrypoint
 
 async function main() {
-  const args = process.argv.slice(2);
-  const wantsJson = args.includes('--json');
-  const wantsList = args.includes('--list');
-  const wantsDeploy = args.includes('--deploy');
-  const reauth = args.includes('--reauth');
+  const argv = process.argv.slice(2);
+  const {
+    wantsJson,
+    wantsList,
+    wantsDeploy,
+    rotateKey,
+    reauth,
+    accountArg: parsedAccountArg,
+  } = parseCloudCliArgs(argv);
+  const { showAll, allowFree, refreshTiers } = parseExtraCloudFlags(argv);
+  let accountArg = parsedAccountArg;
 
-  let accountArg = null;
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === '--account' && args[i + 1]) {
-      accountArg = args[i + 1];
-      i += 1;
-    } else if (!args[i].startsWith('--') && !accountArg) {
-      accountArg = args[i];
-    }
+  if (wantsList || refreshTiers) {
+    await refreshAuthedAccountTiers({ force: refreshTiers }).catch(() => {});
   }
 
   if (wantsList) {
-    const accounts = discoverBrowserGoogleAccounts();
+    const summary = getAccountDiscoverySummary({ proOnly: !showAll });
     if (wantsJson) {
-      console.log(JSON.stringify({ saved: readSavedWorkspaceAccount(), accounts }, null, 2));
+      const saved = readSavedWorkspaceAccount();
+      const safeSaved = saved
+        ? { ...saved, ...(saved.cloudApiKey ? { cloudApiKey: '[saved]' } : {}) }
+        : null;
+      console.log(JSON.stringify({ saved: safeSaved, ...summary }, null, 2));
     } else {
-      console.log(formatCloudStatusAndAccounts());
+      console.log(formatCloudStatusAndAccounts({ includeAll: showAll }));
     }
     return;
   }
 
+  if (!accountArg && wantsDeploy) {
+    const saved = readSavedWorkspaceAccount();
+    if (saved?.account) accountArg = saved.account;
+  }
+
   if (!accountArg && process.stdin.isTTY && !wantsJson) {
+    await refreshAuthedAccountTiers().catch(() => {});
     console.log('');
-    console.log(formatCloudStatusAndAccounts());
+    console.log(formatCloudStatusAndAccounts({ includeAll: showAll }));
     console.log('');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     accountArg = await new Promise((resolve) => {
-      rl.question('Welchen Google-Account moechtest du nutzen? (Nummer, E-Mail oder "new"): ', (ans) => {
+      rl.question('Select Google Pro account (number, email, or "new"): ', (ans) => {
         rl.close();
         resolve(ans.trim() || '1');
       });
@@ -1040,9 +1598,9 @@ async function main() {
 
   if (!accountArg) {
     if (wantsJson) {
-      console.log(JSON.stringify({ ok: false, needsSelection: true, accounts: discoverBrowserGoogleAccounts() }, null, 2));
+      console.log(JSON.stringify({ ok: false, needsSelection: true, ...getAccountDiscoverySummary({ proOnly: !showAll }) }, null, 2));
     } else {
-      console.log(formatCloudStatusAndAccounts());
+      console.log(formatCloudStatusAndAccounts({ includeAll: showAll }));
     }
     return;
   }
@@ -1052,28 +1610,46 @@ async function main() {
   const result = await runGoogleCloudSetup({
     accountSelector: accountArg,
     deploy: wantsDeploy,
+    rotateKey,
     reauth,
+    allowFree,
+    includeAll: showAll,
     onLog: logger,
   });
 
   if (wantsJson) {
-    console.log(JSON.stringify({ ...result, logs }, null, 2));
+    const safeResult = {
+      ...result,
+      ...(result.cloudApiKey ? { cloudApiKey: '[saved]' } : {}),
+    };
+    console.log(JSON.stringify({ ...safeResult, logs }, null, 2));
   } else {
     console.log('');
     if (result.ok) {
       console.log('======================================================================');
-      console.log('FERTIG EINGERICHTET!');
-      console.log(`  Google-Account:   ${result.account}`);
-      console.log(`  Cloud-Projekt:    ${result.projectId}`);
-      console.log(`  Google Drive Sync: ${result.driveReady ? 'Aktiv (Kontext & Handy-Handoff bereit)' : 'Bereit'}`);
+      console.log('SETUP COMPLETE!');
+      console.log(`  Google Account:    ${result.account}${result.storageLabel ? ` (${result.isPro ? 'PRO' : 'Free'} ${result.storageLabel})` : ''}`);
+      console.log(`  Cloud Project:     ${result.projectId}`);
+      console.log(`  Google Drive Sync: ${result.driveReady ? 'Active (context & handoffs ready)' : 'Ready'}`);
       if (result.cloudRunUrl) {
-        console.log(`  24/7 Cloud-URL:   ${result.cloudRunUrl}`);
+        console.log(`  24/7 Cloud URL:    ${result.cloudRunUrl}/v1`);
+        if (result.cloudApiKey) {
+          console.log(`  API Key:           ${result.cloudApiKey}`);
+        }
+        if (result.cloudAccountsCount) {
+          console.log(`  Cloud Accounts:    ${result.cloudAccountsCount} active`);
+        }
+        if (result.verified) {
+          console.log(
+            `  Security Check:    ${result.verified.ok ? 'OK (401 unauth, 200 with key)' : `Health ${result.verified.healthStatus}, unauth ${result.verified.unauthStatus}, auth ${result.verified.authStatus}`}`,
+          );
+        }
       } else if (result.message) {
-        console.log(`  Hinweis:          ${result.message}`);
+        console.log(`  Note:              ${result.message}`);
       }
       console.log('======================================================================');
     } else {
-      console.error(`Fehler: ${result.error || 'Unbekannter Fehler'}`);
+      console.error(`Error: ${result.error || 'Unknown error'}`);
       process.exitCode = 1;
     }
   }

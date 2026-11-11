@@ -1,16 +1,9 @@
 // Verifies the device-flow stall fix: a page that has been static for longer
 // than 15 s must NOT abort the login while a throw-away profile is waiting for
 // a human. Drives driveGithubLogin through a fake CDP session.
-import path from 'node:path';
-import os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const entry = path.join(
-  'C:\\Users\\liket\\Documents\\freepi-proxy',
-  'plugin',
-  'lib',
-  'index.js',
-);
+const entry = fileURLToPath(new URL('../plugin/lib/index.js', import.meta.url));
 const src = await import(pathToFileURL(entry).href);
 
 // The helpers are module-private; re-import via a tiny shim that re-exports the

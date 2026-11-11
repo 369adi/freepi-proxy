@@ -2,9 +2,9 @@
 // press buttons while the person was still logging in with Google and bounce
 // them back to the GitHub login screen.
 import fs from 'node:fs';
-import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const entry = path.join('C:\\Users\\liket\\Documents\\freepi-proxy', 'plugin', 'lib', 'index.js');
+const entry = fileURLToPath(new URL('../plugin/lib/index.js', import.meta.url));
 const code = fs.readFileSync(entry, 'utf8');
 
 let failed = 0;

@@ -57,6 +57,7 @@ test('hours are formatted for a narrow status line', () => {
   assert.equal(fmtHours(0.5), '30 min');
   assert.equal(fmtHours(0.001), '<1 min');
   assert.equal(fmtHours(null), '-');
+  assert.equal(fmtHours(-0.5), '-');
 });
 
 test('summary only counts accounts that can still serve a request', () => {

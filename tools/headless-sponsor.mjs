@@ -182,6 +182,7 @@ async function runPass(base, cookie, accounts, opts) {
   const candidates = [];
   const skipped = [];
   let cookieNow = cookie;
+  let refreshedInAdPass = false;
 
   for (const account of accounts) {
     let res;
@@ -191,7 +192,8 @@ async function runPass(base, cookie, accounts, opts) {
       skipped.push(`${account.id} (fetch error: ${err.message})`);
       continue;
     }
-    if (res.status === 403) {
+    if (res.status === 403 && !refreshedInAdPass) {
+      refreshedInAdPass = true;
       // Cookie rejected: re-establish once and retry this account.
       try { cookieNow = await reestablish(base, opts.verbose); } catch { skipped.push(`${account.id} (cookie re-establish failed)`); continue; }
       try { res = await requestUrl(base, `/sponsor/ad?account=${encodeURIComponent(account.id)}`, { cookie: cookieNow }); }
@@ -237,6 +239,10 @@ async function runPass(base, cookie, accounts, opts) {
           cookieNow = await reestablish(base, opts.verbose);
           res = await requestUrl(base, '/sponsor/impression', { method: 'POST', cookie: cookieNow, body: { nonce: c.nonce, visible: true } });
           if (res.status === 200) confirmed.push(c.id);
+          else if (res.status === 409) {
+            if (opts.verbose) console.log(`[headless] ${c.id}: already confirmed or rejected (409)`);
+            failed.push(`${c.id} (409 already confirmed)`);
+          }
           else failed.push(`${c.id} (HTTP ${res.status} after cookie refresh)`);
         } catch (err) { failed.push(`${c.id} (cookie refresh failed: ${err.message})`); }
       } else {

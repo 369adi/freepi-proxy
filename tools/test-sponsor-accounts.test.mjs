@@ -10,6 +10,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createSponsorPanel } from './lib/sponsor-panel.mjs';
 
 const AD = {
@@ -20,6 +23,8 @@ const AD = {
 
 async function fixture(t, { accountList } = {}) {
   let now = 100_000;
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freepi-sponsor-acc-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const accounts = accountList || [
     { id: 'acc-1', token: 'TOKEN_ONE', handle: 'one' },
     { id: 'acc-2', token: 'TOKEN_TWO', handle: 'two' },
@@ -33,6 +38,7 @@ async function fixture(t, { accountList } = {}) {
     html: '<html>Visible sponsor</html>',
     usage: () => ({}),
     clock: () => now,
+    stateDir,
     onDisplayed: id => displayed.push(id),
     apiRequest: async (route, options) => {
       calls.push({ route, options });

@@ -68,7 +68,7 @@ test('auto-add exports exactly the documented helpers', () => {
 const GITHUB_USERNAME = /^[a-z0-9-]{1,39}$/;
 
 test('makeUsername starts with the local part and a dash', () => {
-  const name = makeUsername('gh8@arisya.de');
+  const name = makeUsername('gh8@example.com');
   assert.match(name, /^gh8-[0-9a-f]{6}$/);
 });
 
@@ -76,18 +76,18 @@ test('makeUsername keeps a hyphenated prefix instead of stripping it', () => {
   // The default prefix is "gh" and the store numbers addresses as "gh-8".
   // The base is only stripped of characters outside [a-z0-9-], so the hyphen
   // survives: "gh-8" + "-" + tail.
-  const name = makeUsername('gh-8@arisya.de');
+  const name = makeUsername('gh-8@example.com');
   assert.match(name, /^gh-8-[0-9a-f]{6}$/);
 });
 
 test('makeUsername only ever uses lowercase letters, digits and hyphens', () => {
   // Underscores and dots are not valid in a GitHub username at all.
   const samples = [
-    'gh_12@arisya.de',
-    'gh.12@arisya.de',
-    'GH-12@ARISYA.DE',
-    'wir ü ml@arisya.de',
-    'a+b@arisya.de',
+    'gh_12@example.com',
+    'gh.12@example.com',
+    'GH-12@EXAMPLE.COM',
+    'wir ü ml@example.com',
+    'a+b@example.com',
   ];
   for (const email of samples) {
     for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -101,11 +101,11 @@ test('makeUsername only ever uses lowercase letters, digits and hyphens', () => 
 });
 
 test('makeUsername lowercases the local part', () => {
-  assert.match(makeUsername('GhX9@arisya.de'), /^ghx9-[0-9a-f]{6}$/);
+  assert.match(makeUsername('GhX9@example.com'), /^ghx9-[0-9a-f]{6}$/);
 });
 
 test('makeUsername never exceeds the 30 character cap', () => {
-  const long = 'a'.repeat(80) + '@arisya.de';
+  const long = 'a'.repeat(80) + '@example.com';
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const name = makeUsername(long, attempt);
     assert.ok(name.length <= 30, `"${name}" is ${name.length} chars`);
@@ -117,15 +117,15 @@ test('makeUsername attempt 0 always carries a 6 hex char suffix', () => {
   // Regression guard: attempt 0 used to send the bare local part ("gh-8"),
   // which GitHub rejected as taken. Every attempt must add its own suffix.
   for (let i = 0; i < 20; i += 1) {
-    assert.match(makeUsername('gh-8@arisya.de', 0), /^gh-8-[0-9a-f]{6}$/);
+    assert.match(makeUsername('gh-8@example.com', 0), /^gh-8-[0-9a-f]{6}$/);
   }
 });
 
 test('makeUsername retries after attempt 0 add extra digits', () => {
   // attempt > 0 appends 6 hex chars plus a two digit number: 8 extra chars.
   for (let i = 0; i < 20; i += 1) {
-    assert.match(makeUsername('gh-8@arisya.de', 1), /^gh-8-[0-9a-f]{8}$/);
-    assert.match(makeUsername('gh-8@arisya.de', 3), /^gh-8-[0-9a-f]{8}$/);
+    assert.match(makeUsername('gh-8@example.com', 1), /^gh-8-[0-9a-f]{8}$/);
+    assert.match(makeUsername('gh-8@example.com', 3), /^gh-8-[0-9a-f]{8}$/);
   }
 });
 
@@ -134,14 +134,14 @@ test('makeUsername is random per call, not derived only from the email', () => {
   // the same address must differ, otherwise every retry would hit the same
   // taken name and the retry loop would be pointless.
   const seen = new Set();
-  for (let i = 0; i < 40; i += 1) seen.add(makeUsername('gh-8@arisya.de', 0));
+  for (let i = 0; i < 40; i += 1) seen.add(makeUsername('gh-8@example.com', 0));
   assert.ok(seen.size > 1, 'the generator must not be deterministic');
 });
 
 test('makeUsername does not throw on odd input', () => {
   // The email always comes from the caller, but a malformed one must not crash
   // the batch. Only the shape guarantees are asserted here.
-  for (const email of ['', '@arisya.de', 'noat', '***@x.de', null]) {
+  for (const email of ['', '@example.com', 'noat', '***@x.de', null]) {
     const name = makeUsername(email);
     assert.equal(typeof name, 'string');
     assert.match(name, GITHUB_USERNAME, `unusable name "${name}" from ${JSON.stringify(email)}`);
@@ -387,7 +387,7 @@ test('--email rejects something that is not an address', () => {
 
 test('--email with --count or --resume exits rather than guessing', () => {
   for (const extra of [['--count', '2'], ['--resume']]) {
-    const r = runCli('--email', 'gh-99@arisya.de', '--dry-run', ...extra);
+    const r = runCli('--email', 'gh-99@example.com', '--dry-run', ...extra);
     assert.equal(r.status, 1, extra.join(' ') + ' with --email must exit 1');
     assert.match(r.stderr, /--email takes exactly one address/);
   }

@@ -276,7 +276,7 @@ export function decide(store, now = Date.now(), opts = {}) {
 
 /** The address that a new account would get — never an identity we already know. */
 export function nextMintEmail(store) {
-  const domain = (store?.settings?.emailDomain || 'arisya.de').trim();
+  const domain = (store?.settings?.emailDomain || process.env.FREEPI_EMAIL_DOMAIN || 'example.com').trim();
   const prefix = (store?.settings?.emailPrefix || 'gh').trim();
   const known = new Set((store?.accounts || []).map(a => (a.email || '').toLowerCase()).filter(Boolean));
   let n = Math.max(1, Number(store?.nextAccountNumber) || 1);

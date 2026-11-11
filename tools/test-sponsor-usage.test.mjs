@@ -3,18 +3,24 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import vm from 'node:vm';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createSponsorPanel } from './lib/sponsor-panel.mjs';
 import { emptyStore, recordUsage } from './lib/store.mjs';
 import { describe } from './lib/policy.mjs';
 
 async function fixture(t) {
   let now = 100_000, account = { id: 'one', token: 'TEST_AUTH_SECRET', handle: 'Example' };
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freepi-sponsor-usage-'));
   const calls = [];
-  const panel = createSponsorPanel({ currentAccount: async () => account, sessionId: 'test-session', html: '<html>Visible sponsor</html>', usage: () => ({}), clock: () => now,
+  const panel = createSponsorPanel({ currentAccount: async () => account, sessionId: 'test-session', html: '<html>Visible sponsor</html>', usage: () => ({}), clock: () => now, stateDir,
     apiRequest: async (route, options) => { calls.push({ route, options }); return route.startsWith('/ads/next') ? { ad_id: 'ad', click_token: 'click', source: 'own', creative: { headline: 'Sponsor', body: 'A real visible advertisement', cta: 'Read more' }, click_url: 'https://example.com' } : {}; } });
   const server = http.createServer(async (req, res) => { if (!await panel(req, res, new URL(req.url, 'http://127.0.0.1:4000'))) { res.writeHead(404); res.end(); } });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => server.close(resolve)));
+  t.after(async () => {
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
   let cookie = '';
   async function request(route, body, origin) {
     return new Promise((resolve, reject) => {

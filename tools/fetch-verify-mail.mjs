@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 // fetch-verify-mail.mjs — zero-dependency IMAP helper for catch-all verification mail.
 //
-// Why: arisya.de has a catch-all, so every random address @arisya.de is accepted
-// and dropped into the webmaster mailbox. This script logs into that mailbox over
+// Why: a catch-all accepts every random address on its domain and delivers it
+// into one mailbox. This script logs into that mailbox over
 // IMAP and prints the newest GitHub verification / confirmation links, so a fresh
 // address can be confirmed without opening a browser.
 //
 // Usage (PowerShell):
-//   $env:IMAP_USER = 'webmaster@arisya.de'
+//   $env:IMAP_USER = 'webmaster@example.com'
 //   $env:IMAP_PASS = '<postfach-passwort>'
-//   node tools/fetch-verify-mail.mjs gh-42@arisya.de
+//   node tools/fetch-verify-mail.mjs gh-42@example.com
 //
 // Without an argument it looks at UNSEEN mail instead.
 // Overrides: IMAP_HOST (default imap.strato.de), IMAP_PORT (993), MAIL_LIMIT (3).

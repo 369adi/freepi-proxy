@@ -89,7 +89,16 @@ async function main() {
     const cat = await getCatalog(active ? active.token : null);
     if (cat && cat.min) {
       const need = String(cat.min);
+      const cmp = (a, b) => {
+        const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+        for (let i = 0; i < 3; i++) {
+          const d = (pa[i] || 0) - (pb[i] || 0);
+          if (d !== 0) return d;
+        }
+        return 0;
+      };
       if (/^\d+\.\d+\.\d+$/.test(VERSION) && VERSION === cat.latest) ok('client version', VERSION + ' (latest)');
+      else if (/^\d+\.\d+\.\d+$/.test(VERSION) && /^\d+\.\d+\.\d+$/.test(need) && cmp(VERSION, need) < 0) bad('client version', VERSION + ' is below minimum ' + need);
       else if (VERSION === need) warn('client version', VERSION + ' is the minimum accepted (latest ' + cat.latest + ')');
       else ok('client version', VERSION + ' (min ' + need + ', latest ' + cat.latest + ')');
     } else ok('client version', VERSION);
@@ -137,11 +146,12 @@ async function main() {
   } else {
     try {
       const b = await import(pathToFileURL(budgetPath).href);
-      const hours = b.creditsToHours ? b.creditsToHours(15000) : null;
-      const okMaths = hours === 3;               // 15000 credits / 5000 per hour
+      const hasFn = typeof b.creditsToHours === 'function';
+      const hours = hasFn ? b.creditsToHours(15000) : null;
+      const okMaths = hasFn && typeof hours === 'number' && Math.abs(hours - 3) < 1e-6;
       const hasApi = ['budgetSummary', 'runwayHours', 'burnRatePerHour', 'fmtHours']
         .every((fn) => typeof b[fn] === 'function');
-      if (!hasApi) bad('budget helper incomplete', 'missing one of budgetSummary/runwayHours/burnRatePerHour/fmtHours');
+      if (!hasApi || !hasFn) bad('budget helper incomplete', 'missing one of creditsToHours/budgetSummary/runwayHours/burnRatePerHour/fmtHours');
       else if (!okMaths) bad('budget helper maths broken', 'creditsToHours(15000) returned ' + hours + ', expected 3');
       else ok('budget helper', '5000 credits = 1 h, summary + runway present');
     } catch (err) {
@@ -152,6 +162,7 @@ async function main() {
   // 6. port / running proxy
   const alive = await proxyAlive(PORT);
   if (alive.alive) ok('proxy running', `:${PORT} with ${alive.models} models`);
+  else if (alive.status) warn('proxy running', `:${PORT} responded HTTP ${alive.status} (check FREEPI_PROXY_API_KEY)`);
   else {
     const free = await portFree(PORT);
     if (free) warn('proxy not running', `port ${PORT} is free — start it with: node proxy.mjs`);

@@ -9,7 +9,7 @@
 // only sane way to give each one a unique deliverable address.
 //
 // WHAT IS AUTOMATED
-//   - a unique address per account (gh-N@arisya.de)
+//   - a unique address per account (gh-N@example.com)
 //   - a private browser profile per account, so no two accounts share cookies
 //   - the entire free-pi side once GitHub is through: device code, consent,
 //     token poll, /me, and the store write
@@ -257,7 +257,7 @@ const loadStoreRaw = () => {
 function storeSettings() {
   const s = loadStoreRaw();
   return {
-    domain: (s && s.settings && s.settings.emailDomain) || 'arisya.de',
+    domain: (s && s.settings && s.settings.emailDomain) || process.env.FREEPI_EMAIL_DOMAIN || 'example.com',
     prefix: (s && s.settings && s.settings.emailPrefix) || 'gh',
     nextNumber: (s && s.nextAccountNumber) || ((s && s.accounts && s.accounts.length) || 0) + 1,
     taken: new Set(((s && s.accounts) || []).map((a) => (a.email || '').toLowerCase()).filter(Boolean)),
@@ -1057,7 +1057,7 @@ async function readGithubCode(cdp, { email, timeoutMs = 240000, log } = {}) {
     const cands = ((inbox && inbox.rows) || []).filter((r) => {
       if (!/github/i.test(String(r.from))) return false;
       const to = String(r.to || '').toLowerCase();
-      // Own address only when the row names one - a generic arisya.de row could
+      // Own address only when the row names one - a generic catch-all row could
       // belong to a sibling sign-up and would hand us the wrong code.
       return !to || to.includes(local);
     });

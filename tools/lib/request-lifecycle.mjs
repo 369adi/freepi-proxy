@@ -1,5 +1,5 @@
 // Transport cleanup independent of provider, credentials, or scheduling policy.
-export function bindRequestLifecycle(upstream, downstream, release, timeoutMs = 120_000) {
+export function bindRequestLifecycle(upstream, downstream, release, timeoutMs = 240_000) {
   let released = false;
   let progressTimer, responseStream, progressListener;
   const finish = () => {
@@ -28,8 +28,10 @@ export function bindRequestLifecycle(upstream, downstream, release, timeoutMs = 
     responseStream=response;
     let pending='';
     const armProgress=()=>{
+      if(released)return;
       clearTimeout(progressTimer);
       progressTimer=setTimeout(()=>{
+        if(released)return;
         upstream.destroy(new Error('Model stream stalled: no response content for '+timeoutMs+' ms'));
         if(!downstream.writableEnded)downstream.destroy();
         finish();
@@ -48,7 +50,10 @@ export function bindRequestLifecycle(upstream, downstream, release, timeoutMs = 
           const payload=JSON.parse(data);
           const meaningful=(payload.choices||[]).some(choice=>{
             const delta=choice.delta||choice.message||{};
-            return [choice.text,delta.content,delta.reasoning_content,delta.reasoning].some(value=>typeof value==='string'&&value.length>0)||
+            const hasReasoningDetails=Array.isArray(delta.reasoning_details)&&delta.reasoning_details.some(item=>
+              typeof item==='string'?item.length>0:Boolean(item&&(item.text||item.summary||item.data)));
+            return [choice.text,delta.content,delta.reasoning_content,delta.reasoning,delta.reasoning_text].some(value=>typeof value==='string'&&value.length>0)||
+              hasReasoningDetails||
               (delta.tool_calls||[]).some(call=>call.function?.arguments||call.function?.name);
           });
           if(meaningful)armProgress();

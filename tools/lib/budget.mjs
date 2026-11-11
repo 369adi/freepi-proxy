@@ -88,7 +88,7 @@ export function burnRatePerHour(samples) {
 /** "4.2 h", "38 min", "-" for null. Deliberately short for table output. */
 export function fmtHours(hours) {
   const h = num(hours);
-  if (h === null) return '-';
+  if (h === null || h < 0) return '-';
   if (h >= 10) return `${Math.round(h)} h`;
   if (h >= 1) return `${h.toFixed(1)} h`;
   const minutes = Math.round(h * 60);

@@ -28,6 +28,20 @@ test('real reasoning and tool output keep a live model stream running', async ()
   finally{clearInterval(timer);}
 });
 
+test('reasoning_text and reasoning_details deltas count as live model progress', async () => {
+  const {upstream,releases}=setup(25),response=new EventEmitter();
+  response.headers={'content-type':'text/event-stream'};upstream.emit('response',response);
+  let tick=0;
+  const timer=setInterval(()=>{
+    const chunk = tick++ % 2 === 0
+      ? 'data: {"choices":[{"delta":{"reasoning_text":"thinking"}}]}\n\n'
+      : 'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step"}]}}]}\n\n';
+    response.emit('data',Buffer.from(chunk));
+  },4);
+  try{await new Promise(resolve=>setTimeout(resolve,60));assert.equal(upstream.destroyed,undefined);response.emit('end');assert.equal(releases(),1);}
+  finally{clearInterval(timer);}
+});
+
 test('client disconnect before response headers cancels upstream and releases exactly once', () => {
   const { upstream, downstream, releases } = setup();
   downstream.destroy();

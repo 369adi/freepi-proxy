@@ -32,7 +32,7 @@ export function emptyStore() {
     settings: {
       lowWatermark: 0.1, // switch away below 10% of the daily allowance
       mintGraceMs: 20 * 60 * 1000, // wait instead of minting if a refill is this close
-      emailDomain: 'arisya.de',
+      emailDomain: process.env.FREEPI_EMAIL_DOMAIN || 'example.com',
       emailPrefix: 'gh',
     },
     totals: { accountsMinted: 0, creditsUsedTotal: 0, byDay: {} },

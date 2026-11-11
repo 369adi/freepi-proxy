@@ -3,9 +3,13 @@
 // Everything else is left as text-only, because offering an attachment to a
 // model that cannot read it is exactly the bug we are fixing.
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const PATCH = 'C:\\Users\\liket\\.dsh\\profiles\\desktop\\cordis.patch.yml';
+const PATCH = process.env.CORDIS_PATCH_PATH || path.join(os.homedir(), '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+const VALIDATOR = fileURLToPath(new URL('./validate-vision.py', import.meta.url));
 
 // Measured: answered "left half blue, right half yellow" for a 64x64 split image.
 const VISION = new Set([
@@ -83,7 +87,7 @@ if (applied.length) {
 }
 
 try {
-  const res = execFileSync('python', ['C:\\Users\\liket\\Documents\\freepi-proxy\\tools\\validate-vision.py'], {
+  const res = execFileSync('python', [VALIDATOR], {
     encoding: 'utf8',
   });
   console.log(res);
